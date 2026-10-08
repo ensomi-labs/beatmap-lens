@@ -70,6 +70,13 @@ pnpm check
 pnpm dev
 ```
 
+In Inspector's **Annotate** setup, select **Full paths** and enter the existing
+dataset folder for saved comments, the catalog JSON file, and the mapped corpus
+folder. Absolute paths and `~/` paths are supported by the local development and
+preview servers. The last paths are remembered; **Open workspace** reconnects
+them. **Browse** also remains available in browsers with folder-picker support.
+Chart and audio access is read-only; saves go to the selected dataset folder.
+
 `pnpm check` runs engineering checks. `pnpm check:regression` separately evaluates
 method changes; missing semantic replay remains missing evidence, not a quality
 pass. Dataset publication checks its own frozen snapshot and declared policy.

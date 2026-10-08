@@ -77,6 +77,7 @@ import {
   previewGestureTransaction,
   updateGestureTransaction,
 } from "./annotation/gesture-transaction";
+import { type LocalWorkspacePaths, openLocalWorkspace, supportsLocalPaths } from "./annotation/local-paths";
 import {
   changeNoteSelectionRange,
   createNoteSelection,
@@ -202,6 +203,10 @@ const emit = defineEmits<{
 
 const sessions = new IndexedDbSessionStore();
 const fileSystemSupported = supportsFileSystemAccess();
+const localPathsSupported = ref(false);
+const setupMethod = ref<"paths" | "browse">("paths");
+const localPathsKey = "beatmap-lens.inspector.local-paths";
+const localPaths = ref<LocalWorkspacePaths>({ datasetPath: "", catalogPath: "", corpusPath: "" });
 const annotatorId = ref("");
 const datasetName = ref("Section gold v1");
 const datasetHandle = shallowRef<BrowserDirectoryHandle>();
@@ -476,8 +481,11 @@ const audioStatusText = computed(() => {
 onMounted(async () => {
   window.addEventListener("keydown", handleWorkspaceKeydown);
   document.addEventListener("visibilitychange", handleVisibilityChange);
-  if (!fileSystemSupported) return;
+  localPathsSupported.value = await supportsLocalPaths();
+  if (!localPathsSupported.value) setupMethod.value = "browse";
   try {
+    const savedPaths = localStorage.getItem(localPathsKey);
+    if (savedPaths) localPaths.value = JSON.parse(savedPaths);
     const preferences = await sessions.getPreferences();
     if (preferences) {
       annotatorId.value = preferences.annotatorId;
@@ -577,13 +585,23 @@ async function startWorkspace(): Promise<void> {
   setupError.value = "";
   const id = annotatorId.value.trim();
   if (!id) return setSetupError("Enter a pseudonymous annotator ID.");
-  if (!datasetHandle.value) return setSetupError("Select a dataset directory.");
-  if (!catalog.value) return setSetupError("Select the local catalog manifest.");
-  if (!corpusHandle.value) return setSetupError("Select the mapped corpus directory.");
-
   setupBusy.value = true;
-  setupProgress.value = "Checking directory permissions";
   try {
+    if (setupMethod.value === "paths") {
+      if (Object.values(localPaths.value).some(path => !path.trim())) {
+        throw new Error("Enter the dataset, catalog, and corpus paths.");
+      }
+      setupProgress.value = "Opening local paths";
+      const opened = await openLocalWorkspace(localPaths.value);
+      datasetHandle.value = opened.dataset;
+      corpusHandle.value = opened.corpus;
+      catalog.value = opened.catalog;
+      localStorage.setItem(localPathsKey, JSON.stringify(localPaths.value));
+    }
+    if (!datasetHandle.value) throw new Error("Select a dataset directory.");
+    if (!catalog.value) throw new Error("Select the local catalog manifest.");
+    if (!corpusHandle.value) throw new Error("Select the mapped corpus directory.");
+    setupProgress.value = "Checking directory permissions";
     const [datasetPermission, corpusPermission] = await Promise.all([
       ensureHandlePermission(datasetHandle.value, "readwrite"),
       ensureHandlePermission(corpusHandle.value, "read"),
@@ -2783,8 +2801,8 @@ function errorMessage(error: unknown): string {
       </div>
 
       <form class="onboarding-form" @submit.prevent="startWorkspace">
-        <div v-if="!fileSystemSupported" class="inline-message inline-message--error">
-          Section annotation requires Chromium's File System Access API.
+        <div v-if="!fileSystemSupported && !localPathsSupported" class="inline-message inline-message--error">
+          Open Inspector with its local server to enter full paths, or use a browser that supports folder selection.
         </div>
 
         <label class="field-stack">
@@ -2797,6 +2815,19 @@ function errorMessage(error: unknown): string {
           <input v-model="datasetName" autocomplete="off" />
         </label>
 
+        <label v-if="localPathsSupported && fileSystemSupported" class="field-stack">
+          <span>Open from</span>
+          <select v-model="setupMethod"><option value="paths">Full paths</option><option value="browse">Browse</option></select>
+        </label>
+
+        <template v-if="localPathsSupported && setupMethod === 'paths'">
+          <label class="field-stack"><span>Dataset directory path</span><input v-model="localPaths.datasetPath" placeholder="Full path to the folder for saved comments" autocomplete="off" spellcheck="false" /></label>
+          <label class="field-stack"><span>Catalog manifest path</span><input v-model="localPaths.catalogPath" placeholder="Full path to the catalog .json file" autocomplete="off" spellcheck="false" /></label>
+          <label class="field-stack"><span>Mapped corpus directory path</span><input v-model="localPaths.corpusPath" placeholder="Full path to the folder containing the charts" autocomplete="off" spellcheck="false" /></label>
+          <p class="setup-note">Use existing folders on this computer. Paths starting with ~/ are supported. Comments are saved in the dataset folder.</p>
+        </template>
+
+        <template v-else>
         <div class="setup-picker-row">
           <div>
             <strong>Dataset directory</strong>
@@ -2831,6 +2862,7 @@ function errorMessage(error: unknown): string {
           Stored directory handles were restored. Starting the workspace requests permission only if
           Chromium no longer grants it.
         </p>
+        </template>
         <p v-if="setupError" class="inline-message inline-message--error" role="alert">
           {{ setupError }}
         </p>
@@ -2841,7 +2873,7 @@ function errorMessage(error: unknown): string {
         <button
           class="button button--primary onboarding-submit"
           type="submit"
-          :disabled="setupBusy || !fileSystemSupported"
+          :disabled="setupBusy || (!fileSystemSupported && !localPathsSupported)"
         >
           {{ setupBusy ? "Opening workspace" : "Open workspace" }}
         </button>
