@@ -1321,6 +1321,7 @@ onBeforeUnmount(() => { window.removeEventListener("keydown", workspaceKeydown);
           </section>
           <section class="review-section review-proposed-judgment">
             <header class="review-claim-heading"><h2>{{ confidenceReviewActive ? 'Selected labels · confidence review' : 'Section judgments' }}</h2><span class="review-kicker">{{ (activeClaim.scope.startMs / 1000).toFixed(3) }}–{{ (activeClaim.scope.endMs / 1000).toFixed(3) }} s</span></header>
+            <a v-if="remoteSource" class="review-golden-link" :href="`/review?view=golden&tag=${encodeURIComponent(activeClaim.tagId)}`" target="_blank" rel="noopener noreferrer">Check golden set ↗<span>High-confidence references · opens a new tab</span></a>
             <WorkflowSectionSliders :claims="drafts" :tags="activeFoundation.tags" :disabled="!canEdit" :active-claim-id="activeClaimId" :confidences="confidences" :explicit-low="confidenceReviewActive" @update:claim="updateSectionAssessment" @update:confidence="updateConfidence" @select="activeClaimId = $event" />
             <p v-if="confidenceReviewActive" class="review-copy">These are the selected human labels. Choose High or Record Low for each, then save. Unchanged labels keep their existing confidence.</p>
             <p class="review-copy">Check High when confident in that label, independently of its strength. New judgments start Low; historical unrecorded confidence stays unspecified until edited.</p>
@@ -1420,6 +1421,10 @@ summary { min-height: 40px; padding-block: 10px; box-sizing: border-box; cursor:
 .review-rail details > summary::marker { color: var(--ink-muted); }
 .review-claim-heading { display: flex; align-items: center; gap: 8px; }
 .review-claim-heading h2 { flex: 1; min-width: 0; }
+.review-golden-link { display: grid; align-content: center; min-height: 40px; padding-block: 8px; color: var(--signal); font-size: 12px; text-decoration: none; }
+.review-golden-link span { color: var(--ink-secondary); font-size: 11px; }
+.review-golden-link:hover { text-decoration: underline; }
+.review-golden-link:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
 .review-definition { padding: 12px 0; border-bottom: 1px solid var(--line); font-size: 12px; }
 .review-definition p { margin-top: 6px; }
 .review-definition pre { max-height: 240px; overflow: auto; font-size: 10px; }

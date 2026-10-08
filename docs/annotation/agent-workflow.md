@@ -359,6 +359,20 @@ as absent. The original scope and playback rate stay visible, and per-tag eviden
 and rationale remain available below the sliders. Selecting a tag changes the
 focused evidence without replacing the other drafts or moving the viewport.
 
+**Golden set** in the connected Review inbox opens the current High-confidence
+human references selected by the [agent regression gate](../../annotation/evaluation/README.md).
+**Check golden set** beside the section sliders opens the same view in a new tab,
+filtered to the active label, while the original section draft stays in place.
+Filter by label, strength, or chart to compare exact source previews, judgment
+rates, saved human comments, and Foundation criteria. Only protected labels are
+shown; a missing dimension is not an absence judgment.
+
+The view calls the gate's existing selector, so equal duplicate cells retain their
+human identities and conflicting High judgments block the set. It refreshes on
+returning to the tab or with **Refresh golden set**, and follows current human
+revisions rather than historical High records. Browsing is read-only; it does not
+freeze a comparison suite, approve a gate run, or save a human judgment.
+
 **Submit section review** saves the displayed section assessments in one atomic
 command. Unchanged original proposals are accepted; edited proposals create modified
 decisions. Previously settled, unchanged judgments are retained, and missing

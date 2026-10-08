@@ -8,6 +8,7 @@ import { parseArgs, promisify } from "node:util";
 import { gzip } from "node:zlib";
 import { resolveReviewAudio, streamReviewAudio } from "./review-audio.mjs";
 import { createCommunityTagReader } from "./review-community-tags.mjs";
+import { buildGoldenSet } from "./review-golden-set.mjs";
 import { atomicWrite, LocalDirectoryHandle } from "./workflow-local-directory.mjs";
 
 const repo = fileURLToPath(new URL("../../../", import.meta.url));
@@ -696,6 +697,52 @@ export async function startReviewWorkspace(options) {
     return { workspace, sources: rows, receipts: [...receipts.values()], errors };
   }
 
+  async function goldenSet() {
+    const inventory = async () => {
+      const names = (await readdir(join(workspace, "workflow")))
+        .filter((name) => /^[a-f\d]{64}\.v2\.json$/.test(name))
+        .sort();
+      return Promise.all(
+        names.map(async (name) => [name.slice(0, 64), await sourceStamp(name.slice(0, 64))]),
+      );
+    };
+    const before = await inventory();
+    const current = new Map();
+    for (const [sha] of before) current.set(sha, await summary(sha));
+    const result = await buildGoldenSet(
+      [...current.values()].map(({ row, feedback }) => ({
+        sourceSha256: row.source.sha256,
+        documentVersion: row.version,
+        effectiveHumanObservations: feedback.effectiveHumanObservations,
+      })),
+    );
+    if (json(before) !== json(await inventory()))
+      throw httpError(
+        409,
+        "Human judgments changed while loading the golden set. Refresh to read the current set.",
+      );
+    return {
+      ...result,
+      checkedAt: new Date().toISOString(),
+      cases: result.cases.map((entry) => {
+        const { row, feedback } = current.get(entry.sourceSha256);
+        const observations = new Map(
+          feedback.effectiveHumanObservations.map((observation) => [observation.id, observation]),
+        );
+        return {
+          ...entry,
+          source: row.source,
+          humans: Object.fromEntries(
+            Object.entries(entry.humans).map(([tag, pins]) => [
+              tag,
+              pins.map((pin) => ({ ...pin, comment: observations.get(pin.id).humanComment })),
+            ]),
+          ),
+        };
+      }),
+    };
+  }
+
   for (const name of (await readdir(join(exchange, "receipts"))).filter((name) =>
     name.endsWith(".json"),
   )) {
@@ -723,6 +770,7 @@ export async function startReviewWorkspace(options) {
     }
     if (request.method === "GET") {
       if (action === "inbox") return send(response, 200, await inbox(), request);
+      if (action === "golden-set") return send(response, 200, await goldenSet(), request);
       if (action === "source") {
         const current = await source(sha);
         const audio = await sourceAudio(current);

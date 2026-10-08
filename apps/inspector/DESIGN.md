@@ -86,6 +86,10 @@ Neutrals carry a faint cool tint. Signal color is used as status ink, never as a
   saved history identifies confidence as unspecified. Confidence-only edits use the same single section save and
   append-only history. Changing assessment, scope, tag or playback rate resets draft
   confidence to Low; evidence-only edits do not redefine label certainty.
+- Connected Review provides a Golden set view with label, strength, and chart filters.
+  Its read-only source previews pair current High-confidence judgments with human
+  comments and Foundation criteria. A link beside section sliders opens references
+  in another tab so the active human draft remains in place.
 - Connected chart review exposes saved history and its version selector in the source rail.
   A version identifies skill name, revision, and content hash; identical bytes do not hide named
   revisions. Earlier human records remain inspectable and editable through append-only revisions.

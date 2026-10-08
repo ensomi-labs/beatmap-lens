@@ -595,6 +595,10 @@ describe("ReviewWorkspace mounted workflow", () => {
     expect(button(container, "Submit section review").disabled).toBe(true);
     await settleUnratedDimensions(container);
     expect(button(container, "Submit section review").disabled).toBe(false);
+    const golden = container.querySelector<HTMLAnchorElement>(".review-golden-link");
+    expect(golden?.getAttribute("href")).toBe("/review?view=golden&tag=synthetic-i");
+    expect(golden?.target).toBe("_blank");
+    expect(golden?.rel).toContain("noopener");
     expect((await f.read())?.document.decisions).toEqual([]);
   });
 

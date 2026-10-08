@@ -106,6 +106,108 @@ async function get(url: string, pathname: string) {
 }
 
 describe("local Review service exchange", () => {
+  it("browses the exact current gate selection without saving and follows confidence revisions", async () => {
+    const f = await fixture();
+    const service = await start(f.workspace);
+    const initial = await get(service.url, `source/${f.sha}`);
+    const claims = [
+      { ...f.claim, id: "high-one" },
+      { ...f.claim, id: "high-two", playbackRate: 1 },
+      { ...f.claim, id: "slow-high", playbackRate: 0.75 },
+      { ...f.claim, id: "low" },
+      { ...f.claim, id: "unspecified" },
+    ];
+    const saved = await post(service.url, `human/${f.sha}/addObservations`, {
+      expectedBase: initial.version,
+      input: {
+        humanId: "fixture-human",
+        claims,
+        confidences: { "high-one": "high", "high-two": "high", "slow-high": "high", low: "low" },
+      },
+    });
+    expect(saved.status).toBe(200);
+    const canonicalPath = join(f.workspace, "workflow", `${f.sha}.v2.json`);
+    const before = await readFile(canonicalPath, "utf8");
+    const golden = await get(service.url, "golden-set");
+    expect(golden.gateError).toBeUndefined();
+    expect(golden.cases).toHaveLength(2);
+    expect(
+      golden.cases.find((entry: { playbackRate: number }) => entry.playbackRate === 1).humans.tech,
+    ).toHaveLength(2);
+    const expected = await exec("uv", [
+      "run",
+      "--locked",
+      "python",
+      "-c",
+      [
+        "import json, sys",
+        "sys.path.insert(0, 'annotation/evaluation')",
+        "from high_confidence_suite import build_suite, current_feedback",
+        "print(json.dumps(build_suite(current_feedback(sys.argv[1]), 'reference')['cases']))",
+      ].join("\n"),
+      f.workspace,
+    ]);
+    expect(
+      golden.cases.map(
+        ({
+          source: _source,
+          humans,
+          ...entry
+        }: {
+          source: unknown;
+          humans: Record<string, Array<{ comment?: string }>>;
+        }) => ({
+          ...entry,
+          humans: Object.fromEntries(
+            Object.entries(humans).map(([tag, pins]) => [
+              tag,
+              pins.map(({ comment: _comment, ...pin }) => pin),
+            ]),
+          ),
+        }),
+      ),
+    ).toEqual(JSON.parse(expected.stdout));
+    expect(await readFile(canonicalPath, "utf8")).toBe(before);
+    const revised = await post(service.url, `human/${f.sha}/addObservations`, {
+      expectedBase: saved.value.version,
+      input: {
+        humanId: "fixture-human",
+        claims: claims.slice(0, 2),
+        confidences: { "high-one": "low", "high-two": "low" },
+        supersedesObservationIds: Object.fromEntries(
+          saved.value.document.observations
+            .slice(0, 2)
+            .map((observation: { id: string; claim: { id: string } }) => [
+              observation.claim.id,
+              observation.id,
+            ]),
+        ),
+      },
+    });
+    expect(revised.status).toBe(200);
+    const current = await get(service.url, "golden-set");
+    expect(current.cases).toHaveLength(1);
+    expect(current.cases[0].playbackRate).toBe(0.75);
+    const conflicting = await post(service.url, `human/${f.sha}/addObservations`, {
+      expectedBase: revised.value.version,
+      input: {
+        humanId: "another-fixture-human",
+        claims: [
+          {
+            ...claims[2],
+            id: "conflicting-high",
+            assessment: { presence: "present", salience: "supporting" },
+          },
+        ],
+        confidences: { "conflicting-high": "high" },
+      },
+    });
+    expect(conflicting.status).toBe(200);
+    const blocked = await get(service.url, "golden-set");
+    expect(blocked.cases).toEqual([]);
+    expect(blocked.gateError).toContain("Conflicting independent current High judgments");
+  }, 20_000);
+
   it("submits a section review atomically through the human command endpoint", async () => {
     const f = await fixture();
     const service = await start(f.workspace);

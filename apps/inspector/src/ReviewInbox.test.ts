@@ -45,6 +45,39 @@ afterEach(() => {
   window.history.replaceState({}, "", "/");
 });
 
+it("opens the golden-set entrypoint independently of saved samples and machine versions", async () => {
+  const { fetcher } = await fixture();
+  localStorage.setItem(
+    "beatmap-lens-review-sample:/review-fixture",
+    JSON.stringify({
+      createdAt: "2026-10-08T00:00:00Z",
+      tagId: "tech",
+      strength: "all",
+      claims: [],
+    }),
+  );
+  window.history.replaceState({}, "", "/review?view=golden&tag=tech");
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (url: string) =>
+      url.endsWith("golden-set")
+        ? Response.json({
+            checkedAt: "2026-10-08T00:00:00Z",
+            cases: [],
+            gateError: "No current High references.",
+          })
+        : fetcher(url),
+    ),
+  );
+  const { container } = mount();
+  await vi.waitFor(() => expect(container.textContent).toContain("No current High references."));
+  expect(container.querySelector("h1")?.textContent).toBe("Golden set");
+  expect(container.querySelector(".inbox-version-filters")).toBeNull();
+  expect(container.querySelector<HTMLSelectElement>(".golden-filters select")?.value).toBe("tech");
+  await click(container, "Browse review history");
+  expect(container.querySelector(".inbox-version-filters")).not.toBeNull();
+});
+
 it("opens a persistent human confidence queue and advances using saved confidence", async () => {
   const { source, inbox, fetcher } = await fixture();
   const first = {

@@ -5,6 +5,7 @@ import { type ConfidenceReviewPlan, confidenceReviewRows } from "./annotation/wo
 import { type InboxClaimV2, type InboxSourceV2, type RemoteSourceV2, type ReviewInboxV2, reviewRequest } from "./annotation/workflow/remote-workspace";
 import { agentVersionLabel, auditVersionLabel, matchesReviewVersions, reviewVersionOptions } from "./annotation/workflow/review-provenance";
 import { assessmentStrength, drawReviewSample, REVIEW_TARGETS, type ReviewSampleBatch, type ReviewSampleItem, type SampleStrength, sampleCandidates, sampleKey, sampleRef } from "./annotation/workflow/review-sampling";
+import GoldenSetBrowser from "./GoldenSetBrowser.vue";
 import ReviewWorkspace from "./ReviewWorkspace.vue";
 
 const inbox = shallowRef<ReviewInboxV2>();
@@ -16,6 +17,7 @@ const openHumanObservationIds = shallowRef<readonly string[]>();
 const confidencePlan = shallowRef<ConfidenceReviewPlan>();
 const confidencePlanError = ref("");
 const confidencePlanUrl = new URLSearchParams(window.location.search).get("confidencePlan");
+const goldenSetRequested = new URLSearchParams(window.location.search).get("view") === "golden";
 const activeConfidenceId = ref("");
 const confidenceRows = computed(() => confidencePlan.value ? confidenceReviewRows(confidencePlan.value, inbox.value?.sources ?? []) : []);
 const confidenceCompleted = computed(() => confidenceRows.value.reduce((sum, row) => sum + row.completed, 0));
@@ -30,7 +32,7 @@ const loading = ref(false);
 const recentSources = new Map<string, RemoteSourceV2>();
 const sourceLoads = new Map<string, Promise<RemoteSourceV2>>();
 const lastSynced = ref("");
-const inboxView = ref<"requests" | "sample" | "history" | "confidence">(confidencePlanUrl ? "confidence" : "requests");
+const inboxView = ref<"requests" | "sample" | "history" | "confidence" | "golden">(goldenSetRequested ? "golden" : confidencePlanUrl ? "confidence" : "requests");
 const showingProvenance = ref(false);
 const labelerVersion = ref("");
 const auditorVersion = ref("");
@@ -117,7 +119,7 @@ watch(() => inbox.value?.workspace, workspace => {
   if (!workspace) return;
   const saved = localStorage.getItem(sampleStorageKey.value);
   sampleBatch.value = saved ? JSON.parse(saved) : undefined;
-  if (sampleBatch.value && !confidencePlanUrl) {
+  if (sampleBatch.value && !confidencePlanUrl && !goldenSetRequested) {
     sampleTag.value = sampleBatch.value.tagId;
     sampleStrength.value = sampleBatch.value.strength;
     labelerVersion.value = sampleBatch.value.labelerVersion ?? "";
@@ -195,7 +197,7 @@ async function refresh(): Promise<void> {
   try {
     const next = await reviewRequest<ReviewInboxV2>("inbox");
     if (stopped) return;
-    if (!inbox.value && !confidencePlanUrl && !next.sources.some(source => source.expertQueue.length || source.requests?.some(request => request.pendingClaimIds.length))) inboxView.value = "history";
+    if (!inbox.value && !confidencePlanUrl && !goldenSetRequested && !next.sources.some(source => source.expertQueue.length || source.requests?.some(request => request.pendingClaimIds.length))) inboxView.value = "history";
     inbox.value = next;
     connectionError.value = "";
     lastSynced.value = new Date().toLocaleTimeString();
@@ -271,17 +273,19 @@ onBeforeUnmount(() => { stopped = true; clearTimeout(timer); });
 </script>
 
 <template>
-  <div v-show="showingInbox" class="inbox-page">
-    <header class="inbox-header"><div><p class="inbox-kicker">Beatmap Lens</p><h1>Review inbox</h1></div><p class="inbox-connection" role="status">{{ connectionError ? 'Connection interrupted · last inbox retained' : inbox ? `Connected · ${lastSynced}` : 'Connecting…' }}</p></header>
+  <div v-show="showingInbox" class="inbox-page" :class="{ 'inbox-page--golden': inboxView === 'golden' }">
+    <header class="inbox-header"><div><p class="inbox-kicker">Beatmap Lens</p><h1>{{ inboxView === 'golden' ? 'Golden set' : 'Review inbox' }}</h1></div><p class="inbox-connection" role="status">{{ connectionError ? 'Connection interrupted · last inbox retained' : inbox ? `Connected · ${lastSynced}` : 'Connecting…' }}</p></header>
     <p v-if="connectionError" class="inbox-error" role="alert">{{ connectionError }}</p>
     <p v-if="loadError" class="inbox-error" role="alert">{{ loadError }}</p>
     <nav class="inbox-view-switch" aria-label="Review inbox views">
       <button type="button" :aria-pressed="inboxView === 'requests'" @click="inboxView = 'requests'">Requests <span>{{ tasks.length }}</span></button>
       <button type="button" :aria-pressed="inboxView === 'sample'" aria-label="Sample machine-reviewed sections" @click="inboxView = 'sample'">Sample <span v-if="sampleBatch">{{ sampleReviewed }}/{{ sampleRows.length }}</span></button>
       <button type="button" :aria-pressed="inboxView === 'history'" aria-label="Browse review history" @click="inboxView = 'history'">History <span>{{ allReviews.length }}</span></button>
+      <button type="button" :aria-pressed="inboxView === 'golden'" @click="inboxView = 'golden'">Golden set</button>
       <button v-if="confidencePlanUrl" type="button" :aria-pressed="inboxView === 'confidence'" @click="inboxView = 'confidence'">Confidence <span>{{ confidenceCompleted }}/{{ confidenceTotal }}</span></button>
     </nav>
-    <section v-if="inboxView !== 'confidence'" class="inbox-version-filters" aria-label="Review version filters">
+    <GoldenSetBrowser v-if="showingInbox && inboxView === 'golden'" />
+    <section v-if="inboxView !== 'confidence' && inboxView !== 'golden'" class="inbox-version-filters" aria-label="Review version filters">
       <div class="inbox-filter-controls">
         <label>Labeler version<select v-model="labelerVersion" name="labelerVersion"><option value="">All versions · {{ labelerVersions.length }}</option><option v-if="labelerVersion && !labelerVersions.some(option => option.key === labelerVersion)" :value="labelerVersion">{{ versionSelectionLabel(labelerVersion, 'labeler') }}</option><option v-for="option in labelerVersions" :key="option.key" :value="option.key">{{ option.label }} · {{ option.count }} claims</option></select></label>
         <label>Auditor version<select v-model="auditorVersion" name="auditorVersion"><option value="">All versions · {{ auditorVersions.length }}</option><option v-if="auditorVersion && !auditorVersions.some(option => option.key === auditorVersion)" :value="auditorVersion">{{ versionSelectionLabel(auditorVersion, 'auditor') }}</option><option v-for="option in auditorVersions" :key="option.key" :value="option.key">{{ option.label }} · {{ option.count }} claims</option></select></label>
@@ -363,6 +367,7 @@ onBeforeUnmount(() => { stopped = true; clearTimeout(timer); });
 
 <style scoped>
 .inbox-page { max-width: 1100px; margin: 0 auto; padding: 48px 32px; color: var(--ink); }
+.inbox-page--golden { max-width: 1500px; }
 .inbox-header { display: flex; justify-content: space-between; gap: 32px; align-items: flex-start; }
 h1 { margin: 8px 0 12px; font-size: 32px; letter-spacing: -.025em; }
 h2 { font-size: 17px; margin: 6px 0 12px; }
@@ -414,7 +419,7 @@ footer { padding-top: 28px; }
 .inbox-sample-number { font: 11px var(--font-data); color: var(--ink-secondary); }
 .inbox-continue { margin: 12px 0; background: var(--ink); color: var(--surface); }
 .inbox-sample-setup { margin: 12px 0; }
-.inbox-view-switch { display: flex; gap: 8px; margin-top: 24px; border-bottom: 1px solid var(--line); }
+.inbox-view-switch { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 24px; border-bottom: 1px solid var(--line); }
 .inbox-view-switch button { justify-content: center; width: auto; min-width: 100px; box-shadow: none; border-radius: 0; border-bottom: 2px solid transparent; font-size: 14px; }
 .inbox-view-switch button[aria-pressed=true] { border-bottom-color: var(--signal); color: var(--signal); }
 .inbox-view-switch span { font: 11px var(--font-data); }
