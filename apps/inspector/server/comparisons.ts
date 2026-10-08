@@ -5,8 +5,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import type { Connect, Plugin } from "vite";
-import { parseOsu, toManiaChart } from "../../../packages/beatmap-lens/src/index.ts";
-import { audioFilenameFromParsedOsu } from "../src/annotation/audio-playback.ts";
+import { parseBeatmap, parseOsu, toManiaChart } from "../../../packages/beatmap-lens/src/index.ts";
 import type {
   ComparisonExcerpt,
   ComparisonManifest,
@@ -120,14 +119,12 @@ export function createComparisonsMiddleware(): Connect.NextHandleFunction {
                 entry.excerpt.id === excerpt.id &&
                 entry.excerpt.start_ms === excerpt.start_ms &&
                 entry.excerpt.end_ms === excerpt.end_ms &&
-                ((entry.shown_a.sha256 === sourceA.sha256 &&
-                  entry.shown_b.sha256 === sourceB.sha256) ||
-                  (entry.shown_a.sha256 === sourceB.sha256 &&
-                    entry.shown_b.sha256 === sourceA.sha256)),
+                ((sameSource(entry.shown_a, sourceA) && sameSource(entry.shown_b, sourceB)) ||
+                  (sameSource(entry.shown_a, sourceB) && sameSource(entry.shown_b, sourceA))),
             );
             return {
               excerpt,
-              a: verdict ? Number(verdict.shown_a.chart_path !== sourceA.chart_path) : randomInt(2),
+              a: verdict ? Number(!sameSource(verdict.shown_a, sourceA)) : randomInt(2),
               ...(verdict ? { verdict } : {}),
             };
           }),
@@ -211,8 +208,7 @@ function fullPath(input: string): string {
 async function fromPaths(paths: [string, string]): Promise<ComparisonManifest> {
   const chartPaths = paths.map(fullPath);
   const first = chartPaths[0] as string;
-  const parsed = parseOsu(await readFile(first, "utf8"));
-  const audio = audioFilenameFromParsedOsu(parsed);
+  const audio = parseBeatmap(await readFile(first, "utf8")).audioFilename;
   if (!audio) throw new Error("The first chart needs an adjacent AudioFilename.");
   const id = createHash("sha256").update(chartPaths.join("\n")).digest("hex").slice(0, 16);
   return {
@@ -235,4 +231,8 @@ async function fromPaths(paths: [string, string]): Promise<ComparisonManifest> {
 function json(response: ServerResponse, value: unknown) {
   response.setHeader("Content-Type", "application/json");
   response.end(JSON.stringify(value));
+}
+
+function sameSource(left: VerdictRecord["shown_a"], right: VerdictRecord["shown_a"]): boolean {
+  return left.sha256 === right.sha256 && left.model === right.model;
 }

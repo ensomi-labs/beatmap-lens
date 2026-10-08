@@ -134,7 +134,7 @@ textarea:focus-visible,
 
 .workspace-mode-switch {
   display: grid;
-  grid-template-columns: repeat(3, minmax(60px, 1fr));
+  grid-template-columns: repeat(4, minmax(60px, 1fr));
   gap: 3px;
   min-inline-size: 0;
   padding: 3px;
@@ -1640,6 +1640,11 @@ button:disabled {
 
 .active-workspace-identity .workspace-mode-switch {
   width: 100%;
+}
+
+.active-workspace-identity .workspace-mode-switch,
+.review-source .workspace-mode-switch {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
 .active-dataset-identity {

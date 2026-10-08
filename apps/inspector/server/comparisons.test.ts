@@ -60,6 +60,16 @@ it("keeps model identities on the service until saving, persists the blind mappi
   expect(reopened.pairs[0]?.excerpts[0]?.saved).toBe(true);
   expect(await readFile(f.chartPaths[0], "utf8")).toBe(f.charts[0]);
   expect(await readFile(f.manifestPath, "utf8")).toBe(JSON.stringify(f.manifest));
+
+  // Repacking the same packet must not invert a saved A/B assignment.
+  const movedChart = join(f.root, "relocated-two.osu");
+  await writeFile(movedChart, f.charts[1] as string);
+  const firstPair = f.manifest.pairs[0];
+  if (!firstPair) throw new Error("Missing pair.");
+  firstPair.charts = [{ ...firstPair.charts[1], chart_path: movedChart }, firstPair.charts[0]];
+  await writeFile(f.manifestPath, JSON.stringify(f.manifest));
+  const repacked: OpenComparison = await f.post("open", { manifest_path: f.manifestPath });
+  expect(await f.post("excerpt", { ...target, session_id: repacked.session_id })).toEqual(restored);
 });
 
 it("opens two chart paths, infers adjacent audio, and appends verdicts only to the chosen folder", async () => {

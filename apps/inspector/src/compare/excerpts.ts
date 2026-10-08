@@ -1,5 +1,5 @@
 import type { ManiaChart, ManiaNote } from "beatmap-lens";
-import type { ComparisonExcerpt } from "./contracts";
+import type { ComparisonExcerpt } from "./contracts.ts";
 
 /** Source-time placement differences, not a quality or musicality score. */
 export function proposeExcerpts(a: ManiaChart, b: ManiaChart): ComparisonExcerpt[] {
