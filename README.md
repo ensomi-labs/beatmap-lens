@@ -77,6 +77,12 @@ preview servers. The last paths are remembered; **Open workspace** reconnects
 them. **Browse** also remains available in browsers with folder-picker support.
 Chart and audio access is read-only; saves go to the selected dataset folder.
 
+To compare two generators, open **Compare** or `/compare`. Enter a comparison
+manifest path, or two `.osu` paths and an output folder. Loop the proposed or
+provided excerpts, switch blind A/B views, and save a one-click verdict. See the
+[Inspector guide](apps/inspector/README.md) and
+[producer format](docs/inspector/model-comparison.md).
+
 `pnpm check` runs engineering checks. `pnpm check:regression` separately evaluates
 method changes; missing semantic replay remains missing evidence, not a quality
 pass. Dataset publication checks its own frozen snapshot and declared policy.

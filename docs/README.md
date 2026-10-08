@@ -5,6 +5,12 @@ The [package README](../packages/beatmap-lens/README.md) owns the npm API. The
 conventions. This directory explains reusable annotation work, research conclusions,
 and design choices.
 
+## Inspector
+
+- [Model comparison packets](inspector/model-comparison.md): manifests, blind listening,
+  automatic excerpts, audio energy, and saved verdicts.
+- [Open Inspector Compare](../apps/inspector/README.md): local command, URL, and demo path.
+
 ## Annotation
 
 - [Discovery and section annotation](annotation/corpus-annotation.md): the main
