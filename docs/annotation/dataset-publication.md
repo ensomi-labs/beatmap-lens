@@ -299,6 +299,66 @@ to the Foundation or frozen labels. The published v0.2.0 files remain unchanged.
 
 ## Published snapshots
 
+### v4: complete sections and original source identities
+
+[v4](https://huggingface.co/datasets/sed-i/mania-pattern-annotations/tree/102d63c485b38e7fb23af3eca64198dc607d3b6c) was published on 2026-10-09 under MIT at HF commit
+`102d63c485b38e7fb23af3eca64198dc607d3b6c`; the `v4` tag resolves to that commit.
+The exporter is pinned to GitHub commit
+`d6b4210550ba271347bc53aaf0079439207a1958`.
+
+| Source | Complete sections |
+| --- | ---: |
+| Published v3, combining human and machine labels | 736 |
+| Other eligible local sections outside v3 | 59 |
+| October 6 campaign | 1,023 |
+| October 7 campaign | 1,042 |
+| **Total** | **2,860** |
+
+A complete section has settled judgments for all five Foundation dimensions at
+one exact source hash, interval and playback rate, with human precedence.
+Of these sections, 92 have human labels on every dimension, 2,742 have independently
+reviewed machine labels throughout, and 26 combine the two authorities. Human
+labels can include confirmations of machine proposals; this is an authority
+breakdown, not a claim that all evidence was independently selected by a human.
+
+The snapshot contains **600 human records** (598 exact cells) and **16,402 machine
+records** in three opt-in method tables, across 2,969 annotated source identities.
+There are 17,002 records over 3,631 annotated sections; eligible individual labels
+in incomplete sections remain available without turning missing dimensions into
+negatives. All **4,995 v3 records are retained unchanged**. Human confidence is
+preserved: 171 High, 23 Low and 406 unspecified.
+
+The October campaigns contribute 11,638 independently supported judgments from
+1,175 and 1,225 delivered sections. Their complete totals include the 23 and 42
+surplus sections beyond the first-1,000 exports. Their shared method is
+`method-655bf779e20d774cfab97ca691a0e951e4af01db7ce15c20b75b5c8123bb1f64`:
+Astra labelers requested medium reasoning and different fresh Astra auditors high,
+in 25-section batches on normal service tier with `codex-cli 0.160.0`.
+All 192 effective worker records passed shared-input and skill-bundle checks.
+The frozen skill is
+`bf56212bc04c99b4bcc5736917285680f0fba756864bd8222c8a22ca3a186299`;
+roles and all eight harness tools match source commit
+`22e5c84f5cacb8493bdab5f1d0fdc09c5373dc60`.
+Independent same-model audit is not human confirmation or a measured accuracy claim.
+
+This release explicitly selects `policy.source_access: metadata-only`.
+Every source retains its original SHA-256, beatmap ID, title, artist, mapper
+(`creator`), difficulty and retrieval URL. Its original page is
+`https://osu.ppy.sh/beatmaps/{beatmap_id}`. The dated prepublication checks found
+2,845 exact versions publicly retrievable and 124 unavailable from the checked
+URLs. Those unavailable versions intersect 122 complete sections; their labels
+remain included. The Dataset Card lists the affected source identities. Consumers
+must match the original SHA-256 before applying labels or note references to
+retrieved bytes; a newer chart must never be substituted. No chart bytes, audio
+or raw execution logs are published.
+
+The complete repository check passed 555 JavaScript and 344 Python tests (four
+skips), types, builds, packaging and smoke checks. The guarded HF commit verified
+155 public artifact references. Anonymous download of all eight snapshot files
+matched the local build and passed snapshot validation. All earlier version tags
+remain unchanged. Manifest SHA-256:
+`6883f5402431cea09f0989cbece6764d8edf87e99b70cb34dcb480d013eed464`.
+
 ### v3: human confidence and the latest audited Astra campaign
 
 [v3](https://huggingface.co/datasets/sed-i/mania-pattern-annotations/tree/b22a7a443783e05fee4db4b1d22b8e573ad448ae) was published on 2026-09-12 under MIT at HF commit
