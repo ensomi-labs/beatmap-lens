@@ -247,29 +247,6 @@ describe("FileSystemDatasetDirectory", () => {
     expect(await (await future.getFile()).text()).toContain('"version":2');
   });
 
-  it("rejects range/note/tag duplicates even when only salience differs", async () => {
-    const root = new FakeDirectoryHandle();
-    const directory = await createFixtureDataset(root);
-    const { context, document } = await noteWorkflowDocument(directory.manifest.currentFoundation);
-    const first = document.annotations[0];
-    if (!first) throw new Error("expected annotation");
-    const duplicate: AnnotationDocumentV1 = {
-      ...document,
-      annotations: [
-        first,
-        {
-          ...first,
-          id: "00000000-0000-4000-8000-000000000099",
-          labels: first.labels.map((label) => ({ ...label, salience: 1 as const })),
-        },
-      ],
-    };
-
-    await expect(directory.saveAnnotation(duplicate, null, context)).rejects.toThrow(
-      "Exact duplicate gold annotation",
-    );
-  });
-
   it("rejects an incompatible Foundation child before making it current", async () => {
     const root = new FakeDirectoryHandle();
     const directory = await createFixtureDataset(root);

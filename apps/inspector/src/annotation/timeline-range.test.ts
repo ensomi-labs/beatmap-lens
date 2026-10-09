@@ -11,11 +11,9 @@ import {
   hitTimelineRangeTarget,
   moveTimelineRange,
   panTimelineViewportRange,
-  parseManualRangeDraft,
   parseTimeInput,
   resizeTimelineRange,
   timelineEdgeHitHeight,
-  timelineEdgeHitWidth,
   timelineRangeBodyContainsY,
   timelineRangeOutOfView,
   timelineRangeVerticalGeometry,
@@ -54,12 +52,6 @@ describe("timeline range operations", () => {
         freePlacement: true,
       }),
     ).toEqual({ startMs: 110.25, endMs: 790.75 });
-  });
-
-  it("keeps forty CSS pixels of edge target outside a narrow timeline body", () => {
-    const hitWidth = timelineEdgeHitWidth(375, 1_000);
-
-    expect((hitWidth / 1_000) * 375).toBe(40);
   });
 
   it("keeps forty CSS pixels of vertical edge target outside a narrow timeline body", () => {
@@ -181,24 +173,6 @@ describe("manual timeline input", () => {
     expect(parseTimeInput("1250")).toEqual({ ok: true, valueMs: 1_250 });
     expect(parseTimeInput("1250.5")).toEqual({ ok: true, valueMs: 1_250.5 });
     expect(parseTimeInput("02:03.045")).toEqual({ ok: true, valueMs: 123_045 });
-  });
-
-  it("keeps invalid and reversed text in an uncommittable draft", () => {
-    const invalid = parseManualRangeDraft({ start: "later", end: "1000" }, 2_000);
-    const reversed = parseManualRangeDraft({ start: "1500", end: "1000" }, 2_000);
-
-    expect(invalid).toMatchObject({
-      ok: false,
-      draft: { start: "later", end: "1000" },
-      errors: { start: "Use milliseconds or mm:ss.mmm." },
-    });
-    expect(reversed).toMatchObject({
-      ok: false,
-      draft: { start: "1500", end: "1000" },
-      errors: { range: "End must be greater than start." },
-    });
-    expect("range" in invalid).toBe(false);
-    expect("range" in reversed).toBe(false);
   });
 
   it("rejects a blank boundary instead of coercing it to zero", () => {

@@ -9,10 +9,8 @@ import type {
 import {
   addReviewNoteV1,
   completeAnnotationDocumentV1,
-  removeGoldExemplarRoleV1,
   resolveReviewNoteV1,
   sameTagOverlapWarningsV1,
-  setGoldExemplarRoleV1,
 } from "./quality";
 import { fixtureDocument, fixtureFoundation } from "./test-helpers";
 
@@ -22,148 +20,6 @@ const noteCreatedAt = "2026-08-04T00:01:00.000Z";
 const resolvedAt = "2026-08-04T00:02:00.000Z";
 
 describe("annotation quality workflow helpers", () => {
-  it("sets, changes, and removes exemplar roles on the gold annotation", async () => {
-    const foundation = fixtureFoundation();
-    const foundationRef = {
-      foundationId: foundation.foundationId,
-      revision: foundation.revision,
-      sha256: await hashFoundationV1(foundation),
-    };
-    const document = fixtureDocument(foundationRef);
-
-    const strong = await setGoldExemplarRoleV1(document, foundation, {
-      annotationId,
-      kind: "strong",
-      now: () => "2026-08-04T00:03:00.000Z",
-      tagId: "stream",
-    });
-    const weak = await setGoldExemplarRoleV1(strong, foundation, {
-      annotationId,
-      kind: "weak",
-      now: () => "2026-08-04T00:04:00.000Z",
-      tagId: "stream",
-    });
-    const removed = removeGoldExemplarRoleV1(weak, {
-      annotationId,
-      now: () => "2026-08-04T00:05:00.000Z",
-      tagId: "stream",
-    });
-
-    expect(strong.annotations[0]?.exemplarRoles).toEqual([{ kind: "strong", tagId: "stream" }]);
-    expect(strong.annotations[0]?.foundation).toEqual(foundationRef);
-    expect(weak.annotations[0]?.exemplarRoles).toEqual([{ kind: "weak", tagId: "stream" }]);
-    expect(removed.annotations[0]?.exemplarRoles).toEqual([]);
-    expect(removed.annotations[0]?.foundation).toEqual(foundationRef);
-    expect(removed.revision).toBe(document.revision + 3);
-    expect(document.annotations[0]?.exemplarRoles).toEqual([]);
-  });
-
-  it("requires exemplar roles to target active tags compatible with the annotation labels", async () => {
-    const foundation = fixtureFoundation();
-    const foundationRef = {
-      foundationId: foundation.foundationId,
-      revision: foundation.revision,
-      sha256: await hashFoundationV1(foundation),
-    };
-    const document = fixtureDocument(foundationRef);
-    const withRetired = {
-      ...foundation,
-      tags: [
-        ...foundation.tags,
-        {
-          aliases: [],
-          definition: "Retired semantic.",
-          displayName: "Retired",
-          id: "retired",
-          inclusionCues: ["Old cue."],
-          status: "retired" as const,
-        },
-      ],
-    };
-    const withoutJack: AnnotationDocumentV1 = {
-      ...document,
-      annotations: document.annotations.map((annotation) => ({
-        ...annotation,
-        labels: annotation.labels.filter((label) => label.tagId !== "jack"),
-      })),
-    };
-
-    await expect(
-      setGoldExemplarRoleV1(document, foundation, {
-        annotationId,
-        kind: "strong",
-        tagId: "missing-label",
-      }),
-    ).rejects.toThrow(/does not define tag missing-label/);
-    await expect(
-      setGoldExemplarRoleV1(document, withRetired, {
-        annotationId,
-        kind: "strong",
-        tagId: "retired",
-      }),
-    ).rejects.toThrow(/retired, not active/);
-    await expect(
-      setGoldExemplarRoleV1(withoutJack, foundation, {
-        annotationId,
-        kind: "weak",
-        tagId: "jack",
-      }),
-    ).rejects.toThrow(/is not labeled jack/);
-    await expect(
-      setGoldExemplarRoleV1(document, foundation, {
-        annotationId,
-        kind: "counterexample",
-        tagId: "jack",
-      }),
-    ).rejects.toThrow(/is labeled jack/);
-
-    const counterexample = await setGoldExemplarRoleV1(withoutJack, foundation, {
-      annotationId,
-      kind: "counterexample",
-      tagId: "jack",
-    });
-    expect(counterexample.annotations[0]?.exemplarRoles).toEqual([
-      { kind: "counterexample", tagId: "jack" },
-    ]);
-  });
-
-  it("requires the current Foundation to support every retained label and role before repinning", async () => {
-    const foundation = fixtureFoundation();
-    const foundationRef = {
-      foundationId: foundation.foundationId,
-      revision: foundation.revision,
-      sha256: await hashFoundationV1(foundation),
-    };
-    const document = fixtureDocument(foundationRef);
-    const withoutJackTag = {
-      ...foundation,
-      tags: foundation.tags.filter((tag) => tag.id !== "jack"),
-    };
-    const withRetainedCounterexample: AnnotationDocumentV1 = {
-      ...document,
-      annotations: document.annotations.map((annotation) => ({
-        ...annotation,
-        exemplarRoles: [{ kind: "counterexample" as const, tagId: "jack" }],
-        labels: annotation.labels.filter((label) => label.tagId !== "jack"),
-      })),
-    };
-
-    await expect(
-      setGoldExemplarRoleV1(document, withoutJackTag, {
-        annotationId,
-        kind: "strong",
-        tagId: "stream",
-      }),
-    ).rejects.toThrow(/Foundation does not define tag jack/);
-    await expect(
-      setGoldExemplarRoleV1(withRetainedCounterexample, withoutJackTag, {
-        annotationId,
-        kind: "strong",
-        tagId: "stream",
-      }),
-    ).rejects.toThrow(/Foundation does not define tag jack/);
-  });
-
   it("adds and resolves durable review notes while preserving creation metadata", async () => {
     const foundation = fixtureFoundation();
     const foundationRef = {

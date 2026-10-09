@@ -44,28 +44,9 @@ export interface ManualRangeDraft {
   readonly end: string;
 }
 
-export interface ManualRangeErrors {
-  readonly start?: string;
-  readonly end?: string;
-  readonly range?: string;
-}
-
 export type TimeInputResult =
   | { readonly ok: true; readonly valueMs: number }
   | { readonly ok: false; readonly error: string };
-
-export type ManualRangeResult =
-  | {
-      readonly ok: true;
-      readonly draft: ManualRangeDraft;
-      readonly range: TimeRangeV1;
-      readonly errors: ManualRangeErrors;
-    }
-  | {
-      readonly ok: false;
-      readonly draft: ManualRangeDraft;
-      readonly errors: ManualRangeErrors;
-    };
 
 export function snapTimelineTime(
   timeMs: number,
@@ -77,15 +58,6 @@ export function snapTimelineTime(
     return boundedTime;
   }
   return clamp(index.nearestSnapPoint(boundedTime) ?? boundedTime, 0, options.chartEndMs);
-}
-
-/** Converts a CSS-pixel edge target into timeline viewBox units. */
-export function timelineEdgeHitWidth(
-  renderedWidth: number,
-  viewBoxWidth: number,
-  exteriorTargetPx = 40,
-): number {
-  return (exteriorTargetPx * viewBoxWidth) / renderedWidth;
 }
 
 /** Converts a CSS-pixel vertical edge target into timeline viewBox units. */
@@ -302,39 +274,6 @@ export function parseTimeInput(input: string): TimeInputResult {
   return {
     ok: false,
     error: "Use milliseconds or mm:ss.mmm.",
-  };
-}
-
-export function parseManualRangeDraft(
-  draft: ManualRangeDraft,
-  chartEndMs: number,
-): ManualRangeResult {
-  const start = parseTimeInput(draft.start);
-  const end = parseTimeInput(draft.end);
-  const errors: { start?: string; end?: string; range?: string } = {};
-
-  if (!start.ok) {
-    errors.start = start.error;
-  } else if (start.valueMs > chartEndMs) {
-    errors.start = `Start must be at most ${chartEndMs} ms.`;
-  }
-  if (!end.ok) {
-    errors.end = end.error;
-  } else if (end.valueMs > chartEndMs) {
-    errors.end = `End must be at most ${chartEndMs} ms.`;
-  }
-
-  if (start.ok && end.ok && start.valueMs >= end.valueMs) {
-    errors.range = "End must be greater than start.";
-  }
-  if (Object.keys(errors).length > 0 || !start.ok || !end.ok) {
-    return { ok: false, draft, errors };
-  }
-  return {
-    ok: true,
-    draft,
-    range: { startMs: start.valueMs, endMs: end.valueMs },
-    errors,
   };
 }
 

@@ -36,11 +36,6 @@ export interface ViewportSourceTimeOptions {
   readonly judgmentLineRatio?: number;
 }
 
-export interface ViewportSourceRangeOptions extends Omit<ViewportSourceTimeOptions, "viewportY"> {
-  readonly anchorY: number;
-  readonly focusY: number;
-}
-
 export interface ProjectedSceneRange {
   readonly y: number;
   readonly height: number;
@@ -103,16 +98,6 @@ export function viewportYToSourceTime(options: ViewportSourceTimeOptions): numbe
   return options.sourceRange
     ? clamp(sourceTimeMs, options.sourceRange.startMs, options.sourceRange.endMs)
     : sourceTimeMs;
-}
-
-export function viewportYRangeToSourceRange(
-  options: ViewportSourceRangeOptions,
-): TimeRangeV1 | undefined {
-  const anchorMs = viewportYToSourceTime({ ...options, viewportY: options.anchorY });
-  const focusMs = viewportYToSourceTime({ ...options, viewportY: options.focusY });
-  const startMs = Math.min(anchorMs, focusMs);
-  const endMs = Math.max(anchorMs, focusMs);
-  return startMs < endMs ? { startMs, endMs } : undefined;
 }
 
 export function projectSceneRange(
