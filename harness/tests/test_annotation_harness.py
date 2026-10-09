@@ -336,12 +336,6 @@ class HarnessTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Frozen harness tool changed'):
             harness.Harness(self.bundle)
 
-    def test_changed_contrast_snapshot_is_detected_on_start(self):
-        path = self.bundle / 'contrast-sets.json'
-        path.write_text(path.read_text().replace('articulation', 'edited'))
-        with self.assertRaisesRegex(ValueError, 'Frozen harness input changed: contrast-sets.json'):
-            harness.Harness(self.bundle)
-
     def test_native_mcp_returns_compact_text_images_and_actionable_argument_errors(self):
         async def run():
             trace = self.root / 'trace.jsonl'

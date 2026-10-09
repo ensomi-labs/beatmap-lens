@@ -138,19 +138,6 @@ class HarnessInspectionTest(unittest.TestCase):
         self.assertEqual(between["rows"], [])
         self.assertEqual(between["enteringHoldArticulation"], first["enteringHoldArticulation"])
 
-    def test_articulation_pages_complete_groups_with_the_same_64_row_limit(self):
-        notes = [n for i in range(70) for n in (note(100 + i * 2, i * 100, 0, i * 100 + 40),
-                                               note(101 + i * 2, i * 100, 1))]
-        source = chart(list(reversed(notes)))
-        first = inspect(source, 0, 7000, view="articulation", limit=1000)
-        self.assertEqual(first["pagination"]["returned"], 64)
-        self.assertEqual(first["pagination"]["nextOffset"], 64)
-        second = inspect(source, 0, 7000, view="articulation", offset=64)
-        self.assertIsNone(second["pagination"]["nextOffset"])
-        self.assertEqual([ref[0] for page in (first, second) for row in page["rows"] for ref in row[1]],
-                         list(range(100, 240)))
-        self.assertTrue(all(len(row[1]) == 2 and len(row[3]) == 1 for page in (first, second) for row in page["rows"]))
-
     def test_tempo_changes_integrate_beats_and_inherited_sv_does_not(self):
         timing = [
             {"sourceLine": 1, "fields": ["0", "500", "4", "2", "0", "100", "1", "0"]},

@@ -1,30 +1,12 @@
-import type { Sha256DigestFunction } from "./canonical-json";
 import type {
   AnnotationDocumentV1,
   FoundationRefV1,
   GoldAnnotationV1,
-  GoldExemplarRoleKindV1,
-  GoldExemplarRoleV1,
-  JudgmentFoundationV1,
   ReviewNoteStateV1,
   StableNoteRefV1,
   TimeRangeV1,
 } from "./contracts";
-import { assertActiveFoundationTagV1, foundationRefV1 } from "./foundation";
 import { intersectRanges } from "./range";
-
-export interface SetGoldExemplarRoleInputV1 {
-  readonly tagId: string;
-  readonly annotationId: string;
-  readonly kind: GoldExemplarRoleKindV1;
-  readonly now?: () => string;
-}
-
-export interface RemoveGoldExemplarRoleInputV1 {
-  readonly tagId: string;
-  readonly annotationId: string;
-  readonly now?: () => string;
-}
 
 export interface AddReviewNoteInputV1 {
   readonly id?: string;
@@ -71,47 +53,6 @@ export type CompleteAnnotationDocumentResultV1 =
       readonly ok: false;
       readonly blockers: readonly ChartCompletionBlockerV1[];
     };
-
-export async function setGoldExemplarRoleV1(
-  document: AnnotationDocumentV1,
-  foundation: JudgmentFoundationV1,
-  input: SetGoldExemplarRoleInputV1,
-  digest?: Sha256DigestFunction,
-): Promise<AnnotationDocumentV1> {
-  const annotation = findGoldAnnotation(document, input.annotationId);
-  const role = { kind: input.kind, tagId: input.tagId };
-  const exemplarRoles = sortRoles([
-    ...annotation.exemplarRoles.filter((candidate) => candidate.tagId !== role.tagId),
-    role,
-  ]);
-  assertGoldAnnotationSupportedByFoundation({ ...annotation, exemplarRoles }, foundation);
-
-  const updatedAt = input.now?.() ?? new Date().toISOString();
-  const currentFoundation = await foundationRefV1(foundation, digest);
-  return reviseGoldAnnotation(document, annotation.id, updatedAt, (entry) => ({
-    ...entry,
-    foundation: currentFoundation,
-    exemplarRoles,
-    updatedAt,
-  }));
-}
-
-export function removeGoldExemplarRoleV1(
-  document: AnnotationDocumentV1,
-  input: RemoveGoldExemplarRoleInputV1,
-): AnnotationDocumentV1 {
-  const annotation = findGoldAnnotation(document, input.annotationId);
-  if (!annotation.exemplarRoles.some((role) => role.tagId === input.tagId)) {
-    throw new Error(`Gold annotation ${input.annotationId} does not have role ${input.tagId}`);
-  }
-
-  const updatedAt = input.now?.() ?? new Date().toISOString();
-  return reviseGoldAnnotation(document, annotation.id, updatedAt, (entry) => ({
-    ...entry,
-    exemplarRoles: entry.exemplarRoles.filter((role) => role.tagId !== input.tagId),
-    updatedAt,
-  }));
-}
 
 export function addReviewNoteV1(
   document: AnnotationDocumentV1,
@@ -238,19 +179,6 @@ function reviseDocument(
   };
 }
 
-function reviseGoldAnnotation(
-  document: AnnotationDocumentV1,
-  annotationId: string,
-  updatedAt: string,
-  update: (annotation: GoldAnnotationV1) => GoldAnnotationV1,
-): AnnotationDocumentV1 {
-  return reviseDocument(document, updatedAt, {
-    annotations: document.annotations.map((annotation) =>
-      annotation.id === annotationId ? update(annotation) : annotation,
-    ),
-  });
-}
-
 function assertResultingGoldAnnotation(
   document: AnnotationDocumentV1,
   annotationId: string | undefined,
@@ -258,53 +186,6 @@ function assertResultingGoldAnnotation(
   if (annotationId && !document.annotations.some((annotation) => annotation.id === annotationId)) {
     throw new Error(`Gold annotation ${annotationId} does not exist`);
   }
-}
-
-function findGoldAnnotation(
-  document: AnnotationDocumentV1,
-  annotationId: string,
-): GoldAnnotationV1 {
-  const annotation = document.annotations.find((entry) => entry.id === annotationId);
-  if (!annotation) throw new Error(`Gold annotation ${annotationId} does not exist`);
-  return annotation;
-}
-
-function assertRoleCompatibleWithLabels(
-  annotation: GoldAnnotationV1,
-  role: GoldExemplarRoleV1,
-): void {
-  const hasLabel = annotation.labels.some((label) => label.tagId === role.tagId);
-  if (role.kind === "counterexample" && hasLabel) {
-    throw new Error(`Counterexample annotation ${annotation.id} is labeled ${role.tagId}`);
-  }
-  if (role.kind !== "counterexample" && !hasLabel) {
-    throw new Error(`Gold annotation ${annotation.id} is not labeled ${role.tagId}`);
-  }
-}
-
-function assertGoldAnnotationSupportedByFoundation(
-  annotation: GoldAnnotationV1,
-  foundation: JudgmentFoundationV1,
-): void {
-  for (const label of annotation.labels) assertActiveFoundationTagV1(foundation, label.tagId);
-  for (const role of annotation.exemplarRoles) {
-    assertActiveFoundationTagV1(foundation, role.tagId);
-    assertRoleCompatibleWithLabels(annotation, role);
-  }
-}
-
-function sortRoles(roles: readonly GoldExemplarRoleV1[]): readonly GoldExemplarRoleV1[] {
-  return [...roles].sort((left, right) =>
-    left.tagId < right.tagId
-      ? -1
-      : left.tagId > right.tagId
-        ? 1
-        : left.kind < right.kind
-          ? -1
-          : left.kind > right.kind
-            ? 1
-            : 0,
-  );
 }
 
 function copyRange(range: TimeRangeV1): TimeRangeV1 {

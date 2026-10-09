@@ -47,7 +47,7 @@ through concurrent agent judgment and note selection.
 | Location | Responsibility |
 | --- | --- |
 | `packages/beatmap-lens/` | Independent npm package |
-| `apps/inspector/` | Browser UI and its local Review service in `server/` |
+| `apps/inspector/` | Browser UI and its local services in `server/` |
 | `harness/` | Read-only inspection, queries, rendering, and example retrieval |
 | `annotation/pipeline/` | Corpus preparation, discovery, selection, annotation, delivery, and revision |
 | `annotation/evaluation/` | Benchmarks and skill/workflow regression gate |
@@ -77,11 +77,10 @@ preview servers. The last paths are remembered; **Open workspace** reconnects
 them. **Browse** also remains available in browsers with folder-picker support.
 Chart and audio access is read-only; saves go to the selected dataset folder.
 
-To compare two generators, open **Compare** or `/compare`. Enter a comparison
-manifest path, or two `.osu` paths and an output folder. Loop the proposed or
-provided excerpts, switch blind A/B views, and save a one-click verdict. See the
-[Inspector guide](apps/inspector/README.md) and
-[producer format](docs/inspector/model-comparison.md).
+Inspector's **Compare** workspace (`/compare`) judges two generated charts of one
+song blind, by listening. The [Inspector guide](apps/inspector/README.md#compare)
+covers its use; [model comparison packets](docs/inspector/model-comparison.md) is
+the format for jobs that produce comparisons and read the verdicts.
 
 `pnpm check` runs engineering checks. `pnpm check:regression` separately evaluates
 method changes; missing semantic replay remains missing evidence, not a quality

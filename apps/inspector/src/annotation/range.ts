@@ -21,10 +21,6 @@ export function rangeCandidates(
   return notes.filter((note) => noteIntersectsRange(note, range));
 }
 
-export function rangesIntersect(left: TimeRangeV1, right: TimeRangeV1): boolean {
-  return left.startMs < right.endMs && right.startMs < left.endMs;
-}
-
 export function intersectRanges(left: TimeRangeV1, right: TimeRangeV1): TimeRangeV1 | undefined {
   const startMs = Math.max(left.startMs, right.startMs);
   const endMs = Math.min(left.endMs, right.endMs);

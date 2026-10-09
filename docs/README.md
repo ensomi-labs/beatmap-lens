@@ -7,9 +7,11 @@ and design choices.
 
 ## Inspector
 
-- [Model comparison packets](inspector/model-comparison.md): manifests, blind listening,
-  automatic excerpts, audio energy, and saved verdicts.
-- [Open Inspector Compare](../apps/inspector/README.md): local command, URL, and demo path.
+- [Inspector guide](../apps/inspector/README.md): running Inspector, its workspaces,
+  and judging two charts in Compare.
+- [Model comparison packets](inspector/model-comparison.md): the manifest and verdict
+  format for blind two-model listening, how excerpts are proposed, and the limits of
+  the energy strip.
 
 ## Annotation
 

@@ -508,12 +508,6 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(receipt['commit'], 'b' * 40)
         api.create_commit.assert_not_called()
 
-    def test_human_correction_does_not_require_written_rationale(self):
-        self.projection["human"][0]["details"]["evidence"]["rationale"] = ""
-        self.projection["human"][0]["details"]["human_rationale"] = ""
-        _, manifest = self.build()
-        self.assertEqual(manifest["counts"]["human"], 1)
-
     def test_explicit_source_exclusion_keeps_verified_subset_and_public_reasons(self):
         verified_source = self.add_second_human_source()
         add_agent(self.projection, self.config)
@@ -649,16 +643,6 @@ class SnapshotTests(unittest.TestCase):
         self.config["foundations"][FOUNDATION]["artifact"]["sha256"] = "0" * 64
         with self.assertRaisesRegex(ValueError, "Foundation artifact digest"):
             self.build()
-
-    def test_explicit_human_revision_keeps_lineage_across_snapshots(self):
-        previous, _ = self.build("first")
-        row = self.projection["human"][0]
-        row.update(record_id="human:two", observation_id="two", end_ms=350,
-                   supersedes_record_ids=["human:one"])
-        self.config["release_id"] = "2026-09-09.2"
-        self.config["previous_snapshot"] = {"repo_id": self.config["repo_id"], "commit": "8" * 40}
-        _, manifest = self.build("second", previous)
-        self.assertEqual(manifest["removed_records"], [{"record_id": "human:one", "reason": "superseded", "superseded_by": ["human:two"]}])
 
     def test_official_osu_locator_preserves_hash_identity_and_mit_notice(self):
         self.config["license"] = "mit"

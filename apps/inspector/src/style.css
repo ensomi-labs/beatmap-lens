@@ -1434,6 +1434,7 @@ button:disabled {
 }
 
 .field-stack input,
+.field-stack select,
 .field-stack textarea,
 .range-inputs input,
 .tag-search {
@@ -1460,6 +1461,7 @@ button:disabled {
 }
 
 .field-stack input:focus,
+.field-stack select:focus,
 .field-stack textarea:focus,
 .range-inputs input:focus,
 .tag-search:focus {

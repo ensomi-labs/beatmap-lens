@@ -85,9 +85,3 @@ export function finalizeGestureTransaction<TEditorState, TKind extends string, T
     ? { outcome: "rollback", transaction }
     : { outcome: "commit", transaction, value };
 }
-
-export function rollbackGestureTransaction<TEditorState, TKind extends string>(
-  transaction: GestureTransaction<TEditorState, TKind>,
-): GestureFinalization<TEditorState, TKind, never> {
-  return { outcome: "rollback", transaction };
-}

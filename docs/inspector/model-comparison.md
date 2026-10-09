@@ -1,19 +1,19 @@
 # Model comparison packets
 
-Inspector Compare is a listening workflow for two generated charts of the same
-audio. It does not produce pattern annotations or quality scores. The researcher
-judges whether note starts, accents, density, and rests follow the music.
+Inspector **Compare** lets a person judge two generated charts of the same song by
+listening, without knowing which model produced which. An experiment job writes a
+*manifest* that lists the pairs; Compare appends one *verdict* line per judgment.
+This page is the contract between the two. How to open and use the page is in the
+[Inspector guide](../../apps/inspector/README.md#compare).
 
-Start and open it using the [Inspector instructions](../../apps/inspector/README.md).
-The local endpoint is `http://127.0.0.1:5174/compare`; enter the JSON file in
-**Manifest path**. A `?manifest=…` URL parameter can prefill that field, but does
-not open or write a comparison automatically.
+A verdict says which chart a listener felt follows the music better in one excerpt.
+It is not a pattern annotation, a Foundation label or a quality score, and it is
+stored apart from the annotation datasets.
 
-## Manifest version 1
+## Manifest
 
-Use UTF-8 JSON. Paths must be absolute or start with `~/`; they are resolved on
-the machine running Inspector. There is no assumed ensomi checkout location.
-An export job can write:
+UTF-8 JSON, version 1. Paths are absolute or start with `~/`, and are resolved on
+the machine that runs Inspector.
 
 ```json
 {
@@ -23,16 +23,10 @@ An export job can write:
     {
       "id": "5150-band3-seed0",
       "title": "5150",
-      "audio_path": "~/model-outputs/song/audio.mp3",
+      "audio_path": "~/model-outputs/5150/audio.mp3",
       "charts": [
-        {
-          "chart_path": "~/model-outputs/baseline/song/band-3-seed-0.osu",
-          "model": "head-baseline + R2"
-        },
-        {
-          "chart_path": "~/model-outputs/candidate/song/band-3-seed-0.osu",
-          "model": "head-candidate + R2"
-        }
+        { "chart_path": "~/model-outputs/baseline/5150/band-3-seed-0.osu", "model": "head-baseline + R2" },
+        { "chart_path": "~/model-outputs/candidate/5150/band-3-seed-0.osu", "model": "head-candidate + R2" }
       ],
       "difficulty_band": 3,
       "seed": 0,
@@ -49,124 +43,100 @@ An export job can write:
 }
 ```
 
-| Field | Contract |
+| Field | Meaning |
 | --- | --- |
-| `version` | Exactly `1`. |
-| `id` | Stable comparison/experiment ID. Use a new ID for a new experiment. |
-| `pairs` | One or more songs, each with exactly two charts. |
-| Pair `id` | Stable unique ID within this comparison. |
-| `title` | Human song title, shown while blind. Keep it model-neutral. |
-| `audio_path` | One shared audio track, with the same time origin as both charts. |
-| `charts` | Exactly two `{chart_path, model}` objects. Array order is input order, not displayed A/B order. Labels need to identify the variants unambiguously. |
-| `difficulty_band`, `seed` | Optional shared metadata. Band is a number or a display string; seed is a number. Both are visible while blind. |
-| `excerpts` | Optional list, in listening order. Omit it or use `[]` for automatic proposals. |
-| Excerpt `id` | Stable unique ID within its pair. |
-| `start_ms`, `end_ms` | Half-open interval in source audio milliseconds, normally 10–20 seconds long. Playback rate never changes these coordinates. |
-| `hint` | One neutral line describing what to listen for. Avoid model names, predictions, or declaring a winner. |
+| `version` | Always `1`. |
+| `id` | Identifies the experiment. A new experiment gets a new ID. |
+| `pairs[].id` | Unique within the manifest and stable across rewrites of it. |
+| `pairs[].title` | Song title, shown while blind. |
+| `pairs[].audio_path` | The one audio file both charts were made for, on the same time origin. |
+| `pairs[].charts` | Exactly two `{ chart_path, model }`. Order is input order only; A and B are assigned by Compare. `model` must tell the two apart. |
+| `pairs[].difficulty_band`, `pairs[].seed` | Optional, shown while blind. Band is a number or a short string; seed is a number. |
+| `pairs[].excerpts` | Optional, in listening order. Omit or leave empty to have Compare propose them. |
+| `excerpts[].id` | Unique within its pair and stable across rewrites. |
+| `excerpts[].start_ms`, `end_ms` | Half-open `[start, end)` in source audio milliseconds, usually 10–20 s long. Playback rate never changes them. |
+| `excerpts[].hint` | One neutral line on what to listen for. |
 
-The producer is responsible for matching song, difficulty, seed, and audio origin.
-Compare does not run the generators or infer these experiment conditions from
-filenames. `.osu` charts are baseline valid inputs. Inspector prioritizes 4K–7K;
-this workflow is intended first for 4K head-model comparisons.
+The producer is responsible for matching song, difficulty, seed and audio origin;
+Compare does not infer them. Everything shown while blind (the title, band, seed,
+hints and the manifest and verdict file names) must stay model-neutral: no model
+names, no predictions, no winner. The blinding is a property of the page, not a
+security boundary against someone reading the files.
 
-## Automatic excerpts
+Inspector draws 4K–7K charts best; this workflow was written first for 4K
+head-model comparisons.
 
-Without supplied excerpts, Inspector compares notes in each column, matching
-heads within 20 ms. Unmatched heads contribute one difference; a changed hold end
-contributes 0.25. It scores 15-second windows starting at one-second intervals
-(plus the final window), then greedily chooses up to five non-overlapping windows
-in decreasing difference order. Equal scores prefer earlier windows. An identical
-pair gets one excerpt explaining that note placement matches. Charts shorter
-than 15 seconds use their extent, with a ten-second minimum display interval.
+## Proposed excerpts
 
-This is a placement-difference heuristic. It does not claim that the highest
-count is the most musically important disagreement, or that either chart is
-better. Producer-supplied excerpts and hints take precedence.
+When a pair has no excerpts, Compare looks for places where the charts differ.
+Per column it matches note heads within 20 ms. An unmatched head counts 1 and a
+matched head whose hold end moved by more than 20 ms counts 0.25. It scores every
+15-second window starting on a whole second (plus the window ending at the song's
+end), then takes up to five non-overlapping windows, highest score first and
+earlier first on ties. Charts shorter than 15 s use one window over their length,
+at least 10 s. Identical charts get one window whose hint says so.
 
-## Blinding and playback
+The score counts placement differences. It does not claim that the most different
+window matters most musically, or that either chart is better.
 
-The local service randomly assigns A/B independently for every excerpt. This
-assignment remains fixed while that comparison is open. Both views use one audio
-element and the Inspector media clock. Switching the visible chart never restarts
-the song; the loop, seek position, pitch-preserving rate, and zoom are shared.
+## Blinding
 
-The service sends chart geometry with metadata and diagnostics removed. Model
-labels, source paths, and the assignment stay on the service until a verdict has
-successfully been written. A failed save keeps the UI blind and retains the note
-for retry. The manifest path, output filename, song title, band, seed, and hints
-are visible, so producers should avoid identity clues there. This is research
-blinding in the UI, not a security boundary against a person reading local files.
+For every excerpt the local service decides at random which chart is A. The
+browser receives note geometry only; chart metadata, model labels and paths stay
+on the service until a verdict has been written. A failed write keeps the page
+blind and keeps the note for a retry.
 
-On reopen, saved verdicts restore the original mapping when comparison/pair ID,
-excerpt ID and bounds, and both model labels and chart hashes match. Unsaved excerpts are shuffled
-again. The UI shows completed excerpts as already judged and does not submit them
-again. The file remains append-only; readers should use the latest matching
-record if multiple records exist, for example from separately opened sessions.
+When a manifest is reopened, an excerpt that already has a verdict is shown with
+the same A/B it was judged under. A verdict belongs to an excerpt when the
+comparison ID, pair ID, excerpt ID and bounds match and both charts have the same
+model label and file hash, in either order. Moving or reordering the chart files
+therefore does not invert a verdict. Excerpts without a
+verdict are shuffled again.
 
-## Audio strip
+## Energy strip
 
-Audio analysis belongs to Inspector (`src/compare/audio-envelope.ts`), alongside
-its browser playback and local service. It introduces no audio runtime or DOM
-dependency into `beatmap-lens` and does not invoke ensomi-model.
+Beside the charts, Compare draws the song's RMS energy (white) and its onset rise
+(blue). Both are computed in the browser from the decoded audio, in 10 ms bins
+across all channels: energy is the RMS, rise is how far it exceeds the mean of
+the previous 50 ms. Each curve is scaled to its own song-wide maximum and scrolls
+on the same time axis as the notes, whatever the playback rate.
 
-The browser decodes the shared audio once per song. It computes RMS across channels
-in 10 ms bins, plus positive RMS rises against the preceding 50 ms mean as a simple
-onset envelope. Channels contribute squared energy so opposite polarity does not
-cancel them. Each curve is normalized by its full-song maximum, identically for A
-and B. White shows RMS energy; blue shows onset energy rises. They scroll with the
-same source-time projection as the falling notes, independent of playback rate.
+RMS is an energy proxy, not perceived loudness, and a rise is not a validated
+onset or accent detector: sustained, distorted, compressed or soft attacks can
+look unlike how they sound. The strip helps a listener find a moment; listening
+decides the verdict.
 
-RMS is an energy proxy, not perceptual loudness; energy rises are not a validated
-musical onset or emphasis detector. Sustained, distorted, compressed, and soft
-attacks can look different from their perceived emphasis. Listening decides the
-verdict. The display does not score alignment or decide a winner.
+## Verdicts
 
-## Verdict JSONL
+Verdicts go to `<manifest name>.verdicts.jsonl` beside the manifest, or in the
+folder chosen on the setup form. Two loose charts write
+`comparison.verdicts.jsonl` in the chosen folder. Charts, audio and manifests are
+only read.
 
-For `comparison.json`, the default output is `comparison.verdicts.jsonl` beside
-it. Choosing an output folder changes the folder, preserving the filename. Two
-chart paths use `comparison.verdicts.jsonl` in the required chosen folder. Only
-verdict files are written; charts, audio, and manifests remain read-only.
-
-Each click appends one UTF-8 JSON object and a newline. Required fields are:
+Each verdict appends one line:
 
 ```json
 {
   "version": 1,
-  "id": "a-generated-uuid",
+  "id": "1f0c6c1e-6d5e-4bd6-9a0e-6a3d1c2b9f10",
   "comparison_id": "head-model-trial-001",
   "pair_id": "5150-band3-seed0",
-  "excerpt": {
-    "id": "first-breath",
-    "start_ms": 25000,
-    "end_ms": 40000,
-    "hint": "Listen for the breath, then the accented return."
-  },
-  "shown_a": {
-    "model": "head-candidate + R2",
-    "chart_path": "/absolute/path/to/candidate.osu",
-    "sha256": "sha256-of-exact-osu-bytes"
-  },
-  "shown_b": {
-    "model": "head-baseline + R2",
-    "chart_path": "/absolute/path/to/baseline.osu",
-    "sha256": "sha256-of-exact-osu-bytes"
-  },
+  "excerpt": { "id": "first-breath", "start_ms": 25000, "end_ms": 40000, "hint": "Listen for the breath, then the accented return." },
+  "shown_a": { "model": "head-candidate + R2", "chart_path": "/path/to/model-outputs/candidate/5150/band-3-seed-0.osu", "sha256": "…" },
+  "shown_b": { "model": "head-baseline + R2", "chart_path": "/path/to/model-outputs/baseline/5150/band-3-seed-0.osu", "sha256": "…" },
   "verdict": "a_better",
-  "note": "The return feels more connected to the accent.",
+  "note": "The return lands with the accent.",
   "time": "2026-10-09T01:00:00.000Z",
   "playback_rate": 1
 }
 ```
 
-`verdict` is `a_better`, `b_better`, `no_difference`, or `cant_tell`. A/B refer to
-the displayed labels, **not manifest order**. `note` can be empty. `time` is the
-service's UTC ISO timestamp; `playback_rate` is the speed at submission. IDs and
-source hashes preserve the context agents need to read the result. These are
-model-comparison decisions, not Foundation labels or annotation records.
+- `verdict` is `a_better`, `b_better`, `no_difference` or `cant_tell`. A and B mean
+  the charts as displayed (`shown_a`, `shown_b`), not manifest order.
+- `shown_a` and `shown_b` carry the resolved path and the SHA-256 of the exact
+  `.osu` bytes, so a reader can tell which file was judged.
+- `note` may be empty. `time` is the service's UTC time. `playback_rate` is the
+  audio rate at the moment of the choice.
 
-The local demo lives under
-`~/ensomi/ensomi-model/artifacts/audio-rows-20261008/lens-demo/`. It compares two
-difficulty bands of existing exports because matched model variants were not yet
-available. Its automated sample verdict must be excluded from human preference
-analysis.
+The file is append-only. If an excerpt has several lines (for example from two
+sessions open at once), the last one is the verdict.

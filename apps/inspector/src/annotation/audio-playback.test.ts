@@ -295,24 +295,6 @@ describe("AudioPlaybackController", () => {
     unsubscribe();
   });
 
-  it("falls back without blocking when media playback is rejected", async () => {
-    const scheduler = new TestFrameScheduler();
-    const media = new FakeAudio(new Error("Autoplay rejected"));
-    const controller = controllerWith({ media, scheduler });
-    await controller.loadBeatmapAudio(context(directory({ "song.ogg": audioFile("song.ogg") })));
-    controller.seek(900);
-    await controller.play();
-
-    await controller.setMusicEnabled(true);
-
-    expect(controller.audioStatus).toEqual({ kind: "rejected", message: "Autoplay rejected" });
-    expect(controller.playing).toBe(true);
-    expect(controller.currentTimeMs).toBe(900);
-
-    scheduler.advance(100);
-    expect(controller.currentTimeMs).toBe(1_000);
-  });
-
   it("falls back from media rejection without applying offset to chart time", async () => {
     const scheduler = new TestFrameScheduler();
     const media = new FakeAudio(new Error("Autoplay rejected"));
@@ -329,6 +311,9 @@ describe("AudioPlaybackController", () => {
     expect(controller.playing).toBe(true);
     expect(controller.currentTimeMs).toBe(900);
     expect(media.currentTime).toBe(1);
+
+    scheduler.advance(100);
+    expect(controller.currentTimeMs).toBe(1_000);
   });
 
   it("does not resume fallback playback from a stale media rejection after pause", async () => {

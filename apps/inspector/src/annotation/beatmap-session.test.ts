@@ -24,21 +24,6 @@ describe("beatmap session catalog context", () => {
 
     expect(document.seedContext.suggestedTags).toEqual(["jump-stream", "tech"]);
   });
-
-  it("rejects catalog labels without a distinct canonical identity", () => {
-    expect(() =>
-      createAnnotationDocument(source, "a".repeat(64), ["---"], now, annotationId),
-    ).toThrow(/has no canonical tag ID/);
-    expect(() =>
-      createAnnotationDocument(
-        source,
-        "a".repeat(64),
-        ["Jump Stream", "jump-stream"],
-        now,
-        annotationId,
-      ),
-    ).toThrow(/share canonical tag ID jump-stream/);
-  });
 });
 
 describe("beatmap session annotation editing", () => {

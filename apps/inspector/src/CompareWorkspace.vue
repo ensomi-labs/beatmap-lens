@@ -1,285 +1,771 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref, shallowRef } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, shallowRef, triggerRef } from "vue";
+import { defaultVisualSpeed, visualSpeedPresets } from "./annotation/buffered-scene";
+import { isNativeActivationTarget, isTypingTarget } from "./annotation/keyboard-targets";
 import { MediaPlaybackClock } from "./annotation/media-playback-clock";
-import { SUPPORTED_PLAYBACK_RATES } from "./annotation/playback-rate";
+import { type PlaybackRate, SUPPORTED_PLAYBACK_RATES } from "./annotation/playback-rate";
+import { formatTimelineRangeTime as formatTime } from "./annotation/timeline-range";
 import CompareStage from "./CompareStage.vue";
 import { type AudioEnvelope, decodeEnvelope } from "./compare/audio-envelope";
-import { comparisonJson, comparisonRequest, formatComparisonTime as time } from "./compare/client";
-import type { BlindExcerpt, ComparisonVerdict, OpenComparison, VerdictRecord } from "./compare/contracts";
+import { comparisonJson, comparisonRequest } from "./compare/client";
+import type {
+  BlindExcerpt,
+  ComparisonVerdict,
+  ExcerptTarget,
+  OpenComparison,
+  VerdictRecord,
+} from "./compare/contracts";
 import WorkspaceModeSwitch from "./WorkspaceModeSwitch.vue";
 import type { WorkspaceMode } from "./workspace-mode";
 
 const emit = defineEmits<{ "change-mode": [mode: WorkspaceMode] }>();
-const inputMode = ref<"manifest" | "paths">("manifest");
-const manifestPath = ref(new URLSearchParams(window.location.search).get("manifest") ?? localStorage.getItem("lens-compare-manifest") ?? "");
-const chartOne = ref("");
-const chartTwo = ref("");
+
+const rememberedManifest = "lens-compare-manifest";
+const verdictChoices: { value: ComparisonVerdict; label: string }[] = [
+  { value: "a_better", label: "A better" },
+  { value: "b_better", label: "B better" },
+  { value: "no_difference", label: "No difference" },
+  { value: "cant_tell", label: "Can't tell" },
+];
+const views = [
+  { label: "A", key: "a", shown: [0] },
+  { label: "B", key: "b", shown: [1] },
+  { label: "Side by side", key: "s", shown: [0, 1] },
+] as const;
+
+// Setup
+const openFrom = ref<"manifest" | "charts">("manifest");
+const manifestPath = ref(
+  new URLSearchParams(window.location.search).get("manifest") ??
+    localStorage.getItem(rememberedManifest) ??
+    "",
+);
+const chartPaths = ref<[string, string]>(["", ""]);
 const outputFolder = ref("");
+
+// Session
 const opened = shallowRef<OpenComparison>();
 const blind = shallowRef<BlindExcerpt>();
 const envelope = shallowRef<AudioEnvelope>();
 const pairIndex = ref(0);
 const excerptIndex = ref(0);
+const note = ref("");
+const view = ref<(typeof views)[number]["key"]>("s");
+const playheadMs = ref(0);
+const playing = ref(false);
+const rate = ref<PlaybackRate>(1);
+const visualSpeed = ref(defaultVisualSpeed);
+const mobilePanel = ref<"source" | "preview" | "details">("preview");
 const busy = ref(false);
 const saving = ref(false);
 const error = ref("");
-const status = ref("");
-const note = ref("");
-const playhead = ref(0);
-const playing = ref(false);
-const rate = ref(1);
-const speed = ref(240);
-const view = ref<"A" | "B" | "both">("both");
-const mobilePanel = ref("source");
+
 const pair = computed(() => opened.value?.pairs[pairIndex.value]);
 const excerpt = computed(() => pair.value?.excerpts[excerptIndex.value]);
 const verdict = computed(() => blind.value?.verdict);
-const completed = computed(() => opened.value?.pairs.reduce((sum, entry) => sum + entry.excerpts.filter((part) => part.saved).length, 0) ?? 0);
-const total = computed(() => opened.value?.pairs.reduce((sum, entry) => sum + entry.excerpts.length, 0) ?? 0);
-const choices: { value: ComparisonVerdict; label: string }[] = [
-  { value: "a_better", label: "A better" }, { value: "b_better", label: "B better" },
-  { value: "no_difference", label: "No difference" }, { value: "cant_tell", label: "Can't tell" },
-];
+const verdictLabel = computed(
+  () => verdictChoices.find((choice) => choice.value === verdict.value?.verdict)?.label,
+);
+const queue = computed(() =>
+  (opened.value?.pairs ?? []).flatMap((song, songIndex) =>
+    song.excerpts.map((part, index) => ({ songIndex, index, saved: part.saved })),
+  ),
+);
+const judged = computed(() => queue.value.filter((entry) => entry.saved).length);
+/** The next excerpt without a verdict after the current one, wrapping across songs. */
+const nextUnjudged = computed(() => {
+  const at = queue.value.findIndex(
+    (entry) => entry.songIndex === pairIndex.value && entry.index === excerptIndex.value,
+  );
+  return [...queue.value.slice(at + 1), ...queue.value.slice(0, at)].find((entry) => !entry.saved);
+});
+const status = computed(() => {
+  if (error.value) return { tone: "error", text: "Needs attention" };
+  if (saving.value) return { tone: "warn", text: "Saving verdict" };
+  if (busy.value) return { tone: "warn", text: "Loading" };
+  if (verdict.value) return { tone: "ready", text: "Verdict saved" };
+  return { tone: "idle", text: "Blind" };
+});
+const shownCharts = computed(() => views.find((entry) => entry.key === view.value)?.shown ?? views[2].shown);
+const verdictFile = computed(() => opened.value?.verdict_path.split(/[\\/]/).at(-1));
+
 let clock: MediaPlaybackClock | undefined;
 let media: HTMLAudioElement | undefined;
-let audioUrl: string | undefined;
+let mediaUrl: string | undefined;
 let disposed = false;
 
-function target() { return { session_id: opened.value?.session_id, pair_index: pairIndex.value, excerpt_index: excerptIndex.value }; }
-function releaseAudio() {
-  clock?.dispose();
-  clock = undefined;
-  if (media) { media.removeAttribute("src"); media.load(); media = undefined; }
-  if (audioUrl) URL.revokeObjectURL(audioUrl);
-  audioUrl = undefined;
-  envelope.value = undefined;
-  playing.value = false;
+onMounted(() => window.addEventListener("keydown", handleKeydown));
+onBeforeUnmount(() => {
+  disposed = true;
+  window.removeEventListener("keydown", handleKeydown);
+  releaseAudio();
+});
+
+function target(): ExcerptTarget {
+  return {
+    session_id: opened.value?.session_id ?? "",
+    pair_index: pairIndex.value,
+    excerpt_index: excerptIndex.value,
+  };
 }
-function report(errorValue: unknown) { error.value = errorValue instanceof Error ? errorValue.message : String(errorValue); }
+
+function report(cause: unknown) {
+  error.value = cause instanceof Error ? cause.message : String(cause);
+}
 
 async function open() {
   busy.value = true;
   error.value = "";
-  status.value = "Opening comparison…";
   try {
     const result = await comparisonJson<OpenComparison>("open", {
-      ...(inputMode.value === "manifest" ? { manifest_path: manifestPath.value } : { chart_paths: [chartOne.value, chartTwo.value] }),
+      ...(openFrom.value === "manifest"
+        ? { manifest_path: manifestPath.value }
+        : { chart_paths: chartPaths.value }),
       ...(outputFolder.value.trim() ? { output_folder: outputFolder.value } : {}),
     });
     if (disposed) return;
+    if (openFrom.value === "manifest") localStorage.setItem(rememberedManifest, manifestPath.value);
     opened.value = result;
-    if (inputMode.value === "manifest") localStorage.setItem("lens-compare-manifest", manifestPath.value);
-    await selectExcerpt(0, 0);
-  } catch (cause) { report(cause); }
-  finally { busy.value = false; status.value = ""; }
+    await select(0, 0);
+  } catch (cause) {
+    report(cause);
+  } finally {
+    busy.value = false;
+  }
 }
 
-async function selectExcerpt(song: number, index: number) {
-  const audioChanged = song !== pairIndex.value || !clock;
-  busy.value = true;
-  error.value = "";
+async function select(songIndex: number, index: number) {
+  const songChanged = songIndex !== pairIndex.value || !clock;
   clock?.pause();
+  pairIndex.value = songIndex;
+  excerptIndex.value = index;
   blind.value = undefined;
   note.value = "";
-  pairIndex.value = song;
-  excerptIndex.value = index;
+  error.value = "";
+  busy.value = true;
   try {
     const result = await comparisonJson<BlindExcerpt>("excerpt", target());
     if (disposed) return;
     blind.value = result;
     note.value = result.verdict?.note ?? "";
-    if (audioChanged) {
-      releaseAudio();
-      status.value = "Loading audio and measuring energy…";
-      const bytes = await (await comparisonRequest("audio", target())).arrayBuffer();
-      const analyzed = await decodeEnvelope(bytes.slice(0));
-      if (disposed) return;
-      envelope.value = analyzed;
-      audioUrl = URL.createObjectURL(new Blob([bytes]));
-      media = new Audio(audioUrl);
-      await new Promise<void>((resolve, reject) => {
-        media?.addEventListener("loadedmetadata", () => resolve(), { once: true });
-        media?.addEventListener("error", () => reject(new Error("The browser could not load this audio.")), { once: true });
-        media?.load();
-      });
-      if (disposed) return;
-      clock = new MediaPlaybackClock(media, undefined, (cause) => { clock?.pause(); report(cause); });
-      clock.subscribe((state) => { playhead.value = state.currentTimeMs; playing.value = state.playing; });
-      clock.setPlaybackRate(rate.value);
-    }
+    if (songChanged) await loadAudio();
     clock?.seek(excerpt.value?.start_ms ?? 0);
     mobilePanel.value = "preview";
-  } catch (cause) { report(cause); }
-  finally { busy.value = false; status.value = ""; }
+  } catch (cause) {
+    report(cause);
+  } finally {
+    busy.value = false;
+  }
+}
+
+/** One audio element per song; both charts follow its clock, so switching views never seeks. */
+async function loadAudio() {
+  releaseAudio();
+  const bytes = await (await comparisonRequest("audio", target())).arrayBuffer();
+  // Decoding detaches the buffer it is given, and the media element still needs the bytes.
+  const analyzed = await decodeEnvelope(bytes.slice(0));
+  if (disposed) return;
+  envelope.value = analyzed;
+  mediaUrl = URL.createObjectURL(new Blob([bytes]));
+  const element = new Audio(mediaUrl);
+  media = element;
+  await new Promise<void>((resolve, reject) => {
+    element.addEventListener("loadedmetadata", () => resolve(), { once: true });
+    element.addEventListener(
+      "error",
+      () => reject(new Error("The browser could not load this audio.")),
+      { once: true },
+    );
+    element.load();
+  });
+  if (disposed) return;
+  const songClock = new MediaPlaybackClock(element, undefined, (cause) => {
+    songClock.pause();
+    report(cause);
+  });
+  songClock.subscribe((state) => {
+    playheadMs.value = state.currentTimeMs;
+    playing.value = state.playing;
+  });
+  songClock.setPlaybackRate(rate.value);
+  clock = songClock;
+}
+
+function releaseAudio() {
+  clock?.dispose();
+  clock = undefined;
+  if (media) {
+    media.removeAttribute("src");
+    media.load();
+    media = undefined;
+  }
+  if (mediaUrl) URL.revokeObjectURL(mediaUrl);
+  mediaUrl = undefined;
+  envelope.value = undefined;
+  playing.value = false;
 }
 
 async function togglePlayback() {
-  if (!clock || !excerpt.value) return;
-  if (playing.value) { clock.pause(); return; }
-  const position = playhead.value;
+  const range = excerpt.value;
+  if (!clock || !range || busy.value) return;
+  if (playing.value) {
+    clock.pause();
+    return;
+  }
+  const position = playheadMs.value;
   error.value = "";
   try {
-    const started = clock.loopSelection({ startMs: excerpt.value.start_ms, endMs: excerpt.value.end_ms });
-    if (position >= excerpt.value.start_ms && position < excerpt.value.end_ms) clock.seek(position);
+    const started = clock.loopSelection({ startMs: range.start_ms, endMs: range.end_ms });
+    // Resume where the listener paused inside the excerpt, not from its start.
+    if (position >= range.start_ms && position < range.end_ms) clock.seek(position);
     await started;
-  } catch (cause) { report(cause); }
+  } catch (cause) {
+    report(cause);
+  }
 }
 
-function setRate(value: number) { rate.value = value; clock?.setPlaybackRate(value); }
+function seek(timeMs: number) {
+  clock?.seek(timeMs);
+}
+
+function setRate(value: PlaybackRate) {
+  rate.value = value;
+  clock?.setPlaybackRate(value);
+}
+
 async function save(value: ComparisonVerdict) {
-  if (!blind.value || verdict.value || saving.value) return;
+  const current = blind.value;
+  if (!current || current.verdict || saving.value) return;
   saving.value = true;
   error.value = "";
   try {
-    const saved = await comparisonJson<VerdictRecord>("verdict", { ...target(), verdict: value, note: note.value, playback_rate: rate.value });
+    const record = await comparisonJson<VerdictRecord>("verdict", {
+      ...target(),
+      verdict: value,
+      note: note.value,
+      playback_rate: rate.value,
+    });
     if (disposed) return;
-    blind.value = { ...blind.value, verdict: saved };
-    if (opened.value && excerpt.value) {
+    blind.value = { ...current, verdict: record };
+    if (excerpt.value) {
       excerpt.value.saved = true;
-      opened.value = { ...opened.value };
+      triggerRef(opened);
     }
-  } catch (cause) { report(cause); }
-  finally { saving.value = false; }
+  } catch (cause) {
+    report(cause);
+  } finally {
+    saving.value = false;
+  }
 }
 
-function nextExcerpt() {
-  const pairs = opened.value?.pairs;
-  if (!pairs) return;
-  const positions = pairs.flatMap((song, i) => song.excerpts.map((part, j) => ({ song: i, index: j, saved: part.saved })));
-  const current = positions.findIndex((entry) => entry.song === pairIndex.value && entry.index === excerptIndex.value);
-  const next = [...positions.slice(current + 1), ...positions.slice(0, current)].find((entry) => !entry.saved);
-  if (next) void selectExcerpt(next.song, next.index);
+function close() {
+  releaseAudio();
+  opened.value = undefined;
+  blind.value = undefined;
+  error.value = "";
 }
 
-function close() { releaseAudio(); opened.value = undefined; blind.value = undefined; error.value = ""; mobilePanel.value = "source"; }
-onBeforeUnmount(() => { disposed = true; releaseAudio(); });
+function handleKeydown(event: KeyboardEvent) {
+  if (!blind.value || event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey)
+    return;
+  if (isTypingTarget(event.target)) return;
+  if (event.key === " ") {
+    if (isNativeActivationTarget(event.target)) return;
+    event.preventDefault();
+    void togglePlayback();
+    return;
+  }
+  const next = views.find((entry) => entry.key === event.key.toLowerCase());
+  if (next) view.value = next.key;
+}
 </script>
 
 <template>
-  <main class="compare-workspace" :data-panel="mobilePanel">
-    <header class="compare-header">
-      <a href="/" class="compare-brand">BEATMAP LENS</a>
-      <h1>Compare by listening</h1>
-      <WorkspaceModeSwitch model-value="compare" :disabled="busy || saving" @update:model-value="emit('change-mode', $event)" />
-    </header>
-    <nav v-if="opened" class="compare-mobile-switch" aria-label="Comparison panels">
-      <button v-for="panel in ['source', 'preview', 'details']" :key="panel" type="button" :aria-pressed="mobilePanel === panel" @click="mobilePanel = panel">{{ panel }}</button>
-    </nav>
-    <div v-if="error" class="compare-message compare-error" role="alert">{{ error }}<button v-if="opened && !busy" type="button" @click="selectExcerpt(pairIndex, excerptIndex)">Reload excerpt</button></div>
-    <p v-if="status" class="compare-message" role="status">{{ status }}</p>
-    <form v-if="!opened" class="compare-setup" @submit.prevent="open">
-      <h2>Listen where the charts differ</h2>
-      <p>Short excerpts, one shared audio track, and a blind A/B choice. Each verdict saves as soon as you choose it.</p>
-      <div class="compare-actions">
-        <button type="button" :aria-pressed="inputMode === 'manifest'" @click="inputMode = 'manifest'">Manifest</button>
-        <button type="button" :aria-pressed="inputMode === 'paths'" @click="inputMode = 'paths'">Two chart paths</button>
-      </div>
-      <label v-if="inputMode === 'manifest'">Manifest path<input v-model="manifestPath" name="manifest" placeholder="~/ensomi/ensomi-model/artifacts/…/comparison.json" required :disabled="busy"></label>
-      <template v-else>
-        <label>First chart path<input v-model="chartOne" name="chart-one" placeholder="/full/path/to/first.osu" required :disabled="busy"></label>
-        <label>Second chart path<input v-model="chartTwo" name="chart-two" placeholder="/full/path/to/second.osu" required :disabled="busy"></label>
-        <p>Choose charts of the same song, difficulty, and seed. Audio comes from the first chart's AudioFilename. A and B are randomized for each excerpt.</p>
-      </template>
-      <label>Verdict output folder {{ inputMode === 'manifest' ? '(optional)' : '' }}<input v-model="outputFolder" name="output-folder" :required="inputMode === 'paths'" :placeholder="inputMode === 'manifest' ? 'Leave blank to save beside the manifest' : '/full/path/to/verdicts'" :disabled="busy"></label>
-      <button type="submit" class="compare-primary" :disabled="busy">{{ busy ? 'Opening…' : 'Open comparison' }}</button>
-    </form>
-    <div v-else class="compare-body">
-      <aside class="compare-source">
-        <div class="compare-rail-heading"><h2>Listening queue</h2><span>{{ completed }} / {{ total }}</span></div>
-        <label>Song<select aria-label="Song" :value="pairIndex" :disabled="busy || saving" @change="selectExcerpt(Number(($event.target as HTMLSelectElement).value), 0)"><option v-for="(song, i) in opened.pairs" :key="i" :value="i">{{ song.title }}</option></select></label>
-        <p v-if="pair" class="compare-meta">{{ pair.difficulty_band !== undefined ? `Band ${pair.difficulty_band} · ` : '' }}{{ pair.seed !== undefined ? `Seed ${pair.seed}` : '' }}</p>
-        <ol class="compare-excerpts">
-          <li v-for="(part, i) in pair?.excerpts" :key="part.id"><button type="button" :aria-current="excerptIndex === i ? 'step' : undefined" :disabled="busy || saving" @click="selectExcerpt(pairIndex, i)"><span>{{ time(part.start_ms) }}–{{ time(part.end_ms) }} <small>{{ part.saved ? 'Saved' : `${Math.round((part.end_ms - part.start_ms) / 1000)} s` }}</small></span><span>{{ part.hint }}</span></button></li>
-        </ol>
-        <p class="compare-copy">A and B are randomized separately for each excerpt. Identities appear after your verdict.</p>
-        <button type="button" :disabled="busy || saving" @click="close">Open another comparison</button>
-      </aside>
-      <section class="compare-preview" aria-label="Comparison preview">
-        <div class="compare-preview-heading"><h2>{{ pair?.title }}</h2><span v-if="excerpt">{{ time(excerpt.start_ms) }}–{{ time(excerpt.end_ms) }}</span></div>
-        <fieldset class="compare-actions compare-view-switch" aria-label="Chart view">
-          <button v-for="option in (['A', 'B', 'both'] as const)" :key="option" type="button" :aria-pressed="view === option" @click="view = option">{{ option === 'both' ? 'Side by side' : `Show ${option}` }}</button>
-        </fieldset>
-        <div class="compare-stage-gutter"><CompareStage v-if="blind" :charts="blind.charts" v-bind="envelope ? { envelope } : {}" :playhead="playhead" :speed="speed" :view="view" /><div v-else class="compare-stage-placeholder">Loading excerpt…</div></div>
-        <div class="compare-transport">
-          <button type="button" class="compare-primary" :disabled="busy || !blind" @click="togglePlayback">{{ playing ? 'Pause' : 'Loop excerpt' }}</button>
-          <button type="button" :disabled="busy || !blind" @click="clock?.seek(excerpt?.start_ms ?? 0)">Restart</button>
-          <output aria-label="Playhead">{{ time(playhead) }}</output>
-          <label>Speed<select aria-label="Playback speed" :value="rate" @change="setRate(Number(($event.target as HTMLSelectElement).value))"><option v-for="value in SUPPORTED_PLAYBACK_RATES" :key="value" :value="value">{{ value }}×</option></select></label>
-          <label>Zoom<select v-model.number="speed" aria-label="Chart zoom"><option :value="120">Wide</option><option :value="240">Normal</option><option :value="480">Close</option></select></label>
+  <main
+    id="main-content"
+    class="bench annotation-bench"
+    :class="{ 'has-active-workspace': opened }"
+    tabindex="-1"
+  >
+    <header v-if="!opened" class="app-bar annotation-app-bar">
+      <div class="brand-lockup">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <div>
+          <p class="brand-name">Beatmap Lens</p>
+          <p class="brand-edition">Blind comparison</p>
         </div>
-        <label v-if="excerpt" class="compare-seek">Excerpt position<input aria-label="Excerpt position" type="range" :min="excerpt.start_ms" :max="excerpt.end_ms - 1" step="1" :value="playhead" :disabled="busy" @input="clock?.seek(Number(($event.target as HTMLInputElement).value))"></label>
-        <p class="compare-copy">White: audio energy. Blue: onset energy rises. Read across to the notes at the same moment. Pitch is kept when slowing down.</p>
-      </section>
-      <aside class="compare-details">
-        <h2>Which follows the music?</h2>
-        <p class="compare-hint">{{ excerpt?.hint }}</p>
-        <p class="compare-copy">Listen for accents, meaningful note starts, and rests where the music breathes.</p>
-        <label>Optional note<textarea v-model="note" rows="3" placeholder="A few words, if useful" :disabled="busy || saving || !!verdict" /></label>
-        <div class="compare-verdicts"><button v-for="choice in choices" :key="choice.value" type="button" :aria-pressed="verdict?.verdict === choice.value" :disabled="busy || saving || !blind || !!verdict" @click="save(choice.value)">{{ choice.label }}</button></div>
-        <p v-if="saving" role="status">Saving verdict…</p>
-        <div v-if="verdict" class="compare-reveal" role="status"><strong>Saved · {{ choices.find(choice => choice.value === verdict?.verdict)?.label }}</strong><p>A · {{ verdict.shown_a.model }}<br>B · {{ verdict.shown_b.model }}</p><button v-if="completed < total" type="button" :disabled="busy" class="compare-primary" @click="nextExcerpt">Next unheard excerpt →</button><p v-else>All excerpts saved.</p></div>
-        <p class="compare-copy">{{ verdict ? 'Saved to' : 'Verdicts will save to' }}<br><span class="compare-output">{{ opened.verdict_path }}</span></p>
-      </aside>
-    </div>
+      </div>
+      <div class="annotation-chart-context">
+        <span>Comparison</span>
+        <strong>Not opened</strong>
+      </div>
+      <WorkspaceModeSwitch
+        model-value="compare"
+        :disabled="busy"
+        @update:model-value="emit('change-mode', $event)"
+      />
+    </header>
+
+    <section v-if="!opened" class="annotation-onboarding" aria-labelledby="compare-heading">
+      <div class="onboarding-intro">
+        <p class="section-kicker"><span class="section-number">01</span> Blind listening</p>
+        <h1 id="compare-heading">Compare two charts by ear</h1>
+        <p>
+          Loop short excerpts of one song and switch between A and B without stopping the audio.
+          Model names stay hidden until your verdict is saved.
+        </p>
+        <dl class="onboarding-policies">
+          <div>
+            <dt>A and B</dt>
+            <dd>Shuffled per excerpt</dd>
+          </div>
+          <div>
+            <dt>Audio</dt>
+            <dd>One clock for both</dd>
+          </div>
+          <div>
+            <dt>Verdicts</dt>
+            <dd>Appended, never edited</dd>
+          </div>
+        </dl>
+      </div>
+
+      <form class="onboarding-form" @submit.prevent="open">
+        <label class="field-stack">
+          <span>Open from</span>
+          <select v-model="openFrom" :disabled="busy">
+            <option value="manifest">Comparison manifest</option>
+            <option value="charts">Two chart files</option>
+          </select>
+        </label>
+
+        <label v-if="openFrom === 'manifest'" class="field-stack">
+          <span>Manifest path</span>
+          <input
+            v-model="manifestPath"
+            name="manifest"
+            placeholder="Full path to comparison.json"
+            autocomplete="off"
+            spellcheck="false"
+            required
+            :disabled="busy"
+          />
+        </label>
+        <template v-else>
+          <label class="field-stack">
+            <span>First chart path</span>
+            <input
+              v-model="chartPaths[0]"
+              name="first-chart"
+              placeholder="Full path to a .osu file"
+              autocomplete="off"
+              spellcheck="false"
+              required
+              :disabled="busy"
+            />
+          </label>
+          <label class="field-stack">
+            <span>Second chart path</span>
+            <input
+              v-model="chartPaths[1]"
+              name="second-chart"
+              placeholder="Full path to a .osu file"
+              autocomplete="off"
+              spellcheck="false"
+              required
+              :disabled="busy"
+            />
+          </label>
+        </template>
+
+        <label class="field-stack">
+          <span>Verdict folder{{ openFrom === "manifest" ? " (optional)" : "" }}</span>
+          <input
+            v-model="outputFolder"
+            name="output-folder"
+            :placeholder="openFrom === 'manifest' ? 'Beside the manifest' : 'Full path to a folder'"
+            autocomplete="off"
+            spellcheck="false"
+            :required="openFrom === 'charts'"
+            :disabled="busy"
+          />
+        </label>
+        <p class="setup-note">
+          {{
+            openFrom === "manifest"
+              ? "Paths starting with ~/ work. Verdicts are appended to <manifest>.verdicts.jsonl."
+              : "Use two exports of the same song, difficulty and seed. Audio comes from the first chart's AudioFilename."
+          }}
+        </p>
+
+        <p v-if="error" class="inline-message inline-message--error" role="alert">{{ error }}</p>
+        <button class="button button--primary onboarding-submit" type="submit" :disabled="busy">
+          {{ busy ? "Opening" : "Open comparison" }}
+        </button>
+      </form>
+    </section>
+
+    <template v-else>
+      <nav class="mobile-view-switcher" aria-label="Comparison views">
+        <button
+          v-for="panel in (['source', 'preview', 'details'] as const)"
+          :key="panel"
+          class="mobile-view-button"
+          :class="{ 'is-active': mobilePanel === panel }"
+          type="button"
+          :aria-pressed="mobilePanel === panel"
+          @click="mobilePanel = panel"
+        >
+          {{ panel }}
+        </button>
+      </nav>
+
+      <div class="annotation-workspace">
+        <aside
+          class="annotation-rail annotation-source-rail"
+          :class="{ 'is-mobile-active': mobilePanel === 'source' }"
+          aria-labelledby="queue-heading"
+        >
+          <div class="active-workspace-identity">
+            <div class="brand-lockup">
+              <span class="brand-mark" aria-hidden="true"></span>
+              <div>
+                <p class="brand-name">Beatmap Lens</p>
+                <p class="brand-edition">Blind comparison</p>
+              </div>
+            </div>
+            <WorkspaceModeSwitch
+              model-value="compare"
+              :disabled="busy || saving"
+              @update:model-value="emit('change-mode', $event)"
+            />
+            <div class="active-dataset-identity">
+              <span>{{ verdictFile }}</span>
+              <strong>{{ pair?.title }}</strong>
+            </div>
+          </div>
+
+          <header class="annotation-rail-header">
+            <div>
+              <p class="section-kicker"><span class="section-number">01</span> Listening queue</p>
+              <h2 id="queue-heading">Excerpts</h2>
+            </div>
+            <span class="rail-count">{{ judged }} / {{ queue.length }}</span>
+          </header>
+
+          <label v-if="opened.pairs.length > 1" class="field-stack compare-song">
+            <span>Song</span>
+            <select
+              :value="pairIndex"
+              :disabled="busy || saving"
+              @change="select(Number(($event.target as HTMLSelectElement).value), 0)"
+            >
+              <option v-for="(song, index) in opened.pairs" :key="index" :value="index">
+                {{ song.title }}
+              </option>
+            </select>
+          </label>
+
+          <nav class="task-list" aria-label="Excerpts">
+            <button
+              v-for="(part, index) in pair?.excerpts"
+              :key="part.id"
+              class="task-row"
+              :class="{ 'is-active': index === excerptIndex }"
+              type="button"
+              :aria-current="index === excerptIndex ? 'step' : undefined"
+              :disabled="busy || saving"
+              @click="select(pairIndex, index)"
+            >
+              <span
+                class="task-status-mark"
+                :class="{ 'task-status-mark--complete': part.saved }"
+                aria-hidden="true"
+              ></span>
+              <span class="task-copy">
+                <strong>{{ formatTime(part.start_ms) }}–{{ formatTime(part.end_ms) }}</strong>
+                <span>{{ part.hint }}</span>
+              </span>
+              <span class="task-status-label">{{ part.saved ? "Judged" : "Pending" }}</span>
+            </button>
+          </nav>
+
+          <section v-if="pair" class="rail-section" aria-labelledby="pair-heading">
+            <h3 id="pair-heading">Pair</h3>
+            <dl class="compact-facts">
+              <div><dt>Song</dt><dd>{{ pair.title }}</dd></div>
+              <div v-if="pair.difficulty_band !== undefined">
+                <dt>Band</dt><dd>{{ pair.difficulty_band }}</dd>
+              </div>
+              <div v-if="pair.seed !== undefined"><dt>Seed</dt><dd>{{ pair.seed }}</dd></div>
+            </dl>
+          </section>
+
+          <section class="rail-section">
+            <button
+              class="button button--quiet"
+              type="button"
+              :disabled="busy || saving"
+              @click="close"
+            >
+              Open another comparison
+            </button>
+          </section>
+        </aside>
+
+        <section
+          class="annotation-stage"
+          :class="{ 'is-mobile-active': mobilePanel === 'preview' }"
+          aria-label="Charts A and B"
+        >
+          <CompareStage
+            v-if="blind"
+            :charts="blind.charts"
+            :playhead-ms="playheadMs"
+            :shown="shownCharts"
+            :visual-speed="visualSpeed"
+            v-bind="envelope ? { envelope } : {}"
+          />
+          <div v-else-if="error" class="stage-message">
+            <p class="inline-message inline-message--error" role="alert">{{ error }}</p>
+            <button
+              class="button button--quiet"
+              type="button"
+              @click="select(pairIndex, excerptIndex)"
+            >
+              Reload excerpt
+            </button>
+          </div>
+          <div v-else class="stage-empty">Loading excerpt</div>
+        </section>
+
+        <aside
+          class="annotation-rail annotation-details-rail"
+          :class="{ 'is-mobile-active': mobilePanel === 'details' }"
+          aria-labelledby="verdict-heading"
+        >
+          <section class="details-transport" aria-label="Playback">
+            <div class="details-transport-status">
+              <div>
+                <span>Playhead</span>
+                <strong>{{ formatTime(playheadMs) }}</strong>
+              </div>
+              <div class="details-transport-state">
+                <span v-if="excerpt">
+                  {{ formatTime(excerpt.start_ms) }}–{{ formatTime(excerpt.end_ms) }}
+                </span>
+                <span class="health-status" :class="`health-status--${status.tone}`" aria-live="polite">
+                  <span class="health-dot" aria-hidden="true"></span>
+                  {{ status.text }}
+                </span>
+              </div>
+            </div>
+
+            <fieldset class="transport-controls compare-transport" aria-label="Playback controls">
+              <button
+                class="transport-button transport-button--primary"
+                type="button"
+                :disabled="busy || !blind"
+                :aria-pressed="playing"
+                aria-keyshortcuts="Space"
+                @click="togglePlayback"
+              >
+                {{ playing ? "Pause" : "Loop excerpt" }}
+              </button>
+              <button
+                class="transport-button"
+                type="button"
+                :disabled="busy || !blind"
+                @click="seek(excerpt?.start_ms ?? 0)"
+              >
+                Restart
+              </button>
+            </fieldset>
+
+            <label v-if="excerpt" class="compare-scrub">
+              <span class="sr-only">Position in excerpt</span>
+              <input
+                type="range"
+                :min="excerpt.start_ms"
+                :max="excerpt.end_ms - 1"
+                step="1"
+                :value="playheadMs"
+                :disabled="busy"
+                @input="seek(Number(($event.target as HTMLInputElement).value))"
+              />
+            </label>
+
+            <div class="transport-tuning">
+              <div class="speed-controls">
+                <span>View</span>
+                <div class="speed-presets compare-views">
+                  <button
+                    v-for="option in views"
+                    :key="option.key"
+                    type="button"
+                    :class="{ 'is-active': view === option.key }"
+                    :aria-pressed="view === option.key"
+                    :aria-keyshortcuts="option.key.toUpperCase()"
+                    @click="view = option.key"
+                  >
+                    {{ option.label }}
+                  </button>
+                </div>
+              </div>
+              <div class="speed-controls">
+                <span>Audio rate</span>
+                <div class="speed-presets" :style="{ '--count': SUPPORTED_PLAYBACK_RATES.length }">
+                  <button
+                    v-for="value in SUPPORTED_PLAYBACK_RATES"
+                    :key="value"
+                    type="button"
+                    :class="{ 'is-active': rate === value }"
+                    :aria-pressed="rate === value"
+                    @click="setRate(value)"
+                  >
+                    {{ value }}×
+                  </button>
+                </div>
+              </div>
+              <div class="speed-controls">
+                <span>Visual speed</span>
+                <div class="speed-presets" :style="{ '--count': visualSpeedPresets.length }">
+                  <button
+                    v-for="value in visualSpeedPresets"
+                    :key="value"
+                    type="button"
+                    :class="{ 'is-active': visualSpeed === value }"
+                    :aria-pressed="visualSpeed === value"
+                    @click="visualSpeed = value"
+                  >
+                    {{ value }}
+                  </button>
+                </div>
+              </div>
+              <p class="setup-note">Space loops or pauses. A, B and S switch the view.</p>
+            </div>
+          </section>
+
+          <section class="editor-section" aria-labelledby="verdict-heading">
+            <div class="editor-section-heading">
+              <h3 id="verdict-heading">Which chart follows the music?</h3>
+            </div>
+            <p class="compare-hint">{{ excerpt?.hint }}</p>
+            <label class="field-stack">
+              <span>Note (optional)</span>
+              <textarea
+                v-model="note"
+                rows="3"
+                placeholder="A few words, if useful"
+                :disabled="busy || saving || Boolean(verdict)"
+              ></textarea>
+            </label>
+            <div class="compare-verdicts">
+              <button
+                v-for="choice in verdictChoices"
+                :key="choice.value"
+                class="button button--quiet"
+                :class="{ 'is-active': verdict?.verdict === choice.value }"
+                type="button"
+                :aria-pressed="verdict?.verdict === choice.value"
+                :disabled="busy || saving || !blind || Boolean(verdict)"
+                @click="save(choice.value)"
+              >
+                {{ choice.label }}
+              </button>
+            </div>
+            <p v-if="error && blind" class="inline-message inline-message--error" role="alert">
+              {{ error }}
+            </p>
+          </section>
+
+          <section v-if="verdict" class="editor-section" role="status" aria-labelledby="reveal-heading">
+            <div class="editor-section-heading">
+              <h3 id="reveal-heading">Saved · {{ verdictLabel }}</h3>
+            </div>
+            <dl class="compact-facts">
+              <div><dt>A</dt><dd>{{ verdict.shown_a.model }}</dd></div>
+              <div><dt>B</dt><dd>{{ verdict.shown_b.model }}</dd></div>
+            </dl>
+            <button
+              v-if="nextUnjudged"
+              class="button button--primary compare-next"
+              type="button"
+              :disabled="busy"
+              @click="select(nextUnjudged.songIndex, nextUnjudged.index)"
+            >
+              Next excerpt
+            </button>
+            <p v-else class="setup-note">Every excerpt has a verdict.</p>
+          </section>
+
+          <p class="setup-note compare-output">
+            Verdicts append to <span>{{ opened.verdict_path }}</span>
+          </p>
+        </aside>
+      </div>
+    </template>
   </main>
 </template>
 
 <style scoped>
-.compare-workspace { min-height: 100dvh; background: var(--surface); color: var(--ink); font-size: 13px; padding-bottom: env(safe-area-inset-bottom); }
-.compare-header { display: flex; align-items: center; flex-wrap: wrap; gap: 24px; padding: 20px max(24px, env(safe-area-inset-left)); border-bottom: 1px solid var(--line); }
-.compare-brand { color: var(--ink); font: 600 11px var(--font-data); text-decoration: none; }
-h1 { margin: 0; flex: 1; font-size: 24px; letter-spacing: -.022em; }
-h2 { font-size: 13px; font-weight: 650; margin: 0; }
-p { line-height: 1.6; text-wrap: pretty; }
-button, input, select, textarea { font: inherit; }
-button { border: 0; border-radius: 10px; padding: 10px 14px; background: var(--surface); color: var(--ink); box-shadow: var(--shadow-control); cursor: pointer; font-weight: 600; transition: transform 120ms var(--ease-out), background-color 140ms var(--ease-out); }
-button:hover { background: var(--surface-hover); }
-button:active { transform: scale(.96); }
-button:disabled { opacity: .5; cursor: default; }
-button[aria-pressed="true"] { color: var(--signal); background: var(--surface-quiet); box-shadow: inset 0 0 0 1px var(--signal); }
-button.compare-primary { background: var(--ink); color: var(--surface); }
-input, select, textarea { min-width: 0; width: 100%; min-height: 40px; border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; color: var(--ink); background: var(--surface-quiet); }
-textarea { border: 0; border-radius: 14px; resize: vertical; }
-label { display: grid; gap: 8px; font-weight: 550; }
-input:focus-visible, select:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
-.compare-setup { max-width: 720px; margin: 64px auto; padding: 0 24px; display: grid; gap: 24px; }
-.compare-setup h2 { font-size: 30px; line-height: 1.08; letter-spacing: -.022em; }
-.compare-setup p { margin: 0; color: var(--ink-secondary); }
-.compare-actions { display: flex; flex-wrap: wrap; gap: 8px; }
-.compare-body { display: grid; grid-template-columns: 260px minmax(0, 1fr) 280px; }
-.compare-source, .compare-details { padding: 24px; min-width: 0; }
-.compare-source { border-right: 1px solid var(--line); }
-.compare-details { border-left: 1px solid var(--line); }
-.compare-rail-heading, .compare-preview-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 24px; }
-.compare-rail-heading span, .compare-preview-heading span, .compare-meta, output { font: 500 11px var(--font-data); font-variant-numeric: tabular-nums; }
-.compare-excerpts { list-style: none; margin: 24px -24px; padding: 0; }
-.compare-excerpts button { display: grid; gap: 8px; width: 100%; text-align: left; border-radius: 0; box-shadow: none; border-bottom: 1px solid var(--line); padding: 16px 24px; font-weight: 450; line-height: 1.5; }
-.compare-excerpts button[aria-current] { background: var(--surface-quiet); color: var(--signal); }
-.compare-excerpts button span:first-child { display: flex; justify-content: space-between; font: 500 10px var(--font-data); }
-.compare-excerpts small { font: inherit; }
-.compare-copy { color: var(--ink-secondary); font-size: 12px; line-height: 1.6; }
-.compare-preview { min-width: 0; padding: 24px; }
-.compare-preview-heading { margin-bottom: 16px; }
-.compare-view-switch { margin: 0 0 16px; padding: 0; border: 0; min-inline-size: 0; }
-.compare-stage-gutter { padding: 8px; border-radius: 22px; background: var(--surface-quiet); }
-.compare-stage-placeholder { display: grid; place-items: center; min-height: 400px; }
-.compare-transport { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 16px; }
-.compare-transport label { display: flex; align-items: center; gap: 8px; font-size: 11px; }
-.compare-transport select { width: auto; }
-.compare-transport output { margin-right: auto; padding: 8px; }
-.compare-seek { margin-top: 16px; font-size: 11px; }
-.compare-seek input { padding: 0; accent-color: var(--signal); }
-.compare-hint { font-size: 16px; margin: 24px 0 12px; }
-.compare-details label { margin-top: 24px; }
-.compare-verdicts { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 16px 0; }
-.compare-reveal { border-top: 1px solid var(--line); padding-top: 16px; margin-top: 24px; }
-.compare-reveal strong { color: var(--success); }
-.compare-output { overflow-wrap: anywhere; font-family: var(--font-data); font-size: 10px; }
-.compare-message { margin: 0; padding: 16px 24px; border-bottom: 1px solid var(--line); }
-.compare-message button { margin-left: 16px; }
-.compare-error { color: var(--danger); }
-.compare-mobile-switch { display: none; }
-@media (max-width: 1200px) { .compare-body { grid-template-columns: 220px minmax(0, 1fr) 240px; } .compare-source, .compare-details, .compare-preview { padding: 16px; } .compare-excerpts { margin: 24px -16px; } .compare-excerpts button { padding: 16px; } }
-@media (max-width: 920px) { .compare-header { gap: 16px; padding: 16px; } h1 { font-size: 20px; } .compare-mobile-switch { display: flex; gap: 8px; padding: 12px 16px; border-bottom: 1px solid var(--line); } .compare-body { display: block; } .compare-source, .compare-preview, .compare-details { display: none; border: 0; } [data-panel="source"] .compare-source, [data-panel="preview"] .compare-preview, [data-panel="details"] .compare-details { display: block; } .compare-verdicts { max-width: 480px; } .compare-setup { margin-top: 32px; } }
-@media (max-width: 600px) { .compare-header { justify-content: space-between; } h1 { order: 3; flex-basis: 100%; } }
+.compare-song {
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.details-transport .compare-transport {
+  grid-template-columns: 2fr 1fr;
+}
+
+.compare-scrub input {
+  width: 100%;
+  margin: 0;
+  accent-color: var(--signal);
+}
+
+.details-transport .speed-controls {
+  grid-template-columns: 72px minmax(0, 1fr);
+}
+
+.details-transport .speed-presets {
+  grid-template-columns: repeat(var(--count), minmax(0, 1fr));
+}
+
+.details-transport .compare-views {
+  grid-template-columns: 1fr 1fr 2fr;
+}
+
+.compare-hint {
+  margin: 0 0 14px;
+  font-size: 0.82rem;
+  line-height: 1.5;
+  text-wrap: pretty;
+}
+
+.compare-verdicts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.compare-verdicts .button,
+.compare-next {
+  min-height: 40px;
+}
+
+.compare-next {
+  width: 100%;
+  margin-top: 12px;
+}
+
+.compare-output {
+  padding: 16px;
+}
+
+.compare-output span {
+  font-family: var(--font-data);
+  overflow-wrap: anywhere;
+}
 </style>

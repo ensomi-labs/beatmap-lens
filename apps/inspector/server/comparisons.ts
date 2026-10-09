@@ -2,215 +2,123 @@ import { createHash, randomInt, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { appendFile, mkdir, readFile, realpath } from "node:fs/promises";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { homedir } from "node:os";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
-import type { Connect, Plugin } from "vite";
-import { parseBeatmap, parseOsu, toManiaChart } from "../../../packages/beatmap-lens/src/index.ts";
+import { basename, dirname, join, resolve } from "node:path";
+import { type ManiaChart, parseBeatmap } from "../../../packages/beatmap-lens/src/index.ts";
 import type {
+  BlindExcerpt,
   ComparisonExcerpt,
   ComparisonManifest,
   ComparisonPair,
+  ComparisonSource,
+  ComparisonVerdict,
   OpenComparison,
+  ShownChart,
   VerdictRecord,
 } from "../src/compare/contracts.ts";
 import { proposeExcerpts } from "../src/compare/excerpts.ts";
+import {
+  assertLocalRequest,
+  fullPath,
+  localService,
+  localServicePlugin,
+  readBody,
+  sendJson,
+} from "./local-service.ts";
 
 const prefix = "/api/inspector/comparisons";
-interface LoadedPair {
-  input: ComparisonPair;
-  charts: ReturnType<typeof toManiaChart>[];
-  sources: [VerdictRecord["shown_a"], VerdictRecord["shown_b"]];
-  excerpts: { excerpt: ComparisonExcerpt; a: number; verdict?: VerdictRecord }[];
-}
+const verdicts: readonly ComparisonVerdict[] = [
+  "a_better",
+  "b_better",
+  "no_difference",
+  "cant_tell",
+];
+
 interface Session {
-  id: string;
-  output: string;
-  pairs: LoadedPair[];
+  comparisonId: string;
+  verdictPath: string;
+  pairs: Pair[];
 }
 
-export function comparisonsPlugin(): Plugin {
-  const install = (server: { middlewares: Connect.Server }) => {
-    server.middlewares.use(createComparisonsMiddleware());
-  };
-  return {
-    name: "inspector-comparisons",
-    configureServer: install,
-    configurePreviewServer: install,
-  };
+interface Pair {
+  input: ComparisonPair;
+  charts: [ManiaChart, ManiaChart];
+  sources: [ShownChart, ShownChart];
+  excerpts: Excerpt[];
 }
 
-export function createComparisonsMiddleware(): Connect.NextHandleFunction {
+interface Excerpt {
+  excerpt: ComparisonExcerpt;
+  /** Manifest chart indexes in displayed A, B order. */
+  order: [0, 1] | [1, 0];
+  verdict?: VerdictRecord;
+}
+
+export const comparisonsPlugin = () =>
+  localServicePlugin("inspector-comparisons", prefix, comparisonsHandler);
+
+export const createComparisonsMiddleware = () => localService(prefix, comparisonsHandler());
+
+function comparisonsHandler() {
   const sessions = new Map<string, Session>();
-  async function handle(request: IncomingMessage, response: ServerResponse) {
-    const url = new URL(request.url ?? "/", `http://${request.headers.host}`);
-    if (
-      !["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(request.socket.remoteAddress ?? "") ||
-      !["127.0.0.1", "localhost", "[::1]"].includes(url.hostname) ||
-      (request.headers.origin && request.headers.origin !== url.origin) ||
-      request.headers["x-beatmap-lens-local"] !== "1"
-    )
-      throw new DOMException(
-        "Comparisons require a same-origin localhost request.",
-        "NotAllowedError",
-      );
-    response.setHeader("Cache-Control", "no-store");
-    response.setHeader("X-Content-Type-Options", "nosniff");
+  return async (request: IncomingMessage, response: ServerResponse, url: URL) => {
+    assertLocalRequest(request, url);
     if (request.method !== "POST") throw new Error("Use POST for comparison operations.");
-    const chunks: Buffer[] = [];
-    for await (const chunk of request) chunks.push(Buffer.from(chunk));
-    const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-    if (url.pathname === `${prefix}/open`) {
-      const manifestPath = body.manifest_path ? fullPath(body.manifest_path) : undefined;
-      const manifest: ComparisonManifest = manifestPath
-        ? JSON.parse(await readFile(manifestPath, "utf8"))
-        : await fromPaths(body.chart_paths);
-      if (manifest.version !== 1) throw new Error("Expected comparison manifest version 1.");
-      const folder = body.output_folder
-        ? fullPath(body.output_folder)
-        : manifestPath
-          ? dirname(manifestPath)
-          : undefined;
-      if (!folder) throw new Error("Choose an output folder for this comparison.");
-      await mkdir(folder, { recursive: true });
-      const output = join(
-        await realpath(folder),
-        manifestPath
-          ? `${basename(manifestPath, ".json")}.verdicts.jsonl`
-          : "comparison.verdicts.jsonl",
-      );
-      const history = await readFile(output, "utf8").catch((error: NodeJS.ErrnoException) => {
-        if (error.code !== "ENOENT") throw error;
-        return "";
-      });
-      const records: VerdictRecord[] = history
-        .split("\n")
-        .filter(Boolean)
-        .map((line) => JSON.parse(line))
-        .reverse();
-      const pairs: LoadedPair[] = [];
-      for (const input of manifest.pairs) {
-        const sources = [];
-        const charts = [];
-        for (const source of input.charts) {
-          const path = fullPath(source.chart_path);
-          const bytes = await readFile(path);
-          const chart = toManiaChart(parseOsu(bytes.toString("utf8")));
-          sources.push({
-            ...source,
-            chart_path: path,
-            sha256: createHash("sha256").update(bytes).digest("hex"),
-          });
-          // Source metadata can contain model names. Only geometry crosses the blind boundary.
-          charts.push({ ...chart, metadata: {}, diagnostics: [] });
-        }
-        const [first, second] = charts;
-        const [sourceA, sourceB] = sources;
-        if (!first || !second || !sourceA || !sourceB) throw new Error("A pair needs two charts.");
-        const excerpts = input.excerpts?.length ? input.excerpts : proposeExcerpts(first, second);
-        pairs.push({
-          input,
-          charts,
-          sources: [sourceA, sourceB],
-          excerpts: excerpts.map((excerpt) => {
-            const verdict = records.find(
-              (entry) =>
-                entry.comparison_id === manifest.id &&
-                entry.pair_id === input.id &&
-                entry.excerpt.id === excerpt.id &&
-                entry.excerpt.start_ms === excerpt.start_ms &&
-                entry.excerpt.end_ms === excerpt.end_ms &&
-                ((sameSource(entry.shown_a, sourceA) && sameSource(entry.shown_b, sourceB)) ||
-                  (sameSource(entry.shown_a, sourceB) && sameSource(entry.shown_b, sourceA))),
-            );
-            return {
-              excerpt,
-              a: verdict ? Number(!sameSource(verdict.shown_a, sourceA)) : randomInt(2),
-              ...(verdict ? { verdict } : {}),
-            };
-          }),
-        });
-      }
-      const token = randomUUID();
-      sessions.set(token, { id: manifest.id, output, pairs });
-      const opened: OpenComparison = {
-        session_id: token,
-        verdict_path: output,
-        pairs: pairs.map(({ input, excerpts }) => ({
-          title: input.title,
-          ...(input.difficulty_band === undefined
-            ? {}
-            : { difficulty_band: input.difficulty_band }),
-          ...(input.seed === undefined ? {} : { seed: input.seed }),
-          excerpts: excerpts.map(({ excerpt, verdict }) => ({
-            ...excerpt,
-            saved: Boolean(verdict),
-          })),
-        })),
-      };
-      json(response, opened);
+    const body = JSON.parse((await readBody(request)).toString("utf8"));
+    const operation = url.pathname.slice(prefix.length + 1);
+    if (operation === "open") {
+      const id = randomUUID();
+      const session = await openSession(body);
+      sessions.set(id, session);
+      sendJson(response, describe(id, session));
       return;
     }
     const session = sessions.get(body.session_id);
     if (!session) throw new Error("Reopen the comparison to reconnect the local service.");
     const pair = session.pairs[body.pair_index];
     if (!pair) throw new Error("Choose a song.");
-    if (url.pathname === `${prefix}/audio`) {
+    if (operation === "audio") {
       response.setHeader("Content-Type", "application/octet-stream");
       response.end(await readFile(fullPath(pair.input.audio_path)));
       return;
     }
     const entry = pair.excerpts[body.excerpt_index];
     if (!entry) throw new Error("Choose an excerpt.");
-    if (url.pathname === `${prefix}/excerpt`) {
-      json(response, {
-        charts: [pair.charts[entry.a], pair.charts[1 - entry.a]],
-        ...(entry.verdict ? { verdict: entry.verdict } : {}),
-      });
-    } else if (url.pathname === `${prefix}/verdict`) {
-      if (!["a_better", "b_better", "no_difference", "cant_tell"].includes(body.verdict))
-        throw new Error("Choose a verdict.");
-      const record: VerdictRecord = {
-        version: 1,
-        id: randomUUID(),
-        comparison_id: session.id,
-        pair_id: pair.input.id,
-        excerpt: entry.excerpt,
-        shown_a: pair.sources[entry.a] as VerdictRecord["shown_a"],
-        shown_b: pair.sources[1 - entry.a] as VerdictRecord["shown_b"],
-        verdict: body.verdict,
-        note: body.note ?? "",
-        time: new Date().toISOString(),
-        playback_rate: body.playback_rate,
-      };
-      await appendFile(session.output, `${JSON.stringify(record)}\n`, {
-        flag: constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | constants.O_NOFOLLOW,
-      });
-      entry.verdict = record;
-      json(response, record);
-    } else throw new Error("Unknown comparison operation.");
-  }
-  return (request, response, next) => {
-    if (!request.url?.startsWith(`${prefix}/`)) return next();
-    void handle(request, response).catch((error: Error) => {
-      response.statusCode = error.name === "NotAllowedError" ? 403 : 400;
-      json(response, { error: error.message });
-    });
+    if (operation === "excerpt") sendJson(response, blind(pair, entry));
+    else if (operation === "verdict")
+      sendJson(response, await saveVerdict(session, pair, entry, body));
+    else throw new Error("Unknown comparison operation.");
   };
 }
 
-function fullPath(input: string): string {
-  const path = input.trim();
-  const expanded = path.startsWith("~/") ? join(homedir(), path.slice(2)) : path;
-  if (!isAbsolute(expanded)) throw new Error("Enter an absolute path or a ~/ path.");
-  return resolve(expanded);
+async function openSession(body: {
+  manifest_path?: string;
+  chart_paths?: [string, string];
+  output_folder?: string;
+}): Promise<Session> {
+  const manifestPath = body.manifest_path ? fullPath(body.manifest_path) : undefined;
+  const manifest: ComparisonManifest = manifestPath
+    ? JSON.parse(await readFile(manifestPath, "utf8"))
+    : await manifestFromCharts(body.chart_paths ?? ["", ""]);
+  if (manifest.version !== 1) throw new Error("Expected comparison manifest version 1.");
+  const folder = body.output_folder
+    ? fullPath(body.output_folder)
+    : manifestPath && dirname(manifestPath);
+  if (!folder) throw new Error("Choose an output folder for this comparison.");
+  await mkdir(folder, { recursive: true });
+  const name = manifestPath ? basename(manifestPath, ".json") : "comparison";
+  const verdictPath = join(await realpath(folder), `${name}.verdicts.jsonl`);
+  const saved = await savedVerdicts(verdictPath, manifest.id);
+  const pairs: Pair[] = [];
+  for (const input of manifest.pairs) pairs.push(await loadPair(input, saved));
+  return { comparisonId: manifest.id, verdictPath, pairs };
 }
 
-async function fromPaths(paths: [string, string]): Promise<ComparisonManifest> {
-  const chartPaths = paths.map(fullPath);
-  const first = chartPaths[0] as string;
+/** Two loose charts become a one-pair manifest; audio sits beside the first chart. */
+async function manifestFromCharts(paths: [string, string]): Promise<ComparisonManifest> {
+  const [first, second] = [fullPath(paths[0]), fullPath(paths[1])];
   const audio = parseBeatmap(await readFile(first, "utf8")).audioFilename;
-  if (!audio) throw new Error("The first chart needs an adjacent AudioFilename.");
-  const id = createHash("sha256").update(chartPaths.join("\n")).digest("hex").slice(0, 16);
+  if (!audio) throw new Error("The first chart needs an AudioFilename.");
+  const id = createHash("sha256").update(`${first}\n${second}`).digest("hex").slice(0, 16);
   return {
     version: 1,
     id: `paths-${id}`,
@@ -221,18 +129,114 @@ async function fromPaths(paths: [string, string]): Promise<ComparisonManifest> {
         audio_path: resolve(dirname(first), audio.replaceAll("\\", "/")),
         charts: [
           { chart_path: first, model: "First input chart" },
-          { chart_path: chartPaths[1] as string, model: "Second input chart" },
+          { chart_path: second, model: "Second input chart" },
         ],
       },
     ],
   };
 }
 
-function json(response: ServerResponse, value: unknown) {
-  response.setHeader("Content-Type", "application/json");
-  response.end(JSON.stringify(value));
+async function loadPair(input: ComparisonPair, saved: Map<string, VerdictRecord>): Promise<Pair> {
+  const [a, b] = await Promise.all([loadChart(input.charts[0]), loadChart(input.charts[1])]);
+  const sources: [ShownChart, ShownChart] = [a.source, b.source];
+  const excerpts = input.excerpts?.length ? input.excerpts : proposeExcerpts(a.chart, b.chart);
+  return {
+    input,
+    charts: [a.chart, b.chart],
+    sources,
+    excerpts: excerpts.map((excerpt) => {
+      const verdict = saved.get(verdictKey(input.id, excerpt, sources));
+      // A judged excerpt keeps the A/B it was judged with; the others are shuffled again.
+      const swapped = verdict ? !sameChart(verdict.shown_a, a.source) : randomInt(2) === 1;
+      return { excerpt, order: swapped ? [1, 0] : [0, 1], ...(verdict ? { verdict } : {}) };
+    }),
+  };
 }
 
-function sameSource(left: VerdictRecord["shown_a"], right: VerdictRecord["shown_a"]): boolean {
+async function loadChart(source: ComparisonSource) {
+  const path = fullPath(source.chart_path);
+  const bytes = await readFile(path);
+  const { chart } = parseBeatmap(bytes.toString("utf8"));
+  return {
+    // Metadata can name the model, so only note geometry crosses the blind boundary.
+    chart: { ...chart, metadata: {}, diagnostics: [] },
+    source: {
+      ...source,
+      chart_path: path,
+      sha256: createHash("sha256").update(bytes).digest("hex"),
+    },
+  };
+}
+
+/** The latest record per excerpt and chart pair, so a re-judged excerpt reads as its last verdict. */
+async function savedVerdicts(path: string, comparisonId: string) {
+  const text = await readFile(path, "utf8").catch((error: NodeJS.ErrnoException) => {
+    if (error.code !== "ENOENT") throw error;
+    return "";
+  });
+  const saved = new Map<string, VerdictRecord>();
+  for (const line of text.split("\n")) {
+    if (!line) continue;
+    const record: VerdictRecord = JSON.parse(line);
+    if (record.comparison_id !== comparisonId) continue;
+    saved.set(verdictKey(record.pair_id, record.excerpt, [record.shown_a, record.shown_b]), record);
+  }
+  return saved;
+}
+
+/** Same pair, excerpt bounds and two charts (by bytes and label), in either A/B order. */
+function verdictKey(pairId: string, excerpt: ComparisonExcerpt, charts: ShownChart[]): string {
+  const identities = charts.map((chart) => `${chart.sha256}:${chart.model}`).sort();
+  return JSON.stringify([pairId, excerpt.id, excerpt.start_ms, excerpt.end_ms, ...identities]);
+}
+
+function sameChart(left: ShownChart, right: ShownChart): boolean {
   return left.sha256 === right.sha256 && left.model === right.model;
+}
+
+function describe(sessionId: string, session: Session): OpenComparison {
+  return {
+    session_id: sessionId,
+    verdict_path: session.verdictPath,
+    pairs: session.pairs.map(({ input, excerpts }) => ({
+      title: input.title,
+      ...(input.difficulty_band === undefined ? {} : { difficulty_band: input.difficulty_band }),
+      ...(input.seed === undefined ? {} : { seed: input.seed }),
+      excerpts: excerpts.map(({ excerpt, verdict }) => ({ ...excerpt, saved: Boolean(verdict) })),
+    })),
+  };
+}
+
+function blind(pair: Pair, { order, verdict }: Excerpt): BlindExcerpt {
+  return {
+    charts: [pair.charts[order[0]], pair.charts[order[1]]],
+    ...(verdict ? { verdict } : {}),
+  };
+}
+
+async function saveVerdict(
+  session: Session,
+  pair: Pair,
+  entry: Excerpt,
+  body: { verdict: ComparisonVerdict; note?: string; playback_rate: number },
+): Promise<VerdictRecord> {
+  if (!verdicts.includes(body.verdict)) throw new Error("Choose a verdict.");
+  const record: VerdictRecord = {
+    version: 1,
+    id: randomUUID(),
+    comparison_id: session.comparisonId,
+    pair_id: pair.input.id,
+    excerpt: entry.excerpt,
+    shown_a: pair.sources[entry.order[0]],
+    shown_b: pair.sources[entry.order[1]],
+    verdict: body.verdict,
+    note: body.note ?? "",
+    time: new Date().toISOString(),
+    playback_rate: body.playback_rate,
+  };
+  await appendFile(session.verdictPath, `${JSON.stringify(record)}\n`, {
+    flag: constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | constants.O_NOFOLLOW,
+  });
+  entry.verdict = record;
+  return record;
 }
