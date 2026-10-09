@@ -67,6 +67,16 @@ Fill the release configuration with:
   excludes those judgments from this snapshot and records their counts and reasons;
   it never changes workspace gold. A required Foundation calibration source cannot
   be excluded from its definition's dependencies.
+- `policy.source_access`: `verified` (the default when omitted) requires public
+  source retrieval checks. Explicit `metadata-only` publishes source identity and
+  attribution even when the original version is no longer retrievable. Source
+  rows retain the original SHA-256, beatmap ID, title, artist, mapper (`creator`),
+  difficulty and URL. The original page is
+  `https://osu.ppy.sh/beatmaps/{beatmap_id}`. This policy skips source URL checks
+  during publication; it does not skip original local-byte validation or public
+  exporter, Foundation and method artifact checks. Record any dated retrieval
+  observations in `release_notes`. Consumers must still match the original hash
+  before applying labels or note references to chart bytes.
 
 An HF source reference has this shape (values shown are placeholders):
 
@@ -86,12 +96,13 @@ Alternatively use `kind: "content-addressed"` and an HTTPS `uri` containing the 
 source SHA-256; other locator fields are null. For a chart with a public beatmap ID,
 `init` uses `kind: "osu"`, `uri: "https://osu.ppy.sh/osu/<beatmap-id>"`, and null
 values for the other locator fields. This official URL can change: identity is the
-original `source_sha256`, and publication downloads and checks those exact bytes.
+original `source_sha256`. Under the default `verified` source-access policy,
+publication downloads and checks those exact bytes.
 Consumers must do the same. A missing file or hash mismatch means the annotated
 version is unavailable, and never authorizes attaching labels to another version.
 An external mirror that retains the exact bytes can use `kind: "url"` and its
-HTTPS `uri` (other locator fields null). This also requires byte-for-byte SHA-256
-verification; neither a mirror's beatmap ID nor a normalized-chart match suffices.
+HTTPS `uri` (other locator fields null). Using chart bytes still requires byte-for-byte
+SHA-256 verification; neither a mirror's beatmap ID nor a normalized-chart match suffices.
 No chart bytes, normalized notes, audio, or images are added to the publication.
 The MIT license covers the annotations; it does not relicense linked beatmaps.
 
@@ -151,12 +162,16 @@ pnpm dataset:release publish .local/releases/2026-09-09.1 \
   --receipt .local/release-work/published.json
 ```
 
-`plan` is read-only. It verifies public GitHub artifact bytes and source locators,
+`plan` is read-only. It verifies public GitHub artifact bytes and, under the default
+`verified` source-access policy, source locators,
 then lists added/replaced/deleted snapshot files. Standalone source files are
 downloaded and hash-checked; corpus shard references are checked for public file
 availability at the pinned commit, without downloading and decoding whole shards.
 The report distinguishes these checks. Consumers must still verify the original
 source byte hash when resolving a corpus row.
+With explicit `metadata-only` access, the report counts source rows as
+`identity_only`, without downloading their URLs or claiming current availability.
+The Dataset Card explains the policy and preserves the consumer hash requirement.
 
 `publish` repeats validation and reference checks, copies the exact file inventory
 into private temporary staging, and sends one HF commit guarded by the observed

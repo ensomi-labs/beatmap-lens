@@ -247,12 +247,14 @@ def _policy(config: dict) -> dict:
     value = deepcopy(config.get("policy", {}))
     value.setdefault("excluded_sources", {})
     required = {"agent_methods", "auxiliary_evidence", "allow_partial_method_provenance", "excluded_sources"}
-    _fail(required <= set(value) <= required | {"human_precedence", "agent_handoff_ids"}, "policy must declare agent_methods, auxiliary_evidence and allow_partial_method_provenance, with optional excluded_sources, human_precedence and agent_handoff_ids")
+    _fail(required <= set(value) <= required | {"human_precedence", "agent_handoff_ids", "source_access"}, "policy must declare agent_methods, auxiliary_evidence and allow_partial_method_provenance, with optional excluded_sources, human_precedence, agent_handoff_ids and source_access")
     _fail(isinstance(value["agent_methods"], list) and len(value["agent_methods"]) == len(set(value["agent_methods"])), "policy agent_methods must be unique")
     _fail(isinstance(value["auxiliary_evidence"], list) and not set(value["auxiliary_evidence"]) - {"current", "changed", "untracked"}, "policy auxiliary_evidence must explicitly select supported statuses")
     _fail(isinstance(value["allow_partial_method_provenance"], bool), "allow_partial_method_provenance must be boolean")
     if "human_precedence" in value:
         _fail(isinstance(value["human_precedence"], bool), "human_precedence must be boolean")
+    if "source_access" in value:
+        _fail(value["source_access"] in {"verified", "metadata-only"}, "source_access must be verified or metadata-only")
     if "agent_handoff_ids" in value:
         handoffs = value["agent_handoff_ids"]
         _fail(isinstance(handoffs, list), "agent_handoff_ids must be a list")
@@ -446,6 +448,8 @@ def _dataset_card(manifest: dict) -> str:
               ]
     if manifest.get("release_notes"):
         lines += [manifest["release_notes"], ""]
+    if manifest["policy"].get("source_access", "verified") == "metadata-only":
+        lines += ["## Source identity and availability", "", "This release uses `policy.source_access: metadata-only`. It publishes the original source SHA-256, beatmap ID, title, artist, mapper (`creator`), difficulty, and retrieval URL even when the original chart version is no longer publicly retrievable. The original beatmap page is `https://osu.ppy.sh/beatmaps/{beatmap_id}`. Publication does not require those URLs to serve matching bytes; an existing or working URL is not a verified copy of the annotated version. The collector still validates the original local bytes and source-backed judgments. Exporter, Foundation, and method artifact checks remain required.", "", "Before applying a label, source time range, or note reference to a downloaded chart, verify its SHA-256 against `source_sha256`. A failed download or hash mismatch means that chart version cannot be used with these labels. Never substitute the current chart version. Retrieval observations in the release notes describe only the stated check period, not permanent availability.", ""]
     lines += ["Normative Foundation definitions:"]
     for foundation_id, value in manifest["foundations"].items():
         ref = value["artifact"]
