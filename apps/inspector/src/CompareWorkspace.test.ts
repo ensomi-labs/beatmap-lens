@@ -5,13 +5,9 @@ import { createApp, nextTick } from "vue";
 import { MediaPlaybackClock } from "./annotation/media-playback-clock";
 import CompareWorkspace from "./CompareWorkspace.vue";
 import { comparisonJson, comparisonRequest } from "./compare/client";
-import type { VerdictRecord } from "./compare/contracts";
+import type { OpenComparison, VerdictRecord } from "./compare/contracts";
 
-vi.mock("./compare/client", async (original) => ({
-  ...(await original<typeof import("./compare/client")>()),
-  comparisonJson: vi.fn(),
-  comparisonRequest: vi.fn(),
-}));
+vi.mock("./compare/client", () => ({ comparisonJson: vi.fn(), comparisonRequest: vi.fn() }));
 vi.mock("./compare/audio-envelope", () => ({
   decodeEnvelope: async () => ({ step_ms: 10, energy: [0, 1], onset: [0, 1] }),
 }));
@@ -44,14 +40,13 @@ vi.mock("./annotation/media-playback-clock", () => ({
   }),
 }));
 
-let app: ReturnType<typeof createApp>;
-let container: HTMLElement;
+const excerpt = { id: "one", start_ms: 1000, end_ms: 16_000, hint: "Listen for the breath." };
 const saved: VerdictRecord = {
   version: 1,
   id: "saved-one",
   comparison_id: "trial",
   pair_id: "song",
-  excerpt: { id: "one", start_ms: 1000, end_ms: 16_000, hint: "Listen for the breath." },
+  excerpt,
   shown_a: { model: "Model hidden-one", chart_path: "/one.osu", sha256: "one" },
   shown_b: { model: "Model hidden-two", chart_path: "/two.osu", sha256: "two" },
   verdict: "a_better",
@@ -59,10 +54,29 @@ const saved: VerdictRecord = {
   playback_rate: 1,
   time: "2026-10-09T00:00:00.000Z",
 };
+const opened: OpenComparison = {
+  session_id: "session",
+  verdict_path: "/results/trial.verdicts.jsonl",
+  pairs: [
+    {
+      title: "Song",
+      excerpts: [
+        { ...excerpt, saved: false },
+        { ...excerpt, id: "two", start_ms: 20_000, end_ms: 35_000, saved: false },
+      ],
+    },
+  ],
+};
+const chart = toManiaChart(
+  parseOsu(
+    "osu file format v14\n[General]\nMode:3\n[Difficulty]\nCircleSize:4\n[HitObjects]\n64,192,1000,1,0,0:0:0:0:\n",
+  ),
+);
+
+let app: ReturnType<typeof createApp>;
+let container: HTMLElement;
 
 beforeEach(() => {
-  vi.clearAllMocks();
-  localStorage.clear();
   vi.stubGlobal(
     "Audio",
     class extends EventTarget {
@@ -74,26 +88,8 @@ beforeEach(() => {
   );
   vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:test");
   vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
-  const chart = toManiaChart(
-    parseOsu(
-      "osu file format v14\n[General]\nMode:3\n[Difficulty]\nCircleSize:4\n[HitObjects]\n64,192,1000,1,0,0:0:0:0:\n",
-    ),
-  );
   vi.mocked(comparisonJson).mockImplementation(async (operation, body) => {
-    if (operation === "open")
-      return {
-        session_id: "session",
-        verdict_path: "/results/trial.verdicts.jsonl",
-        pairs: [
-          {
-            title: "Song",
-            excerpts: [
-              { ...saved.excerpt, saved: false },
-              { ...saved.excerpt, id: "two", start_ms: 20_000, end_ms: 35_000, saved: false },
-            ],
-          },
-        ],
-      };
+    if (operation === "open") return structuredClone(opened);
     if (operation === "excerpt") return { charts: [chart, chart] };
     if (operation === "verdict") return { ...saved, ...(body as object) };
     throw new Error(operation);
@@ -104,49 +100,32 @@ beforeEach(() => {
   app = createApp(CompareWorkspace);
   app.mount(container);
 });
+
 afterEach(() => {
   app.unmount();
   document.body.replaceChildren();
+  localStorage.clear();
   vi.unstubAllGlobals();
 });
 
-async function click(text: string) {
-  const button = [...container.querySelectorAll("button")].find(
-    (entry) => entry.textContent?.trim() === text,
-  );
-  if (!button) throw new Error(`No button: ${text}`);
-  button.click();
-  await nextTick();
-}
-async function open() {
-  const input = container.querySelector<HTMLInputElement>('input[name="manifest"]');
-  if (!input) throw new Error("No manifest field");
-  input.value = "/trial.json";
-  input.dispatchEvent(new Event("input"));
-  container.querySelector("form")?.dispatchEvent(new Event("submit", { cancelable: true }));
-  await vi.waitFor(() => expect(container.textContent).toContain("Loop excerpt"));
-  await vi.waitFor(() => expect(MediaPlaybackClock).toHaveBeenCalledOnce());
-}
-
-it("switches A/B without changing playback and saves a verdict before revealing model identity", async () => {
+it("switches A/B without touching playback and reveals the models only after saving", async () => {
   await open();
   expect(container.textContent).not.toContain("Model hidden");
-  expect(container.querySelectorAll(".compare-chart")).toHaveLength(2);
+  expect(panes()).toEqual(["Chart A", "Chart B"]);
+
   await click("Loop excerpt");
   const clock = vi.mocked(MediaPlaybackClock).mock.results[0]?.value;
   clock.seek(7000);
+  await click("A");
+  expect(panes()).toEqual(["Chart A"]);
+  window.dispatchEvent(new KeyboardEvent("keydown", { key: "b" }));
   await nextTick();
-  await click("Show A");
-  await click("Show B");
-  expect(container.querySelectorAll(".compare-chart")).toHaveLength(1);
-  expect(container.querySelector(".compare-chart")?.getAttribute("aria-label")).toBe("Chart B");
+  expect(panes()).toEqual(["Chart B"]);
   expect(clock.currentTimeMs).toBe(7000);
   expect(clock.playing).toBe(true);
   expect(clock.loopSelection).toHaveBeenCalledOnce();
-  const textarea = container.querySelector("textarea");
-  if (!textarea) throw new Error("No note field");
-  textarea.value = "The quiet part breathes.";
-  textarea.dispatchEvent(new Event("input"));
+
+  type("The quiet part breathes.");
   await click("A better");
   await vi.waitFor(() => expect(container.textContent).toContain("Saved · A better"));
   expect(comparisonJson).toHaveBeenCalledWith("verdict", {
@@ -157,25 +136,55 @@ it("switches A/B without changing playback and saves a verdict before revealing 
     note: "The quiet part breathes.",
     playback_rate: 1,
   });
-  expect(container.textContent).toContain("A · Model hidden-one");
-  await click("Next unheard excerpt →");
+  expect(container.textContent).toContain("Model hidden-one");
+
+  await click("Next excerpt");
   await vi.waitFor(() => expect(container.textContent).not.toContain("Model hidden"));
   expect(clock.currentTimeMs).toBe(20_000);
   expect(container.querySelector("textarea")?.value).toBe("");
   expect(comparisonRequest).toHaveBeenCalledOnce();
 });
 
-it("keeps an unsaved verdict blind and its note intact when writing fails, then allows retry", async () => {
+it("stays blind and keeps the note when saving fails, then saves on retry", async () => {
   await open();
   vi.mocked(comparisonJson).mockRejectedValueOnce(new Error("Output folder is not writable."));
-  const textarea = container.querySelector("textarea");
-  if (!textarea) throw new Error("No note field");
-  textarea.value = "Needs another listen.";
-  textarea.dispatchEvent(new Event("input"));
+  type("Needs another listen.");
   await click("Can't tell");
   await vi.waitFor(() => expect(container.textContent).toContain("Output folder is not writable."));
   expect(container.textContent).not.toContain("Model hidden");
-  expect(textarea.value).toBe("Needs another listen.");
+  expect(container.querySelector("textarea")?.value).toBe("Needs another listen.");
   await click("Can't tell");
   await vi.waitFor(() => expect(container.textContent).toContain("Saved · Can't tell"));
 });
+
+async function open() {
+  const input = container.querySelector<HTMLInputElement>('input[name="manifest"]');
+  if (!input) throw new Error("No manifest field");
+  input.value = "/trial.json";
+  input.dispatchEvent(new Event("input"));
+  container.querySelector("form")?.dispatchEvent(new Event("submit", { cancelable: true }));
+  await vi.waitFor(() => expect(MediaPlaybackClock).toHaveBeenCalledOnce());
+  await vi.waitFor(() => expect(panes()).toHaveLength(2));
+}
+
+async function click(text: string) {
+  const button = [...container.querySelectorAll("button")].find(
+    (entry) => entry.textContent?.trim() === text,
+  );
+  if (!button) throw new Error(`No button: ${text}`);
+  button.click();
+  await nextTick();
+}
+
+function type(text: string) {
+  const textarea = container.querySelector("textarea");
+  if (!textarea) throw new Error("No note field");
+  textarea.value = text;
+  textarea.dispatchEvent(new Event("input"));
+}
+
+function panes() {
+  return [...container.querySelectorAll(".compare-pane")].map((pane) =>
+    pane.getAttribute("aria-label"),
+  );
+}
