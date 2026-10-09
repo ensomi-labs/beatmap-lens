@@ -77,6 +77,7 @@ import {
   previewGestureTransaction,
   updateGestureTransaction,
 } from "./annotation/gesture-transaction";
+import { isNativeActivationTarget, isTypingTarget } from "./annotation/keyboard-targets";
 import { type LocalWorkspacePaths, openLocalWorkspace, supportsLocalPaths } from "./annotation/local-paths";
 import {
   changeNoteSelectionRange,
@@ -1572,20 +1573,6 @@ function isEditorUndoState(value: unknown): value is EditorUndoState {
     Array.isArray(state.labels) &&
     Array.isArray(state.exemplarRoles) &&
     typeof state.judgmentNote === "string"
-  );
-}
-
-function isTypingTarget(target: EventTarget | null): boolean {
-  return (
-    target instanceof HTMLElement &&
-    Boolean(target.closest("input, textarea, select, [contenteditable='true']"))
-  );
-}
-
-function isNativeActivationTarget(target: EventTarget | null): boolean {
-  return (
-    target instanceof HTMLElement &&
-    Boolean(target.closest("button, a, summary, [role='button'], [role='link']"))
   );
 }
 

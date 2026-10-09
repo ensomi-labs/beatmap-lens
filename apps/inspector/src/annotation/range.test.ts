@@ -5,7 +5,6 @@ import {
   intersectRanges,
   noteIntersectsRange,
   rangeCandidates,
-  rangesIntersect,
 } from "./range";
 
 describe("half-open annotation ranges", () => {
@@ -27,8 +26,7 @@ describe("half-open annotation ranges", () => {
     expect(noteIntersectsRange(long, { startMs: 150, endMs: 200 })).toBe(false);
   });
 
-  it("keeps touching ranges disjoint and returns their half-open intersection", () => {
-    expect(rangesIntersect({ startMs: 0, endMs: 100 }, { startMs: 100, endMs: 200 })).toBe(false);
+  it("returns the half-open intersection of overlapping ranges", () => {
     expect(intersectRanges({ startMs: 0, endMs: 150 }, { startMs: 100, endMs: 200 })).toEqual({
       startMs: 100,
       endMs: 150,

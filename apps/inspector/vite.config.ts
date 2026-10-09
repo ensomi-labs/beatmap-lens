@@ -1,10 +1,11 @@
 import { fileURLToPath, URL } from "node:url";
 import vue from "@vitejs/plugin-vue";
 import { defineConfig } from "vite";
+import { comparisonsPlugin } from "./server/comparisons.ts";
 import { localFilesPlugin } from "./server/local-files.ts";
 
 export default defineConfig({
-  plugins: [vue(), localFilesPlugin()],
+  plugins: [vue(), localFilesPlugin(), comparisonsPlugin()],
   resolve: {
     alias: {
       "beatmap-lens": fileURLToPath(

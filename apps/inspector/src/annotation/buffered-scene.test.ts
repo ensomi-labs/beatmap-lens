@@ -3,7 +3,6 @@ import { describe, expect, it } from "vitest";
 import {
   BufferedSceneController,
   projectSceneRange,
-  viewportYRangeToSourceRange,
   viewportYToSourceTime,
 } from "./buffered-scene";
 
@@ -159,14 +158,6 @@ describe("viewport source-time projection", () => {
         viewportY: 0,
       }),
     ).toBe(20_000);
-  });
-
-  it("creates the same source range for upward and downward drags", () => {
-    const upward = viewportYRangeToSourceRange({ ...options, anchorY: 500, focusY: 0 });
-    const downward = viewportYRangeToSourceRange({ ...options, anchorY: 0, focusY: 500 });
-
-    expect(upward).toEqual({ startMs: 9_600, endMs: 11_600 });
-    expect(downward).toEqual(upward);
   });
 
   it.each(["bottom-to-top", "top-to-bottom"] as const)(

@@ -18,6 +18,8 @@ export default defineConfig({
     clearMocks: true,
     environment: "node",
     exclude: ["**/dist/**", "**/node_modules/**"],
+    // Node 25 defines its own localStorage, which shadows the DOM environment's.
+    execArgv: ["--no-experimental-webstorage"],
     include: ["apps/**/*.test.ts", "packages/**/*.test.ts"],
     restoreMocks: true,
     testTimeout: 5_000,
