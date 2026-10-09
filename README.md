@@ -27,17 +27,17 @@ past experiment is not a public maintenance commitment.
 
 Annotations are published on Hugging Face as
 [sed-i/mania-pattern-annotations](https://huggingface.co/datasets/sed-i/mania-pattern-annotations).
-The MIT snapshot [v3](https://huggingface.co/datasets/sed-i/mania-pattern-annotations/tree/b22a7a443783e05fee4db4b1d22b8e573ad448ae) contains 592 human records and
-4,403 independently audited Astra judgments across 545 annotated charts.
-The human layer is the default; the opt-in machine layer selects only eligible
-judgments from the latest 1,000-section campaign, with exact human precedence.
-The [frozen method](annotation/methods/astra-1000-20260912/README.md) records
-`gpt-6-astra`, skill and harness hashes, prompts, and independent auditor identities.
-Machine audit is not human confirmation or a measured accuracy claim. Earlier
-machine layers remain available at their immutable historical dataset versions.
+The MIT snapshot [v4](https://huggingface.co/datasets/sed-i/mania-pattern-annotations/tree/102d63c485b38e7fb23af3eca64198dc607d3b6c) contains **2,860 complete five-dimension sections**,
+combining 600 human records and 16,402 independently audited machine judgments
+across 2,969 source identities. The human layer is the default; machine methods
+remain separate opt-ins with exact human precedence. All v3 records are preserved.
+Original beatmap URLs, titles, artist/mapper credits and SHA-256 identities remain
+available even when the exact chart version can no longer be downloaded. Consumers
+must verify the original hash before using chart bytes with these annotations.
+Machine audit is not human confirmation or a measured accuracy claim.
 Dataset releases are independent of the npm package.
-The [publication pipeline](docs/annotation/dataset-publication.md) builds compact
-Parquet snapshots with pinned GitHub artifacts and hash-verified external chart references.
+The [publication record and pipeline](docs/annotation/dataset-publication.md) describe
+scope, immutable method artifacts, source-access policy and earlier releases.
 The [selection repair procedure](docs/annotation/evidence-review.md) preserves
 label authority and evidence provenance, and supplements missing selections
 through concurrent agent judgment and note selection.

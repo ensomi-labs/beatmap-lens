@@ -6,7 +6,7 @@ import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { sha256Hex } from "../canonical-json";
 import { inspectOsuSourceV1 } from "../source-identity";
-import type { AgentProvenanceV2, HumanEvidenceRefV2 } from "./contracts";
+import type { AgentProvenanceV2, HumanEvidenceRefV2, ReviewDocumentV2 } from "./contracts";
 import {
   addHumanObservationsV2,
   addHumanObservationV2,
@@ -95,6 +95,29 @@ async function secondSource(f: Awaited<ReturnType<typeof workflowFixture>>) {
     bytes,
   );
   return { bytes, human };
+}
+
+/** A compact-storage workspace holding the documents, with the offline collector module. */
+async function collectorWorkspace(documents: readonly ReviewDocumentV2[]) {
+  const workspace = await mkdtemp(join(tmpdir(), "annotation-publication-"));
+  workspaces.push(workspace);
+  const adapterUrl = pathToFileURL(
+    resolve("apps/inspector/server/workflow-local-directory.mjs"),
+  ).href;
+  const collectorUrl = pathToFileURL(
+    resolve("apps/inspector/server/collect-annotation-release.mjs"),
+  ).href;
+  const { LocalDirectoryHandle } = await import(/* @vite-ignore */ adapterUrl);
+  const workflow = await new LocalDirectoryHandle(workspace).getDirectoryHandle("workflow", {
+    create: true,
+  });
+  for (const document of documents) {
+    const file = await workflow.getFileHandle(`${document.source.sha256}.v2.json`, {
+      create: true,
+    });
+    await file.writeCanonicalJson(document, await hashWorkflowValueV2(document));
+  }
+  return { workspace, ...(await import(/* @vite-ignore */ collectorUrl)) };
 }
 
 describe("dataset publication projection", () => {
@@ -590,24 +613,33 @@ print(json.dumps(manifest['counts']))
     ).toBe(true);
   });
 
+  it("collects the same cross-source projection with serial and parallel validation", async () => {
+    const f = await reviewedFixture();
+    const auxiliary = await secondSource(f);
+    const { workspace, collectAnnotationRelease, writeCollectedInput } = await collectorWorkspace([
+      f.reviewed,
+      auxiliary.human,
+    ]);
+    const serial = await collectAnnotationRelease({ workspace, createdAt: NOW });
+    const parallel = await collectAnnotationRelease({ workspace, createdAt: NOW, workers: 2 });
+    expect(parallel).toEqual(serial);
+    expect(parallel.sources).toHaveLength(2);
+    expect(parallel.human).toHaveLength(1);
+    expect(parallel.agents).toHaveLength(2);
+    const output = join(workspace, "release-input.json");
+    await writeCollectedInput(output, parallel);
+    expect(JSON.parse(await readFile(output, "utf8"))).toEqual(serial);
+
+    await writeFile(join(workspace, "workflow", `${f.reviewed.source.sha256}.v2.json`), "{broken");
+    await expect(
+      collectAnnotationRelease({ workspace, createdAt: NOW, workers: 2 }),
+    ).rejects.toThrow();
+  });
+
   it("collects compact storage read-only and rejects concurrent canonical changes", async () => {
     const f = await reviewedFixture();
-    const workspace = await mkdtemp(join(tmpdir(), "annotation-publication-"));
-    workspaces.push(workspace);
-    const adapterUrl = pathToFileURL(
-      resolve("apps/inspector/server/workflow-local-directory.mjs"),
-    ).href;
-    const collectorUrl = pathToFileURL(
-      resolve("apps/inspector/server/collect-annotation-release.mjs"),
-    ).href;
-    const { LocalDirectoryHandle } = await import(/* @vite-ignore */ adapterUrl);
-    const { collectAnnotationRelease } = await import(/* @vite-ignore */ collectorUrl);
-    const root = new LocalDirectoryHandle(workspace);
-    const workflow = await root.getDirectoryHandle("workflow", { create: true });
-    const name = `${f.reviewed.source.sha256}.v2.json`;
-    const file = await workflow.getFileHandle(name, { create: true });
-    await file.writeCanonicalJson(f.reviewed, await hashWorkflowValueV2(f.reviewed));
-    const path = join(workspace, "workflow", name);
+    const { workspace, collectAnnotationRelease } = await collectorWorkspace([f.reviewed]);
+    const path = join(workspace, "workflow", `${f.reviewed.source.sha256}.v2.json`);
     const before = await readFile(path);
     const result = await collectAnnotationRelease({ workspace, createdAt: NOW });
     expect(result.contract).toBe("beatmap-lens-release-input");
@@ -638,11 +670,16 @@ print(json.dumps(manifest['counts']))
       },
     ]);
     expect(await readFile(path)).toEqual(before);
-    await expect(
-      collectAnnotationRelease({
-        workspace,
-        onProgress: async () => writeFile(path, Buffer.concat([before, Buffer.from("\n")])),
-      }),
-    ).rejects.toThrow("Workspace changed during release collection");
+    for (const workers of [1, 2]) {
+      await expect(
+        collectAnnotationRelease({
+          workspace,
+          workers,
+          onProgress: async () => writeFile(path, Buffer.concat([before, Buffer.from("\n")])),
+        }),
+      ).rejects.toThrow("Workspace changed during release collection");
+      // Restore, so the next run's write is again a change.
+      await writeFile(path, before);
+    }
   });
 });

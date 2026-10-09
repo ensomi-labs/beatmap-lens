@@ -69,7 +69,11 @@ def verify_public_references(snapshot, manifest, api=None):
             if digest(response.content) != ref['sha256']:
                 raise ValueError(f'Published artifact checksum differs: {url}')
             checked.add(key)
-        for source in pq.read_table(Path(snapshot)/'data/sources.parquet').to_pylist():
+        rows = pq.read_table(Path(snapshot)/'data/sources.parquet').to_pylist()
+        if manifest.get('policy', {}).get('source_access') == 'metadata-only':
+            sources['identity_only'] = len(rows)
+            rows = []
+        for source in rows:
             ref = source['source_ref']
             if ref['kind'] in ('content-addressed', 'osu', 'url'):
                 if ref['kind'] == 'osu':

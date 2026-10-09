@@ -26,9 +26,10 @@ def write_new(path, value):
         output.write(json.dumps(value, indent=2, ensure_ascii=False) + '\n')
 
 
-def collect(workspace, output):
+def collect(workspace, output, workers):
     command = ['node', str(REPO/'apps/inspector/server/collect-annotation-release.mjs'),
-               '--workspace', str(Path(workspace).resolve()), '--out', str(Path(output).resolve())]
+               '--workspace', str(Path(workspace).resolve()), '--out', str(Path(output).resolve()),
+               '--workers', str(workers)]
     subprocess.run(command, cwd=REPO, check=True)
 
 
@@ -99,6 +100,7 @@ def main(argv=None):
     gather = commands.add_parser('collect', help='Freeze a read-only projection from a Review workspace')
     gather.add_argument('--workspace', required=True)
     gather.add_argument('--out', required=True)
+    gather.add_argument('--workers', type=int, default=1, help='Parallel source validators (default: 1)')
     initialize = commands.add_parser('init', help='Prepare configuration and public Foundation reference artifacts')
     initialize.add_argument('--input', required=True)
     initialize.add_argument('--out', required=True)
@@ -118,7 +120,7 @@ def main(argv=None):
     publish.add_argument('--receipt', required=True, help='Write the returned HF commit identity outside the snapshot')
     args = parser.parse_args(argv)
     if args.command == 'collect':
-        collect(args.workspace, args.out)
+        collect(args.workspace, args.out, args.workers)
         return 0
     if args.command == 'init':
         result = prepare_config(args.input, args.out)

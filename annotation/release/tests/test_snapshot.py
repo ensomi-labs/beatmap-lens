@@ -112,6 +112,19 @@ class SnapshotTests(unittest.TestCase):
     def rewrite_manifest(self, path, manifest):
         (path / "manifest.json").write_bytes(canonical_json(manifest))
 
+    def test_metadata_only_policy_retains_original_source_identity_and_attribution(self):
+        self.config["policy"]["source_access"] = "metadata-only"
+        self.config["sources"][SOURCE] = {"kind": "osu", "uri": "https://osu.ppy.sh/osu/123"}
+        path, manifest = self.build()
+        source = pq.read_table(path / "data/sources.parquet").to_pylist()[0]
+        self.assertEqual(source["source_sha256"], SOURCE)
+        self.assertEqual((source["beatmap_id"], source["title"], source["artist"], source["creator"]),
+                         (123, "Chart", "Artist", "Mapper"))
+        self.assertEqual(source["source_ref"]["uri"], "https://osu.ppy.sh/osu/123")
+        self.assertEqual(manifest["policy"]["source_access"], "metadata-only")
+        self.assertIn("Never substitute the current chart version", (path / "README.md").read_text())
+        self.assertTrue(validate_snapshot(path)["valid"])
+
     def test_batch_allowlist_excludes_other_handoffs_of_the_same_method(self):
         included = add_agent(self.projection, self.config)
         other_batch = deepcopy(included)

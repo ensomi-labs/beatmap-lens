@@ -26,6 +26,9 @@ extracts effective human observations, and resolves auxiliary human evidence
 against the whole frozen workspace. A concurrent canonical edit makes collection
 fail; collect again after the edit. The internal input includes public Foundation
 projections and dependency metadata. Only the final snapshot directory is uploaded.
+For large workspaces, add `collect --workers 4` to validate source documents in
+parallel. Output ordering and whole-workspace consistency checks stay identical
+to the default single-worker collection.
 
 `init` creates `release.json` with the project defaults (`sed-i/mania-pattern-annotations`,
 MIT, human-only), explicit missing artifact commits, and official source locators.
@@ -64,6 +67,16 @@ Fill the release configuration with:
   excludes those judgments from this snapshot and records their counts and reasons;
   it never changes workspace gold. A required Foundation calibration source cannot
   be excluded from its definition's dependencies.
+- `policy.source_access`: `verified` (the default when omitted) requires public
+  source retrieval checks. Explicit `metadata-only` publishes source identity and
+  attribution even when the original version is no longer retrievable. Source
+  rows retain the original SHA-256, beatmap ID, title, artist, mapper (`creator`),
+  difficulty and URL. The original page is
+  `https://osu.ppy.sh/beatmaps/{beatmap_id}`. This policy skips source URL checks
+  during publication; it does not skip original local-byte validation or public
+  exporter, Foundation and method artifact checks. Record any dated retrieval
+  observations in `release_notes`. Consumers must still match the original hash
+  before applying labels or note references to chart bytes.
 
 An HF source reference has this shape (values shown are placeholders):
 
@@ -83,12 +96,13 @@ Alternatively use `kind: "content-addressed"` and an HTTPS `uri` containing the 
 source SHA-256; other locator fields are null. For a chart with a public beatmap ID,
 `init` uses `kind: "osu"`, `uri: "https://osu.ppy.sh/osu/<beatmap-id>"`, and null
 values for the other locator fields. This official URL can change: identity is the
-original `source_sha256`, and publication downloads and checks those exact bytes.
+original `source_sha256`. Under the default `verified` source-access policy,
+publication downloads and checks those exact bytes.
 Consumers must do the same. A missing file or hash mismatch means the annotated
 version is unavailable, and never authorizes attaching labels to another version.
 An external mirror that retains the exact bytes can use `kind: "url"` and its
-HTTPS `uri` (other locator fields null). This also requires byte-for-byte SHA-256
-verification; neither a mirror's beatmap ID nor a normalized-chart match suffices.
+HTTPS `uri` (other locator fields null). Using chart bytes still requires byte-for-byte
+SHA-256 verification; neither a mirror's beatmap ID nor a normalized-chart match suffices.
 No chart bytes, normalized notes, audio, or images are added to the publication.
 The MIT license covers the annotations; it does not relicense linked beatmaps.
 
@@ -148,12 +162,16 @@ pnpm dataset:release publish .local/releases/2026-09-09.1 \
   --receipt .local/release-work/published.json
 ```
 
-`plan` is read-only. It verifies public GitHub artifact bytes and source locators,
+`plan` is read-only. It verifies public GitHub artifact bytes and, under the default
+`verified` source-access policy, source locators,
 then lists added/replaced/deleted snapshot files. Standalone source files are
 downloaded and hash-checked; corpus shard references are checked for public file
 availability at the pinned commit, without downloading and decoding whole shards.
 The report distinguishes these checks. Consumers must still verify the original
 source byte hash when resolving a corpus row.
+With explicit `metadata-only` access, the report counts source rows as
+`identity_only`, without downloading their URLs or claiming current availability.
+The Dataset Card explains the policy and preserves the consumer hash requirement.
 
 `publish` repeats validation and reference checks, copies the exact file inventory
 into private temporary staging, and sends one HF commit guarded by the observed
@@ -280,6 +298,66 @@ These are use restrictions and provenance distinctions, not retroactive changes
 to the Foundation or frozen labels. The published v0.2.0 files remain unchanged.
 
 ## Published snapshots
+
+### v4: complete sections and original source identities
+
+[v4](https://huggingface.co/datasets/sed-i/mania-pattern-annotations/tree/102d63c485b38e7fb23af3eca64198dc607d3b6c) was published on 2026-10-09 under MIT at HF commit
+`102d63c485b38e7fb23af3eca64198dc607d3b6c`; the `v4` tag resolves to that commit.
+The exporter is pinned to GitHub commit
+`d6b4210550ba271347bc53aaf0079439207a1958`.
+
+| Source | Complete sections |
+| --- | ---: |
+| Published v3, combining human and machine labels | 736 |
+| Other eligible local sections outside v3 | 59 |
+| October 6 campaign | 1,023 |
+| October 7 campaign | 1,042 |
+| **Total** | **2,860** |
+
+A complete section has settled judgments for all five Foundation dimensions at
+one exact source hash, interval and playback rate, with human precedence.
+Of these sections, 92 have human labels on every dimension, 2,742 have independently
+reviewed machine labels throughout, and 26 combine the two authorities. Human
+labels can include confirmations of machine proposals; this is an authority
+breakdown, not a claim that all evidence was independently selected by a human.
+
+The snapshot contains **600 human records** (598 exact cells) and **16,402 machine
+records** in three opt-in method tables, across 2,969 annotated source identities.
+There are 17,002 records over 3,631 annotated sections; eligible individual labels
+in incomplete sections remain available without turning missing dimensions into
+negatives. All **4,995 v3 records are retained unchanged**. Human confidence is
+preserved: 171 High, 23 Low and 406 unspecified.
+
+The October campaigns contribute 11,638 independently supported judgments from
+1,175 and 1,225 delivered sections. Their complete totals include the 23 and 42
+surplus sections beyond the first-1,000 exports. Their shared method is
+`method-655bf779e20d774cfab97ca691a0e951e4af01db7ce15c20b75b5c8123bb1f64`:
+Astra labelers requested medium reasoning and different fresh Astra auditors high,
+in 25-section batches on normal service tier with `codex-cli 0.160.0`.
+All 192 effective worker records passed shared-input and skill-bundle checks.
+The frozen skill is
+`bf56212bc04c99b4bcc5736917285680f0fba756864bd8222c8a22ca3a186299`;
+roles and all eight harness tools match source commit
+`22e5c84f5cacb8493bdab5f1d0fdc09c5373dc60`.
+Independent same-model audit is not human confirmation or a measured accuracy claim.
+
+This release explicitly selects `policy.source_access: metadata-only`.
+Every source retains its original SHA-256, beatmap ID, title, artist, mapper
+(`creator`), difficulty and retrieval URL. Its original page is
+`https://osu.ppy.sh/beatmaps/{beatmap_id}`. The dated prepublication checks found
+2,845 exact versions publicly retrievable and 124 unavailable from the checked
+URLs. Those unavailable versions intersect 122 complete sections; their labels
+remain included. The Dataset Card lists the affected source identities. Consumers
+must match the original SHA-256 before applying labels or note references to
+retrieved bytes; a newer chart must never be substituted. No chart bytes, audio
+or raw execution logs are published.
+
+The complete repository check passed 555 JavaScript and 344 Python tests (four
+skips), types, builds, packaging and smoke checks. The guarded HF commit verified
+155 public artifact references. Anonymous download of all eight snapshot files
+matched the local build and passed snapshot validation. All earlier version tags
+remain unchanged. Manifest SHA-256:
+`6883f5402431cea09f0989cbece6764d8edf87e99b70cb34dcb480d013eed464`.
 
 ### v3: human confidence and the latest audited Astra campaign
 

@@ -14,19 +14,34 @@ import publish
 
 
 class ReferenceTests(unittest.TestCase):
-    def verify(self, source, api=None, content=b'original .osu bytes'):
+    def verify(self, source, api=None, content=b'original .osu bytes', *, source_access=None,
+               artifact_content=b'exporter code'):
         artifact = b'exporter code'
         manifest = {'exporter': {'repository': 'https://github.com/example/annotations',
                                  'commit': 'a'*40, 'path': 'export.py',
                                  'sha256': publish.digest(artifact)},
                     'exporter_files': {}, 'foundations': {}, 'methods': {}}
+        if source_access is not None:
+            manifest['policy'] = {'source_access': source_access}
         responses = [httpx.Response(200, content=value,
                                     request=httpx.Request('GET', 'https://example.com'))
-                     for value in (artifact, content)]
+                     for value in (artifact_content, content)]
         with patch.object(publish.httpx, 'Client') as client, patch.object(publish.pq, 'read_table') as table:
             client.return_value.__enter__.return_value.get.side_effect = responses
             table.return_value.to_pylist.return_value = [source]
-            return publish.verify_public_references(Path('/snapshot'), manifest, api=api)
+            result = publish.verify_public_references(Path('/snapshot'), manifest, api=api)
+            if source_access == 'metadata-only':
+                self.assertEqual(client.return_value.__enter__.return_value.get.call_count, 1)
+            return result
+
+    def test_metadata_only_keeps_source_identity_without_weakening_artifact_checks(self):
+        source = {'source_sha256': publish.digest(b'original .osu bytes'),
+                  'source_ref': {'kind': 'osu', 'uri': 'https://osu.ppy.sh/osu/123'}}
+        result = self.verify(source, content=b'new edited version', source_access='metadata-only')
+        self.assertEqual(result['sources'], {
+            'content_verified': 0, 'locator_verified': 0, 'identity_only': 1})
+        with self.assertRaisesRegex(ValueError, 'Published artifact checksum differs'):
+            self.verify(source, source_access='metadata-only', artifact_content=b'changed exporter')
 
     def test_osu_locator_requires_exact_original_bytes(self):
         for kind, uri in (('osu', 'https://osu.ppy.sh/osu/123'),
