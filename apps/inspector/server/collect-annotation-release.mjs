@@ -1,14 +1,11 @@
 import { createHash } from "node:crypto";
-import { createWriteStream } from "node:fs";
-import { mkdir, mkdtemp, readdir, readFile, rename, rm } from "node:fs/promises";
+import { mkdir, readdir, readFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { dirname, join, resolve, sep } from "node:path";
-import { Readable } from "node:stream";
-import { pipeline } from "node:stream/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
 import { isMainThread, parentPort, Worker, workerData } from "node:worker_threads";
-import { readCanonicalWorkflowFile } from "./workflow-local-directory.mjs";
+import { atomicWrite, readCanonicalWorkflowFile } from "./workflow-local-directory.mjs";
 
 const repo = fileURLToPath(new URL("../../../", import.meta.url));
 const require = createRequire(new URL("../package.json", import.meta.url));
@@ -117,9 +114,9 @@ async function projectInWorkers(workspace, files, count, accept) {
             worker.postMessage({ index, key: files[index] });
           };
           worker.on("error", reject);
-          worker.on("exit", (code) => {
-            if (code !== 0) reject(new Error(`Collection worker exited with code ${code}.`));
-          });
+          worker.on("exit", (code) =>
+            reject(new Error(`Collection worker exited with code ${code}.`)),
+          );
           worker.on("message", async (message) => {
             try {
               if (message.error) throw new Error(message.error);
@@ -209,14 +206,7 @@ export async function writeCollectedInput(output, result) {
     yield "\n}\n";
   }
   await mkdir(dirname(output), { recursive: true });
-  const temporary = await mkdtemp(`${output}.`);
-  try {
-    const path = join(temporary, "input.json");
-    await pipeline(Readable.from(chunks()), createWriteStream(path));
-    await rename(path, output);
-  } finally {
-    await rm(temporary, { recursive: true, force: true });
-  }
+  await atomicWrite(output, chunks());
 }
 
 async function main() {

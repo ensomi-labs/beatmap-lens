@@ -448,7 +448,7 @@ def _dataset_card(manifest: dict) -> str:
               ]
     if manifest.get("release_notes"):
         lines += [manifest["release_notes"], ""]
-    if manifest["policy"].get("source_access", "verified") == "metadata-only":
+    if manifest["policy"].get("source_access") == "metadata-only":
         lines += ["## Source identity and availability", "", "This release uses `policy.source_access: metadata-only`. It publishes the original source SHA-256, beatmap ID, title, artist, mapper (`creator`), difficulty, and retrieval URL even when the original chart version is no longer publicly retrievable. The original beatmap page is `https://osu.ppy.sh/beatmaps/{beatmap_id}`. Publication does not require those URLs to serve matching bytes; an existing or working URL is not a verified copy of the annotated version. The collector still validates the original local bytes and source-backed judgments. Exporter, Foundation, and method artifact checks remain required.", "", "Before applying a label, source time range, or note reference to a downloaded chart, verify its SHA-256 against `source_sha256`. A failed download or hash mismatch means that chart version cannot be used with these labels. Never substitute the current chart version. Retrieval observations in the release notes describe only the stated check period, not permanent availability.", ""]
     lines += ["Normative Foundation definitions:"]
     for foundation_id, value in manifest["foundations"].items():

@@ -26,7 +26,7 @@ def write_new(path, value):
         output.write(json.dumps(value, indent=2, ensure_ascii=False) + '\n')
 
 
-def collect(workspace, output, workers=1):
+def collect(workspace, output, workers):
     command = ['node', str(REPO/'apps/inspector/server/collect-annotation-release.mjs'),
                '--workspace', str(Path(workspace).resolve()), '--out', str(Path(output).resolve()),
                '--workers', str(workers)]
