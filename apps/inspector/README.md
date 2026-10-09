@@ -1,76 +1,79 @@
 # Inspector
 
-Inspector owns local file handling, playback, and human inspection. The npm package
-stays DOM-free. See [DESIGN.md](DESIGN.md) for the interface language.
+Inspector is the local browser app for reading `osu!mania` charts against their
+audio and recording human judgments about them. It is a Vue and Vite app. Parsing
+and scene projection come from the [`beatmap-lens`](../../packages/beatmap-lens/README.md)
+package, which stays DOM-free; file access, playback and review live here.
+Interface conventions are in [DESIGN.md](DESIGN.md).
 
-## Compare two generators
+## Run it
 
-From the repository root, run:
+From the repository root:
 
 ```sh
 pnpm install
-pnpm dev --host 127.0.0.1 --port 5174 --strictPort
+pnpm dev
 ```
 
-Open **http://127.0.0.1:5174/compare**. In **Manifest path**, enter an absolute or
-`~/` path, then select **Open comparison**. The Compare workspace is also available
-in the Inspector mode switch. This requires the local dev or preview server;
-hosting the static build alone does not provide filesystem access.
+Open the address Vite prints. The dev and preview servers also provide Inspector's
+local services, which read the absolute or `~/` paths you type into a form. They
+answer only same-origin requests from this machine. A static build served from
+anywhere else has no file access: Annotate falls back to browser folder pickers
+and Compare cannot open.
 
-On the prepared mac worktree, if pnpm is not on PATH:
+## Workspaces
 
-```sh
-cd ~/wt/beatmap-lens-compare
-PATH="/opt/homebrew/bin:$HOME/.local/bin:$PATH" \
-  npm exec --yes --package=pnpm@11.9.0 -- \
-  pnpm dev --host 127.0.0.1 --port 5174 --strictPort
-```
+The mode switch moves between four workspaces:
 
-For the local demo, enter:
+| Workspace | What it is for |
+| --- | --- |
+| **Inspect** | Paste or open one chart and check its parse, diagnostics and rendered SVG. |
+| **Annotate** | Judge selected sections of catalog charts into a local dataset folder; see the [root README](../../README.md#development). |
+| **Review** | Open `.osu` files, frozen tasks and agent handoffs from disk and record human review. |
+| **Compare** | Judge two generated charts of the same song by listening, without knowing which model made which. |
 
-```text
-~/ensomi/ensomi-model/artifacts/audio-rows-20261008/lens-demo/comparison.json
-```
+`/compare` opens Compare directly. The connected Review inbox at `/review` is served
+by `pnpm review:workspace` instead; see [agent–human review](../../docs/annotation/agent-workflow.md).
 
-It compares 5150, band 3 against band 4, seed 0. This demonstrates a visible
-difference using existing exports; it is **not a matched two-model experiment**.
-Its example “Can't tell” verdict is marked as an automated UI smoke test in its
-note, not a human musical preference.
+## Compare
 
-Choose a short excerpt from the queue and select **Loop excerpt**. **Show A**,
-**Show B**, and **Side by side** share one audio clock, so switching views does
-not pause or seek. **Restart** and the excerpt-position slider seek within the
-loop. Speed keeps pitch; Zoom changes only the visual time scale. White audio
-energy and blue onset energy rises align horizontally with the notes.
+Compare plays one song under two charts and asks which follows the music better.
+It is for judging chart generators by ear; it does not write annotations.
 
-Choose **A better**, **B better**, **No difference**, or **Can't tell**. A note is
-optional and must be entered before choosing. One click saves and reveals the
-model names for that excerpt. **Next unheard excerpt** advances to another
-unsaved excerpt, including the next song. Completed excerpts reopen with their
-saved verdict and original A/B mapping. On small screens, Source, Preview, and
-Details switch between the queue, playback, and verdict controls.
+1. Open **Compare** (or `/compare?manifest=<path>` to prefill the path).
+2. Enter a [comparison manifest](../../docs/inspector/model-comparison.md), or choose
+   **Two chart files** and enter two `.osu` paths plus a verdict folder. In that mode
+   the audio is the first chart's `AudioFilename`.
+3. Pick an excerpt from the queue and loop it. **A**, **B** and **Side by side**
+   share one audio clock, so switching views never restarts the music. Audio rate
+   keeps pitch; visual speed changes only how far apart the notes are drawn.
+4. Read the white energy and blue onset-rise curves across to the notes at the same
+   height. They are listening aids, not scores.
+5. Choose **A better**, **B better**, **No difference** or **Can't tell**. A note is
+   optional and must be written first. The choice is saved at once and only then
+   are the model names shown. **Next excerpt** moves to the next unjudged excerpt,
+   across songs.
 
-**Two chart paths** opens a pair without a manifest. Both paths must point to
-`.osu` exports of the same song; audio is resolved beside the first chart using
-its `AudioFilename`. Choose an output folder. Model names after voting are
-“First input chart” and “Second input chart”, and records contain the exact paths.
+Keyboard: <kbd>Space</kbd> loops or pauses, <kbd>A</kbd>, <kbd>B</kbd> and
+<kbd>S</kbd> switch the view. Verdicts have no shortcut, so a stray key cannot
+record one.
 
-Verdicts go beside the manifest by default, or into the optional **Verdict output
-folder**. Inputs remain read-only. These records are separate from Foundation,
-annotation datasets, and human annotation histories.
+Reopening the same manifest restores judged excerpts with the A/B assignment they
+were judged under. On narrow screens, **Source**, **Preview** and **Details** switch
+between the queue, the charts and the verdict.
 
-The [comparison manifest and verdict format](../../docs/inspector/model-comparison.md)
-is the producer contract for ensomi-model jobs. It also documents excerpt
-selection, blinding, and the limits of the audio display.
+## Code map
 
-## Verification on Node 25
+| Path | Responsibility |
+| --- | --- |
+| `src/App.vue` | Picks the workspace from the URL and the mode switch |
+| `src/*Workspace.vue` | One component per workspace |
+| `src/annotation/` | Annotation contracts, dataset storage, playback clocks, scene buffering |
+| `src/compare/` | Comparison contracts, excerpt proposals, audio envelope |
+| `server/local-service.ts` | Localhost-only request guard and helpers shared by both services |
+| `server/local-files.ts` | Full-path dataset, catalog and corpus access for Annotate |
+| `server/comparisons.ts` | Blind comparison sessions and verdict files for Compare |
+| `server/review-workspace.mjs` | The connected Review service behind `/review` |
 
-Node 25's experimental global Web Storage conflicts with the DOM test environment.
-Disable it for the existing engineering check. A low-concurrency invocation is:
-
-```sh
-NODE_OPTIONS='--no-experimental-webstorage --v8-pool-size=1' \
-UV_THREADPOOL_SIZE=1 RAYON_NUM_THREADS=1 VITEST_MAX_WORKERS=1 \
-OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 \
-  pnpm check
-```
+Run `pnpm check` from the repository root before merging; the
+[contribution guide](../../CONTRIBUTING.md) lists what it covers.
