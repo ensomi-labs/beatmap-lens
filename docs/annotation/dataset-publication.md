@@ -26,6 +26,9 @@ extracts effective human observations, and resolves auxiliary human evidence
 against the whole frozen workspace. A concurrent canonical edit makes collection
 fail; collect again after the edit. The internal input includes public Foundation
 projections and dependency metadata. Only the final snapshot directory is uploaded.
+For large workspaces, add `collect --workers 4` to validate source documents in
+parallel. Output ordering and whole-workspace consistency checks stay identical
+to the default single-worker collection.
 
 `init` creates `release.json` with the project defaults (`sed-i/mania-pattern-annotations`,
 MIT, human-only), explicit missing artifact commits, and official source locators.

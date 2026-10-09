@@ -590,9 +590,10 @@ print(json.dumps(manifest['counts']))
     ).toBe(true);
   });
 
-  it("collects compact storage read-only and rejects concurrent canonical changes", async () => {
+  it("collects the same cross-source projection with serial and parallel validation", async () => {
     const f = await reviewedFixture();
-    const workspace = await mkdtemp(join(tmpdir(), "annotation-publication-"));
+    const auxiliary = await secondSource(f);
+    const workspace = await mkdtemp(join(tmpdir(), "annotation-publication-parallel-"));
     workspaces.push(workspace);
     const adapterUrl = pathToFileURL(
       resolve("apps/inspector/server/workflow-local-directory.mjs"),
@@ -601,48 +602,91 @@ print(json.dumps(manifest['counts']))
       resolve("apps/inspector/server/collect-annotation-release.mjs"),
     ).href;
     const { LocalDirectoryHandle } = await import(/* @vite-ignore */ adapterUrl);
-    const { collectAnnotationRelease } = await import(/* @vite-ignore */ collectorUrl);
+    const { collectAnnotationRelease, writeCollectedInput } = await import(
+      /* @vite-ignore */ collectorUrl
+    );
     const root = new LocalDirectoryHandle(workspace);
     const workflow = await root.getDirectoryHandle("workflow", { create: true });
-    const name = `${f.reviewed.source.sha256}.v2.json`;
-    const file = await workflow.getFileHandle(name, { create: true });
-    await file.writeCanonicalJson(f.reviewed, await hashWorkflowValueV2(f.reviewed));
-    const path = join(workspace, "workflow", name);
-    const before = await readFile(path);
-    const result = await collectAnnotationRelease({ workspace, createdAt: NOW });
-    expect(result.contract).toBe("beatmap-lens-release-input");
-    expect(result.agents).toHaveLength(2);
-    const implementationPaths = Object.keys(result.collector_files);
-    expect(implementationPaths).toEqual(
-      expect.arrayContaining([
-        "apps/inspector/server/collect-annotation-release.mjs",
-        "apps/inspector/server/workflow-local-directory.mjs",
-        "apps/inspector/src/annotation/workflow/domain.ts",
-        "apps/inspector/src/annotation/workflow/publication.ts",
-        "apps/inspector/src/annotation/source-identity.ts",
-        "packages/beatmap-lens/src/parser.ts",
-        "apps/inspector/package.json",
-        "package.json",
-        "pnpm-lock.yaml",
-      ]),
-    );
-    expect(
-      implementationPaths.every((key) => !key.includes(".test.") && !key.includes(".agents/")),
-    ).toBe(true);
-    for (const key of implementationPaths)
-      expect(result.collector_files[key]).toBe(await sha256Hex(await readFile(resolve(key))));
-    expect(result.workspace_files).toEqual([
-      {
-        source_sha256: f.reviewed.source.sha256,
-        canonical_sha256: await hashWorkflowValueV2(f.reviewed),
-      },
-    ]);
-    expect(await readFile(path)).toEqual(before);
+    for (const document of [f.reviewed, auxiliary.human]) {
+      const file = await workflow.getFileHandle(`${document.source.sha256}.v2.json`, {
+        create: true,
+      });
+      await file.writeCanonicalJson(document, await hashWorkflowValueV2(document));
+    }
+    const serial = await collectAnnotationRelease({ workspace, createdAt: NOW });
+    const parallel = await collectAnnotationRelease({ workspace, createdAt: NOW, workers: 2 });
+    expect(parallel).toEqual(serial);
+    expect(parallel.sources).toHaveLength(2);
+    expect(parallel.human).toHaveLength(1);
+    expect(parallel.agents).toHaveLength(2);
+    const output = join(workspace, "release-input.json");
+    await writeCollectedInput(output, parallel);
+    expect(JSON.parse(await readFile(output, "utf8"))).toEqual(serial);
+
+    const path = join(workspace, "workflow", `${f.reviewed.source.sha256}.v2.json`);
+    await writeFile(path, "{broken");
     await expect(
-      collectAnnotationRelease({
-        workspace,
-        onProgress: async () => writeFile(path, Buffer.concat([before, Buffer.from("\n")])),
-      }),
-    ).rejects.toThrow("Workspace changed during release collection");
+      collectAnnotationRelease({ workspace, createdAt: NOW, workers: 2 }),
+    ).rejects.toThrow();
   });
+
+  it.each([1, 2])(
+    "collects read-only and rejects concurrent changes with %i workers",
+    async (workers) => {
+      const f = await reviewedFixture();
+      const workspace = await mkdtemp(join(tmpdir(), "annotation-publication-"));
+      workspaces.push(workspace);
+      const adapterUrl = pathToFileURL(
+        resolve("apps/inspector/server/workflow-local-directory.mjs"),
+      ).href;
+      const collectorUrl = pathToFileURL(
+        resolve("apps/inspector/server/collect-annotation-release.mjs"),
+      ).href;
+      const { LocalDirectoryHandle } = await import(/* @vite-ignore */ adapterUrl);
+      const { collectAnnotationRelease } = await import(/* @vite-ignore */ collectorUrl);
+      const root = new LocalDirectoryHandle(workspace);
+      const workflow = await root.getDirectoryHandle("workflow", { create: true });
+      const name = `${f.reviewed.source.sha256}.v2.json`;
+      const file = await workflow.getFileHandle(name, { create: true });
+      await file.writeCanonicalJson(f.reviewed, await hashWorkflowValueV2(f.reviewed));
+      const path = join(workspace, "workflow", name);
+      const before = await readFile(path);
+      const result = await collectAnnotationRelease({ workspace, createdAt: NOW, workers });
+      expect(result.contract).toBe("beatmap-lens-release-input");
+      expect(result.agents).toHaveLength(2);
+      const implementationPaths = Object.keys(result.collector_files);
+      expect(implementationPaths).toEqual(
+        expect.arrayContaining([
+          "apps/inspector/server/collect-annotation-release.mjs",
+          "apps/inspector/server/workflow-local-directory.mjs",
+          "apps/inspector/src/annotation/workflow/domain.ts",
+          "apps/inspector/src/annotation/workflow/publication.ts",
+          "apps/inspector/src/annotation/source-identity.ts",
+          "packages/beatmap-lens/src/parser.ts",
+          "apps/inspector/package.json",
+          "package.json",
+          "pnpm-lock.yaml",
+        ]),
+      );
+      expect(
+        implementationPaths.every((key) => !key.includes(".test.") && !key.includes(".agents/")),
+      ).toBe(true);
+      for (const key of implementationPaths)
+        expect(result.collector_files[key]).toBe(await sha256Hex(await readFile(resolve(key))));
+      expect(result.workspace_files).toEqual([
+        {
+          source_sha256: f.reviewed.source.sha256,
+          canonical_sha256: await hashWorkflowValueV2(f.reviewed),
+        },
+      ]);
+      expect(await readFile(path)).toEqual(before);
+      await expect(
+        collectAnnotationRelease({
+          workspace,
+          workers,
+          onProgress: async () => writeFile(path, Buffer.concat([before, Buffer.from("\n")])),
+        }),
+      ).rejects.toThrow("Workspace changed during release collection");
+    },
+  );
 });
