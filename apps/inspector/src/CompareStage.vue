@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { type ManiaChart, projectTime } from "beatmap-lens";
+import type { ManiaChart } from "beatmap-lens";
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { BufferedSceneController, judgmentLineRatio } from "./annotation/buffered-scene";
 import { formatTimelineRangeTime as formatTime } from "./annotation/timeline-range";
@@ -53,8 +53,7 @@ const frames = computed(() =>
 
 /** Energy and onset rise on the notes' own time axis, so a peak meets the line with its notes. */
 const envelopePaths = computed(() => {
-  const projection = frames.value[0]?.scene.projection;
-  if (!props.envelope || !projection) return { energy: "", onset: "" };
+  if (!props.envelope || size.value.height === 0) return { energy: "", onset: "" };
   const { step_ms, energy, onset } = props.envelope;
   const msPerPixel = 1000 / props.visualSpeed;
   const pastMs = (size.value.height - lineY.value) * msPerPixel;
@@ -63,11 +62,11 @@ const envelopePaths = computed(() => {
     energy.length,
     Math.ceil((props.playheadMs + lineY.value * msPerPixel) / step_ms),
   );
-  const playheadY = projectTime(projection, props.playheadMs);
   let energyPath = "";
   let onsetPath = "";
   for (let i = first; i < last; i++) {
-    const y = lineY.value + projectTime(projection, (i + 0.5) * step_ms) - playheadY;
+    // Audio bins can extend past the note buffer; their time axis is still linear.
+    const y = lineY.value - ((i + 0.5) * step_ms - props.playheadMs) / msPerPixel;
     const command = i === first ? "M" : "L";
     energyPath += `${command}${4 + (energy[i] ?? 0) * 52},${y}`;
     onsetPath += `${command}${62 + (onset[i] ?? 0) * 34},${y}`;

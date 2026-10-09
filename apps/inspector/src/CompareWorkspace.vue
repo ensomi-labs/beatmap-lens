@@ -1,9 +1,11 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, shallowRef, triggerRef } from "vue";
+import AudioOffsetControl from "./AudioOffsetControl.vue";
 import { defaultVisualSpeed, visualSpeedPresets } from "./annotation/buffered-scene";
 import { isNativeActivationTarget, isTypingTarget } from "./annotation/keyboard-targets";
 import { MediaPlaybackClock } from "./annotation/media-playback-clock";
 import { type PlaybackRate, SUPPORTED_PLAYBACK_RATES } from "./annotation/playback-rate";
+import { IndexedDbSessionStore } from "./annotation/session-store";
 import { formatTimelineRangeTime as formatTime } from "./annotation/timeline-range";
 import CompareStage from "./CompareStage.vue";
 import { type AudioEnvelope, decodeEnvelope } from "./compare/audio-envelope";
@@ -55,10 +57,17 @@ const playheadMs = ref(0);
 const playing = ref(false);
 const rate = ref<PlaybackRate>(1);
 const visualSpeed = ref(defaultVisualSpeed);
+const audioOffsetMs = ref(0);
 const mobilePanel = ref<"source" | "preview" | "details">("preview");
 const busy = ref(false);
 const saving = ref(false);
 const error = ref("");
+
+const sessions = new IndexedDbSessionStore();
+let preferenceWrite = Promise.resolve();
+const preferencesReady = sessions.getPreferences().then((preferences) => {
+  audioOffsetMs.value = preferences?.audioOffsetMs ?? 0;
+}).catch((cause) => report(new Error(`Could not load Inspector preferences: ${String(cause)}`)));
 
 const pair = computed(() => opened.value?.pairs[pairIndex.value]);
 const excerpt = computed(() => pair.value?.excerpts[excerptIndex.value]);
@@ -117,6 +126,7 @@ async function open() {
   busy.value = true;
   error.value = "";
   try {
+    await preferencesReady;
     const result = await comparisonJson<OpenComparison>("open", {
       ...(openFrom.value === "manifest"
         ? { manifest_path: manifestPath.value }
@@ -179,10 +189,15 @@ async function loadAudio() {
     element.load();
   });
   if (disposed) return;
-  const songClock = new MediaPlaybackClock(element, undefined, (cause) => {
-    songClock.pause();
-    report(cause);
-  });
+  const songClock = new MediaPlaybackClock(
+    element,
+    undefined,
+    (cause) => {
+      songClock.pause();
+      report(cause);
+    },
+    audioOffsetMs.value,
+  );
   songClock.subscribe((state) => {
     playheadMs.value = state.currentTimeMs;
     playing.value = state.playing;
@@ -231,6 +246,21 @@ function seek(timeMs: number) {
 function setRate(value: PlaybackRate) {
   rate.value = value;
   clock?.setPlaybackRate(value);
+}
+
+function setAudioOffset(value: number) {
+  audioOffsetMs.value = value;
+  clock?.setAudioOffsetMs(value);
+  preferenceWrite = preferenceWrite.then(async () => {
+    const previous = await sessions.getPreferences();
+    await sessions.setPreferences({
+      annotatorId: "",
+      visualSpeed: defaultVisualSpeed,
+      musicEnabled: false,
+      ...previous,
+      audioOffsetMs: value,
+    });
+  }).catch((cause) => report(new Error(`Could not save Inspector preferences: ${String(cause)}`)));
 }
 
 async function save(value: ComparisonVerdict) {
@@ -642,6 +672,11 @@ function handleKeydown(event: KeyboardEvent) {
                   </button>
                 </div>
               </div>
+              <AudioOffsetControl
+                :model-value="audioOffsetMs"
+                :disabled="busy || !blind"
+                @update:model-value="setAudioOffset"
+              />
               <p class="setup-note">Space loops or pauses. A, B and S switch the view.</p>
             </div>
           </section>

@@ -11,6 +11,7 @@ import {
   watch,
 } from "vue";
 import AnnotationTimeline from "./AnnotationTimeline.vue";
+import AudioOffsetControl from "./AudioOffsetControl.vue";
 import {
   AUDIO_OFFSET_PREFERENCE_KEY,
   AudioPlaybackController,
@@ -281,8 +282,6 @@ const playbackState = ref<PlaybackClockState>({
 const musicEnabled = ref(false);
 const audioStatus = ref<AudioPlaybackStatus>({ kind: "idle" });
 const audioOffsetMs = ref(0);
-const audioOffsetDraft = ref("0");
-const audioOffsetError = ref("");
 const timelineViewRange = ref<TimeRangeV1>({ startMs: 0, endMs: 1 });
 const focusedTagId = ref<string>();
 const editorUndoStack = ref<readonly EditorUndoState[]>([]);
@@ -494,7 +493,6 @@ onMounted(async () => {
       visualSpeedDraft.value = String(preferences.visualSpeed);
       musicEnabled.value = preferences.musicEnabled;
       audioOffsetMs.value = preferences.audioOffsetMs ?? 0;
-      audioOffsetDraft.value = String(audioOffsetMs.value);
     }
 
     const storedDataset = await sessions.getDirectoryHandle<BrowserDirectoryHandle>("dataset");
@@ -1043,25 +1041,12 @@ async function applyVisualSpeed(): Promise<void> {
   if (editorDirty.value) await persistDraftNow(true);
 }
 
-async function applyAudioOffset(): Promise<void> {
-  const offsetMs = Number(audioOffsetDraft.value);
-  if (!Number.isFinite(offsetMs)) {
-    audioOffsetError.value = "Use a finite offset in milliseconds.";
-    return;
-  }
-
-  audioOffsetError.value = "";
+async function setAudioOffset(offsetMs: number): Promise<void> {
   audioOffsetMs.value = offsetMs;
-  audioOffsetDraft.value = formatMs(offsetMs);
   resetPlaybackInstrumentation();
   playbackClock?.setAudioOffsetMs(offsetMs);
   restartPlaybackInstrumentation();
   await persistSessionPreferences();
-}
-
-async function adjustAudioOffset(deltaMs: number): Promise<void> {
-  audioOffsetDraft.value = formatMs(audioOffsetMs.value + deltaMs);
-  await applyAudioOffset();
 }
 
 function persistSessionPreferences(): Promise<void> {
@@ -3150,31 +3135,11 @@ function errorMessage(error: unknown): string {
                 </label>
               </div>
 
-              <div class="audio-offset-control">
-                <div class="transport-control-label">
-                  <span>Audio offset</span>
-                  <small>Positive values play audio earlier</small>
-                </div>
-                <div class="audio-offset-editor">
-                  <button type="button" :disabled="editorLocked" @click="adjustAudioOffset(-10)">−10</button>
-                  <label>
-                    <span class="sr-only">Audio offset in milliseconds</span>
-                    <input
-                      v-model="audioOffsetDraft"
-                      type="number"
-                      step="10"
-                      :disabled="editorLocked"
-                      @blur="applyAudioOffset"
-                      @keydown.enter.prevent="applyAudioOffset"
-                    />
-                    <small>ms</small>
-                  </label>
-                  <button type="button" :disabled="editorLocked" @click="adjustAudioOffset(10)">+10</button>
-                  <button type="button" :disabled="editorLocked || audioOffsetMs === 0" @click="adjustAudioOffset(-audioOffsetMs)">
-                    Reset
-                  </button>
-                </div>
-              </div>
+              <AudioOffsetControl
+                :model-value="audioOffsetMs"
+                :disabled="editorLocked"
+                @update:model-value="setAudioOffset"
+              />
 
               <div class="timeline-zoom-control">
                 <div class="transport-control-label">
@@ -3194,7 +3159,6 @@ function errorMessage(error: unknown): string {
                 {{ audioStatusText }}
               </small>
               <small v-if="visualSpeedError" role="alert">{{ visualSpeedError }}</small>
-              <small v-if="audioOffsetError" role="alert">{{ audioOffsetError }}</small>
             </div>
           </section>
 

@@ -3,6 +3,7 @@ import { parseOsu, toManiaChart } from "beatmap-lens";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { createApp, nextTick } from "vue";
 import { MediaPlaybackClock } from "./annotation/media-playback-clock";
+import type { SessionPreferences } from "./annotation/session-store";
 import CompareWorkspace from "./CompareWorkspace.vue";
 import { comparisonJson, comparisonRequest } from "./compare/client";
 import type { OpenComparison, VerdictRecord } from "./compare/contracts";
@@ -10,6 +11,17 @@ import type { OpenComparison, VerdictRecord } from "./compare/contracts";
 vi.mock("./compare/client", () => ({ comparisonJson: vi.fn(), comparisonRequest: vi.fn() }));
 vi.mock("./compare/audio-envelope", () => ({
   decodeEnvelope: async () => ({ step_ms: 10, energy: [0, 1], onset: [0, 1] }),
+}));
+const preferences = vi.hoisted(() => ({ value: undefined as SessionPreferences | undefined }));
+vi.mock("./annotation/session-store", () => ({
+  IndexedDbSessionStore: class {
+    async getPreferences() {
+      return preferences.value;
+    }
+    async setPreferences(value: SessionPreferences) {
+      preferences.value = value;
+    }
+  },
 }));
 vi.mock("./annotation/media-playback-clock", () => ({
   MediaPlaybackClock: vi.fn(function FakeMediaPlaybackClock() {
@@ -34,6 +46,7 @@ vi.mock("./annotation/media-playback-clock", () => ({
         listener(clock);
       }),
       setPlaybackRate: vi.fn(),
+      setAudioOffsetMs: vi.fn(),
       dispose: vi.fn(),
     };
     return clock;
@@ -77,6 +90,12 @@ let app: ReturnType<typeof createApp>;
 let container: HTMLElement;
 
 beforeEach(() => {
+  preferences.value = {
+    annotatorId: "listener",
+    audioOffsetMs: 45,
+    musicEnabled: true,
+    visualSpeed: 900,
+  };
   vi.stubGlobal(
     "Audio",
     class extends EventTarget {
@@ -155,6 +174,29 @@ it("stays blind and keeps the note when saving fails, then saves on retry", asyn
   expect(container.querySelector("textarea")?.value).toBe("Needs another listen.");
   await click("Can't tell");
   await vi.waitFor(() => expect(container.textContent).toContain("Saved · Can't tell"));
+});
+
+it("restores, applies, and saves the shared audio offset", async () => {
+  await open();
+  const clock = vi.mocked(MediaPlaybackClock).mock.results[0]?.value;
+  const input = container.querySelector<HTMLInputElement>(".audio-offset-editor input");
+  if (!input) throw new Error("No audio offset field");
+  expect(input.value).toBe("45");
+  expect(vi.mocked(MediaPlaybackClock).mock.calls[0]?.[3]).toBe(45);
+
+  const previous = preferences.value;
+  input.value = "-80";
+  input.dispatchEvent(new Event("input"));
+  input.dispatchEvent(new Event("blur"));
+  expect(clock.setAudioOffsetMs).toHaveBeenLastCalledWith(-80);
+  await vi.waitFor(() => expect(preferences.value).toEqual({ ...previous, audioOffsetMs: -80 }));
+
+  await click("+10");
+  expect(input.value).toBe("-70");
+  await click("Reset");
+  expect(input.value).toBe("0");
+  expect(clock.setAudioOffsetMs).toHaveBeenLastCalledWith(0);
+  await vi.waitFor(() => expect(preferences.value?.audioOffsetMs).toBe(0));
 });
 
 async function open() {
