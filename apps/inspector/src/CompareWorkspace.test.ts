@@ -47,6 +47,7 @@ vi.mock("./annotation/media-playback-clock", () => ({
       }),
       setPlaybackRate: vi.fn(),
       setAudioOffsetMs: vi.fn(),
+      setAudioVolume: vi.fn(),
       dispose: vi.fn(),
     };
     return clock;
@@ -197,6 +198,36 @@ it("restores, applies, and saves the shared audio offset", async () => {
   expect(input.value).toBe("0");
   expect(clock.setAudioOffsetMs).toHaveBeenLastCalledWith(0);
   await vi.waitFor(() => expect(preferences.value?.audioOffsetMs).toBe(0));
+});
+
+it("defaults to 80% and restores volume without interrupting comparison playback", async () => {
+  await open();
+  const clock = vi.mocked(MediaPlaybackClock).mock.results[0]?.value;
+  const input = container.querySelector<HTMLInputElement>('input[aria-label="Volume"]');
+  if (!input) throw new Error("No volume control");
+  expect(input.value).toBe("80");
+  expect(clock.setAudioVolume).toHaveBeenCalledWith(0.8);
+  await click("Loop excerpt");
+  clock.seek(7000);
+  const previous = preferences.value;
+  input.value = "35";
+  input.dispatchEvent(new Event("input"));
+  expect(clock.setAudioVolume).toHaveBeenLastCalledWith(0.35);
+  expect(clock.currentTimeMs).toBe(7000);
+  expect(clock.playing).toBe(true);
+  expect(clock.loopSelection).toHaveBeenCalledOnce();
+  await vi.waitFor(() => expect(preferences.value).toEqual({ ...previous, audioVolume: 0.35 }));
+
+  app.unmount();
+  vi.mocked(MediaPlaybackClock).mockClear();
+  vi.mocked(comparisonRequest).mockResolvedValue(new Response(new Uint8Array([1, 2, 3])));
+  app = createApp(CompareWorkspace);
+  app.mount(container);
+  await open();
+  expect(container.querySelector<HTMLInputElement>('input[aria-label="Volume"]')?.value).toBe("35");
+  expect(vi.mocked(MediaPlaybackClock).mock.results[0]?.value.setAudioVolume).toHaveBeenCalledWith(
+    0.35,
+  );
 });
 
 async function open() {

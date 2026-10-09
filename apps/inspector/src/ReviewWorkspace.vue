@@ -2,7 +2,9 @@
 import { parseBeatmap, renderSvgPages } from "beatmap-lens";
 import { computed, onBeforeUnmount, onMounted, ref, shallowRef, watch } from "vue";
 import AnnotationTimeline from "./AnnotationTimeline.vue";
+import AudioVolumeControl from "./AudioVolumeControl.vue";
 import { AUDIO_OFFSET_PREFERENCE_KEY, AudioPlaybackController, type AudioPlaybackStatus, MUSIC_PREFERENCE_KEY } from "./annotation/audio-playback";
+import { AUDIO_VOLUME_PREFERENCE_KEY, DEFAULT_AUDIO_VOLUME } from "./annotation/audio-volume";
 import { BufferedSceneController, judgmentLineRatio, projectSceneRange } from "./annotation/buffered-scene";
 import { serializeCanonicalJson } from "./annotation/canonical-json";
 import type { StableNoteRefV1, TimeRangeV1 } from "./annotation/contracts";
@@ -187,6 +189,7 @@ const looping = ref(false);
 const playbackReady = ref(false);
 const musicEnabled = ref(false);
 const audioOffsetMs = ref(0);
+const audioVolume = ref(DEFAULT_AUDIO_VOLUME);
 const audioStatus = shallowRef<AudioPlaybackStatus>({ kind: "idle" });
 let playback: AudioPlaybackController | undefined;
 let preferenceWrite = Promise.resolve();
@@ -195,6 +198,7 @@ const preferencesReady = sessions.getPreferences().then(preferences => {
   speed.value = preferences.visualSpeed;
   musicEnabled.value = preferences.musicEnabled;
   audioOffsetMs.value = preferences.audioOffsetMs ?? 0;
+  audioVolume.value = preferences.audioVolume ?? DEFAULT_AUDIO_VOLUME;
 }).catch(cause => { error.value = `Could not load Inspector preferences: ${String(cause)}`; });
 const transportDisabled = computed(() => !playbackReady.value || busy.value || sourceLoading.value || props.active === false || Boolean(calibrationExample.value));
 const audioDescription = computed(() => {
@@ -220,7 +224,7 @@ watch(source, async (current, _previous, onCleanup) => {
   await preferencesReady;
   if (disposed) return;
   clock = new AudioPlaybackController({ preferenceStore: {
-    getItem: key => key === MUSIC_PREFERENCE_KEY ? (musicEnabled.value ? "on" : "off") : key === AUDIO_OFFSET_PREFERENCE_KEY ? String(audioOffsetMs.value) : null,
+    getItem: key => key === MUSIC_PREFERENCE_KEY ? (musicEnabled.value ? "on" : "off") : key === AUDIO_OFFSET_PREFERENCE_KEY ? String(audioOffsetMs.value) : key === AUDIO_VOLUME_PREFERENCE_KEY ? String(audioVolume.value) : null,
     setItem: () => {},
   } });
   playback = clock;
@@ -240,6 +244,7 @@ watch(source, async (current, _previous, onCleanup) => {
     if (disposed || source.value !== current) return;
     musicEnabled.value = state.musicEnabled;
     audioOffsetMs.value = state.audioOffsetMs;
+    audioVolume.value = state.audioVolume;
     audioStatus.value = state.status;
   });
   playbackReady.value = true;
@@ -257,7 +262,7 @@ watch(() => [activeClaim.value?.scope.startMs, activeClaim.value?.scope.endMs], 
 function savePreferences(patch: Partial<SessionPreferences>): void {
   preferenceWrite = preferenceWrite.then(async () => {
     const previous = await sessions.getPreferences();
-    await sessions.setPreferences({ annotatorId: "", visualSpeed: speed.value, musicEnabled: musicEnabled.value, audioOffsetMs: audioOffsetMs.value, ...previous, ...patch });
+    await sessions.setPreferences({ annotatorId: "", visualSpeed: speed.value, musicEnabled: musicEnabled.value, audioOffsetMs: audioOffsetMs.value, audioVolume: audioVolume.value, ...previous, ...patch });
   }).catch(cause => { error.value = `Could not save Inspector preferences: ${String(cause)}`; });
 }
 
@@ -296,6 +301,11 @@ function setAudioOffset(value: number): void {
   if (!Number.isFinite(value)) return;
   playback?.setAudioOffsetMs(value);
   savePreferences({ audioOffsetMs: value });
+}
+
+function setAudioVolume(value: number): void {
+  playback?.setAudioVolume(value);
+  savePreferences({ audioVolume: value });
 }
 
 function setPlaybackRate(rate: number): void {
@@ -1296,6 +1306,11 @@ onBeforeUnmount(() => { window.removeEventListener("keydown", workspaceKeydown);
                 <button type="button" :disabled="transportDisabled || audioOffsetMs === 0" @click="setAudioOffset(0)">Reset</button>
               </div>
               <p class="review-copy">Shared with Inspector. Positive values play audio earlier.</p>
+              <AudioVolumeControl
+                :model-value="audioVolume"
+                :disabled="transportDisabled"
+                @update:model-value="setAudioVolume"
+              />
               <section class="review-zoom" aria-label="Timeline lens">
                 <button type="button" aria-label="Zoom timeline in" @click="zoomTimeline(1)" @keydown="timelineControlKeydown">Zoom in</button>
                 <button type="button" aria-label="Zoom timeline out" @click="zoomTimeline(-1)" @keydown="timelineControlKeydown">Zoom out</button>

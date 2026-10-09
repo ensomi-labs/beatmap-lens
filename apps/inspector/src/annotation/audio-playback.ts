@@ -1,4 +1,5 @@
 import type { ParsedOsu } from "beatmap-lens";
+import { AUDIO_VOLUME_PREFERENCE_KEY, normalizeAudioVolume } from "./audio-volume";
 import type { CatalogTask } from "./catalog";
 import { MediaPlaybackClock } from "./media-playback-clock";
 import {
@@ -63,6 +64,7 @@ export type AudioPlaybackStatus =
 
 export interface AudioPlaybackControllerState {
   readonly audioOffsetMs: number;
+  readonly audioVolume: number;
   readonly musicEnabled: boolean;
   readonly status: AudioPlaybackStatus;
 }
@@ -119,6 +121,7 @@ export class AudioPlaybackController implements PlaybackClock {
   #intentId = 0;
   #musicEnabled: boolean;
   #audioOffsetMs: number;
+  #audioVolume: number;
   #playbackRate: PlaybackRate = 1;
   #status: AudioPlaybackStatus = { kind: "idle" };
   #disposed = false;
@@ -133,6 +136,8 @@ export class AudioPlaybackController implements PlaybackClock {
     this.#audioOffsetMs = parseAudioOffsetMs(
       this.#preferenceStore?.getItem(AUDIO_OFFSET_PREFERENCE_KEY) ?? null,
     );
+    const volume = this.#preferenceStore?.getItem(AUDIO_VOLUME_PREFERENCE_KEY);
+    this.#audioVolume = normalizeAudioVolume(volume == null ? undefined : Number(volume));
     this.#syntheticClock = new SyntheticPlaybackClock(options.scheduler);
     this.#activeClock = this.#syntheticClock;
     this.#activeState = clockState(this.#syntheticClock);
@@ -166,6 +171,10 @@ export class AudioPlaybackController implements PlaybackClock {
 
   get audioStatus(): AudioPlaybackStatus {
     return this.#status;
+  }
+
+  get audioVolume(): number {
+    return this.#audioVolume;
   }
 
   get audioOffsetMs(): number {
@@ -268,6 +277,7 @@ export class AudioPlaybackController implements PlaybackClock {
       },
       this.#audioOffsetMs,
     );
+    this.#mediaClock.setAudioVolume(this.#audioVolume);
     this.#mediaClock.setPlaybackRate(this.#playbackRate);
     this.#setStatus({ kind: "ready" });
 
@@ -311,6 +321,13 @@ export class AudioPlaybackController implements PlaybackClock {
       this.#setStatus({ kind: "ready" });
       await this.#switchToMedia(intentId);
     }
+  }
+
+  setAudioVolume(volume: number): void {
+    this.#audioVolume = normalizeAudioVolume(volume);
+    this.#preferenceStore?.setItem(AUDIO_VOLUME_PREFERENCE_KEY, String(this.#audioVolume));
+    this.#mediaClock?.setAudioVolume(this.#audioVolume);
+    this.#emitAudio();
   }
 
   setAudioOffsetMs(audioOffsetMs: number): void {
@@ -519,6 +536,7 @@ export class AudioPlaybackController implements PlaybackClock {
   #audioState(): AudioPlaybackControllerState {
     return {
       audioOffsetMs: this.#audioOffsetMs,
+      audioVolume: this.#audioVolume,
       musicEnabled: this.#musicEnabled,
       status: this.#status,
     };

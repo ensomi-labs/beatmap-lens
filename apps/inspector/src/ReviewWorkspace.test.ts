@@ -862,6 +862,10 @@ describe("ReviewWorkspace mounted workflow", () => {
     app.mount(container);
     await vi.waitFor(() => expect(loadAudio).toHaveBeenCalledWith("/api/review/audio/fixture"));
     expect(control(container, "Global audio offset").value).toBe("45");
+    expect(control(container, "Volume").value).toBe("80");
+    const setVolume = vi.spyOn(AudioPlaybackController.prototype, "setAudioVolume");
+    await setValue(control(container, "Volume"), "35", "input");
+    expect(setVolume).toHaveBeenLastCalledWith(0.35);
     expect(control(container, "Visual speed").value).toBe("360");
     expect(
       container.querySelector('.review-transport button[aria-pressed="true"]')?.textContent,
@@ -875,6 +879,7 @@ describe("ReviewWorkspace mounted workflow", () => {
         visualSpeed: 480,
         musicEnabled: false,
         audioOffsetMs: 55,
+        audioVolume: 0.35,
       }),
     );
     let finishEnable: (() => void) | undefined;

@@ -12,6 +12,7 @@ import {
 } from "vue";
 import AnnotationTimeline from "./AnnotationTimeline.vue";
 import AudioOffsetControl from "./AudioOffsetControl.vue";
+import AudioVolumeControl from "./AudioVolumeControl.vue";
 import {
   AUDIO_OFFSET_PREFERENCE_KEY,
   AudioPlaybackController,
@@ -19,6 +20,7 @@ import {
   createBeatmapAudioFileContext,
   MUSIC_PREFERENCE_KEY,
 } from "./annotation/audio-playback";
+import { AUDIO_VOLUME_PREFERENCE_KEY, DEFAULT_AUDIO_VOLUME } from "./annotation/audio-volume";
 import {
   type BeatmapSession,
   createGoldAnnotation,
@@ -282,6 +284,7 @@ const playbackState = ref<PlaybackClockState>({
 const musicEnabled = ref(false);
 const audioStatus = ref<AudioPlaybackStatus>({ kind: "idle" });
 const audioOffsetMs = ref(0);
+const audioVolume = ref(DEFAULT_AUDIO_VOLUME);
 const timelineViewRange = ref<TimeRangeV1>({ startMs: 0, endMs: 1 });
 const focusedTagId = ref<string>();
 const editorUndoStack = ref<readonly EditorUndoState[]>([]);
@@ -493,6 +496,7 @@ onMounted(async () => {
       visualSpeedDraft.value = String(preferences.visualSpeed);
       musicEnabled.value = preferences.musicEnabled;
       audioOffsetMs.value = preferences.audioOffsetMs ?? 0;
+      audioVolume.value = preferences.audioVolume ?? DEFAULT_AUDIO_VOLUME;
     }
 
     const storedDataset = await sessions.getDirectoryHandle<BrowserDirectoryHandle>("dataset");
@@ -612,6 +616,7 @@ async function startWorkspace(): Promise<void> {
     await sessions.setPreferences({
       annotatorId: id,
       audioOffsetMs: audioOffsetMs.value,
+      audioVolume: audioVolume.value,
       musicEnabled: musicEnabled.value,
       visualSpeed: visualSpeed.value,
     });
@@ -784,7 +789,9 @@ async function initializeInteractiveSession(): Promise<void> {
           ? (musicEnabled.value ? "on" : "off")
           : key === AUDIO_OFFSET_PREFERENCE_KEY
             ? String(audioOffsetMs.value)
-            : null,
+            : key === AUDIO_VOLUME_PREFERENCE_KEY
+              ? String(audioVolume.value)
+              : null,
       setItem: () => {},
     },
   });
@@ -809,6 +816,7 @@ async function initializeInteractiveSession(): Promise<void> {
     if (playbackClock !== controller) return;
     musicEnabled.value = state.musicEnabled;
     audioOffsetMs.value = state.audioOffsetMs;
+    audioVolume.value = state.audioVolume;
     audioStatus.value = state.status;
   });
   controller.seek(initialTime);
@@ -1049,10 +1057,17 @@ async function setAudioOffset(offsetMs: number): Promise<void> {
   await persistSessionPreferences();
 }
 
+async function setAudioVolume(value: number): Promise<void> {
+  audioVolume.value = value;
+  playbackClock?.setAudioVolume(value);
+  await persistSessionPreferences();
+}
+
 function persistSessionPreferences(): Promise<void> {
   const preferences = {
     annotatorId: annotatorId.value.trim(),
     audioOffsetMs: audioOffsetMs.value,
+    audioVolume: audioVolume.value,
     musicEnabled: musicEnabled.value,
     visualSpeed: visualSpeed.value,
   };
@@ -3139,6 +3154,12 @@ function errorMessage(error: unknown): string {
                 :model-value="audioOffsetMs"
                 :disabled="editorLocked"
                 @update:model-value="setAudioOffset"
+              />
+
+              <AudioVolumeControl
+                :model-value="audioVolume"
+                :disabled="editorLocked"
+                @update:model-value="setAudioVolume"
               />
 
               <div class="timeline-zoom-control">

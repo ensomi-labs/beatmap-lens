@@ -1,3 +1,4 @@
+import { DEFAULT_AUDIO_VOLUME, normalizeAudioVolume } from "./audio-volume";
 import {
   animationFrameScheduler,
   type PlaybackClock,
@@ -42,6 +43,7 @@ export class MediaPlaybackClock implements PlaybackClock {
     audioOffsetMs = 0,
   ) {
     this.#media = media;
+    this.setAudioVolume(DEFAULT_AUDIO_VOLUME);
     this.#media.playbackRate = this.#playbackRate;
     this.#media.preservesPitch = true;
     this.#scheduler = scheduler;
@@ -69,6 +71,10 @@ export class MediaPlaybackClock implements PlaybackClock {
 
   get playbackRate(): PlaybackRate {
     return this.#playbackRate;
+  }
+
+  setAudioVolume(volume: number): void {
+    this.#media.volume = normalizeAudioVolume(volume);
   }
 
   setPlaybackRate(rate: number): void {

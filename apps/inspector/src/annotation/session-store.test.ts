@@ -36,6 +36,7 @@ describe("MemorySessionStore", () => {
     expect(await store.getPreferences()).toEqual({
       annotatorId: "expert-a",
       audioOffsetMs: 0,
+      audioVolume: 0.8,
       musicEnabled: false,
       visualSpeed: 480,
     });
@@ -59,6 +60,7 @@ describe("MemorySessionStore", () => {
     expect(await store.getPreferences()).toEqual({
       annotatorId: "expert-a",
       audioOffsetMs: 0,
+      audioVolume: 0.8,
       musicEnabled: true,
       visualSpeed: 240,
     });
@@ -66,6 +68,7 @@ describe("MemorySessionStore", () => {
     await store.setPreferences({
       annotatorId: "expert-a",
       audioOffsetMs: -120,
+      audioVolume: 0.35,
       musicEnabled: true,
       visualSpeed: 240,
     });
@@ -73,6 +76,7 @@ describe("MemorySessionStore", () => {
     expect(await store.getPreferences()).toEqual({
       annotatorId: "expert-a",
       audioOffsetMs: -120,
+      audioVolume: 0.35,
       musicEnabled: true,
       visualSpeed: 240,
     });

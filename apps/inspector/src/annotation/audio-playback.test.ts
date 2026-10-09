@@ -10,6 +10,7 @@ import {
   type MusicPreferenceStore,
   resolveBeatmapAudioFile,
 } from "./audio-playback";
+import { AUDIO_VOLUME_PREFERENCE_KEY } from "./audio-volume";
 import type { PlaybackFrameScheduler } from "./playback-clock";
 
 describe("resolveBeatmapAudioFile", () => {
@@ -167,6 +168,34 @@ describe("AudioPlaybackController", () => {
 
     await controller.setMusicEnabled(false);
     expect(preferenceStore.getItem(MUSIC_PREFERENCE_KEY)).toBe("off");
+  });
+
+  it("applies 80% by default and keeps volume through playback, new audio, and reopening", async () => {
+    const media = new FakeAudio();
+    const scheduler = new TestFrameScheduler();
+    const preferenceStore = new MemoryPreferenceStore();
+    preferenceStore.setItem(MUSIC_PREFERENCE_KEY, "on");
+    const controller = controllerWith({ media, preferenceStore, scheduler });
+    await controller.loadAudioUrl("/first-song");
+    expect(media.volume).toBe(0.8);
+    await controller.loopSelection({ startMs: 1000, endMs: 2000 });
+    controller.seek(1200);
+
+    controller.setAudioVolume(0.35);
+    expect(media.volume).toBe(0.35);
+    expect(controller.currentTimeMs).toBe(1200);
+    expect(controller.playing).toBe(true);
+    expect(preferenceStore.getItem(AUDIO_VOLUME_PREFERENCE_KEY)).toBe("0.35");
+
+    await controller.loadAudioUrl("/next-song");
+    expect(media.volume).toBe(0.35);
+    controller.setAudioVolume(0);
+    controller.dispose();
+    const reopened = controllerWith({ media, preferenceStore, scheduler });
+    await reopened.loadAudioUrl("/next-song");
+    expect(reopened.audioVolume).toBe(0);
+    expect(media.volume).toBe(0);
+    reopened.dispose();
   });
 
   it("persists audio offset and retimes media without moving chart time", async () => {
@@ -521,6 +550,7 @@ function directory(
 }
 
 class FakeAudio extends EventTarget {
+  volume = 1;
   currentTime = 0;
   error: MediaError | null = null;
   playbackRate = 1;

@@ -1,4 +1,5 @@
 import { toRaw } from "vue";
+import { normalizeAudioVolume } from "./audio-volume";
 import type { GoldExemplarRoleV1, StableNoteRefV1, TimeRangeV1 } from "./contracts";
 
 export interface DraftLabel {
@@ -40,6 +41,7 @@ type StoredAnnotationDraft = Omit<AnnotationDraft, "exemplarRoles"> & {
 export interface SessionPreferences {
   annotatorId: string;
   audioOffsetMs?: number;
+  audioVolume?: number;
   musicEnabled: boolean;
   visualSpeed: number;
 }
@@ -256,6 +258,7 @@ function normalizePreferences(preferences: StoredSessionPreferences): SessionPre
   return {
     ...snapshot,
     audioOffsetMs: normalizeAudioOffsetMs(snapshot.audioOffsetMs),
+    audioVolume: normalizeAudioVolume(snapshot.audioVolume),
   };
 }
 
