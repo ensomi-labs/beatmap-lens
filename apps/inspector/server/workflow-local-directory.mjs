@@ -7,7 +7,8 @@ import { gunzip, gzip } from "node:zlib";
 const compress = promisify(gzip);
 const decompress = promisify(gunzip);
 const storageFormat = "beatmap-lens-local-compact-v1";
-const blobContracts = new Set(["beatmap-lens-judgment-foundation", "beatmap-lens-agent-task"]);
+const taskContract = "beatmap-lens-agent-task";
+const blobContracts = new Set(["beatmap-lens-judgment-foundation", taskContract]);
 
 /** Node adapter for the existing canonical command writer. Commits are atomic renames. */
 export class LocalDirectoryHandle {
@@ -265,6 +266,81 @@ export async function compactReviewWorkspace(workspace) {
     beforeBytes: files.reduce((sum, file) => sum + file.beforeBytes, objectBytesBefore),
     afterBytes: files.reduce((sum, file) => sum + file.afterBytes, objectBytesAfter),
   };
+}
+
+/**
+ * Frozen agent task packets (`*task.json` from `fetch-task`) repeat the Foundation, its
+ * calibration charts and the source bytes, and jobs copy them. Each packet keeps its path and
+ * becomes a compact envelope over objects stored once in `<root>/.workflow-objects`. A packet
+ * is replaced only after its rebuild from the stored objects matches the original bytes.
+ * Run with the campaign's writers stopped.
+ */
+export async function compactTaskPackets(root) {
+  const storageRoot = resolve(root);
+  const objectBytesBefore = await objectBytes(storageRoot);
+  const files = [];
+  const kept = [];
+  for (const path of await taskPacketPaths(storageRoot)) {
+    const stored = await readFile(path);
+    const content = stored.toString("utf8");
+    const packet = JSON.parse(content);
+    if (packet.storage === storageFormat) continue;
+    // Only the canonical writer's exact bytes are rebuilt by the shared expansion.
+    if (packet.contract !== taskContract || `${JSON.stringify(packet, null, 2)}\n` !== content) {
+      kept.push({ path, reason: "not a canonical task packet" });
+      continue;
+    }
+    const canonicalSha256 = digest(stored);
+    const compact = await compactDocument(packet, canonicalSha256, storageRoot);
+    const rebuilt = await expandPackedDocument(JSON.parse(compact), storageRoot);
+    if (`${JSON.stringify(rebuilt, null, 2)}\n` !== content) {
+      kept.push({ path, reason: "rebuild differs from the original bytes" });
+      continue;
+    }
+    await atomicWrite(path, compact);
+    files.push({
+      path,
+      canonicalSha256,
+      beforeBytes: stored.length,
+      afterBytes: Buffer.byteLength(compact),
+    });
+  }
+  const objectBytesAfter = await objectBytes(storageRoot);
+  return {
+    files,
+    kept,
+    objectBytesBefore,
+    objectBytesAfter,
+    beforeBytes: files.reduce((sum, file) => sum + file.beforeBytes, objectBytesBefore),
+    afterBytes: files.reduce((sum, file) => sum + file.afterBytes, objectBytesAfter),
+  };
+}
+
+/** Restore the exact original bytes of every compact task packet under root, in place. */
+export async function expandTaskPackets(root) {
+  const storageRoot = resolve(root);
+  const files = [];
+  for (const path of await taskPacketPaths(storageRoot)) {
+    const stored = await readFile(path);
+    const content = await expandContent(stored, storageRoot);
+    if (content === stored) continue;
+    await atomicWrite(path, content);
+    files.push({ path, canonicalSha256: digest(content), bytes: Buffer.byteLength(content) });
+  }
+  return { files };
+}
+
+/** Exact original text of one task packet, compact or not; root holds its `.workflow-objects`. */
+export async function readTaskPacketFile(path, root) {
+  return (await expandContent(await readFile(path), resolve(root))).toString("utf8");
+}
+
+async function taskPacketPaths(root) {
+  const entries = await readdir(root, { recursive: true, withFileTypes: true });
+  return entries
+    .filter((entry) => entry.isFile() && entry.name.endsWith("task.json"))
+    .map((entry) => join(entry.parentPath, entry.name))
+    .sort();
 }
 
 async function objectBytes(storageRoot) {

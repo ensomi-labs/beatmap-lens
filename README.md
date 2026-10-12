@@ -91,6 +91,36 @@ annotation work. Paths and Python environments are configurable; see the
 [annotation workflow](docs/annotation/corpus-annotation.md) and
 [contribution guide](CONTRIBUTING.md). The npm package does not depend on ensomi.
 
+## Compact task packets
+
+Campaigns copy each frozen agent task packet (`task.json` from `fetch-task`) into the
+labeler's delivery folder and the auditor's `sealed/` inputs. Every copy repeats the
+Foundation with its calibration charts and the source chart as JSON byte arrays, about
+8 MB per packet. Once a campaign has finished, store its packets once:
+
+```sh
+node apps/inspector/server/annotation-workflow.mjs compact-packets --root .local/CAMPAIGN
+```
+
+Each `*task.json` under the root keeps its path and becomes a
+`beatmap-lens-local-compact-v1` envelope: the SHA-256 of the original file and a reference
+to the packed task. The task, its Foundation and the chart bytes are stored once by SHA-256
+in `CAMPAIGN/.workflow-objects`, in the review workspace's object format (JSON gzipped,
+chart bytes as `.bin`). A packet is replaced only after its rebuild matches the original
+bytes; other files are left as they are.
+
+File readers (delivery and recovery scripts, auditors' sealed inputs, campaign exports)
+need the original bytes. Before rerunning any step of a compacted campaign, restore them in
+place, verified against the stored hash, and compact again afterwards:
+
+```sh
+node apps/inspector/server/annotation-workflow.mjs expand-packets --root .local/CAMPAIGN
+```
+
+`readTaskPacketFile(path, root)` in `apps/inspector/server/workflow-local-directory.mjs`
+returns one packet's original text without rewriting it. Back up a compacted campaign
+together with its `.workflow-objects`.
+
 ## License
 
 MIT

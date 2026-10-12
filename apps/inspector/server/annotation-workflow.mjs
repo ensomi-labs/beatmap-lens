@@ -3,7 +3,11 @@ import { createRequire } from "node:module";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
-import { readCanonicalWorkflowFile } from "./workflow-local-directory.mjs";
+import {
+  compactTaskPackets,
+  expandTaskPackets,
+  readCanonicalWorkflowFile,
+} from "./workflow-local-directory.mjs";
 
 const repoRoot = fileURLToPath(new URL("../../../", import.meta.url));
 const require = createRequire(new URL("../package.json", import.meta.url));
@@ -21,6 +25,7 @@ const { positionals, values } = parseArgs({
     "foundation-source-sha": { type: "string" },
     "foundation-sha": { type: "string" },
     out: { type: "string" },
+    root: { type: "string" },
     "start-ms": { type: "string" },
     "end-ms": { type: "string" },
     fresh: { type: "boolean" },
@@ -44,6 +49,9 @@ if (values.help || !command) {
   expert-queue --file WORKFLOW.json [--source CHART.osu] [--out FILE]
   dispositions --file WORKFLOW_OR_DISPOSITIONS.json [--source CHART.osu] [--out FILE]
 
+  compact-packets --root CAMPAIGN_DIRECTORY
+  expand-packets --root CAMPAIGN_DIRECTORY
+
 The fixed human inbox is http://127.0.0.1:4176/review. Agents fetch frozen tasks,
 submit sealed packets, and read dispositions without human file transfers.
 Tasks freeze approved workspace context. Evidence includes the full difficulty and
@@ -51,6 +59,8 @@ exact source, even when rendered pages use a bounded range. Handoff accepts
 proposal, self-check notes and questions only. Independent auditors seal a separate
 packet against the original handoff. Human decisions are made in Inspector;
 machine review never creates a human-confirmed observation.
+compact-packets stores the task packets under a finished campaign once, in its
+.workflow-objects; expand-packets restores their exact bytes for file readers.
 `);
   process.exit(0);
 }
@@ -61,6 +71,23 @@ if (
 ) {
   try {
     await networkExchange();
+  } catch (error) {
+    process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+    process.exitCode = 1;
+  }
+} else if (command === "compact-packets" || command === "expand-packets") {
+  try {
+    const root = required("root");
+    const summary =
+      command === "compact-packets"
+        ? await compactTaskPackets(root).then(({ files, kept, beforeBytes, afterBytes }) => ({
+            compacted: files.length,
+            beforeBytes,
+            afterBytes,
+            kept,
+          }))
+        : { expanded: (await expandTaskPackets(root)).files.length };
+    process.stdout.write(`${JSON.stringify(summary, null, 2)}\n`);
   } catch (error) {
     process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
     process.exitCode = 1;
