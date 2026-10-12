@@ -1,5 +1,6 @@
 // @vitest-environment happy-dom
 
+import { renderDefaults } from "beatmap-lens";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createApp, h, nextTick, shallowRef } from "vue";
 import { AudioPlaybackController } from "./annotation/audio-playback";
@@ -866,6 +867,10 @@ describe("ReviewWorkspace mounted workflow", () => {
     const setVolume = vi.spyOn(AudioPlaybackController.prototype, "setAudioVolume");
     await setValue(control(container, "Volume"), "35", "input");
     expect(setVolume).toHaveBeenLastCalledWith(0.35);
+    expect(control(container, "Long-note tail").value).toBe(
+      String(renderDefaults.scene.tailShortenMs),
+    );
+    await setValue(control(container, "Long-note tail"), "25");
     expect(control(container, "Visual speed").value).toBe("360");
     expect(
       container.querySelector('.review-transport button[aria-pressed="true"]')?.textContent,
@@ -880,6 +885,7 @@ describe("ReviewWorkspace mounted workflow", () => {
         musicEnabled: false,
         audioOffsetMs: 55,
         audioVolume: 0.35,
+        tailShortenMs: 25,
       }),
     );
     let finishEnable: (() => void) | undefined;

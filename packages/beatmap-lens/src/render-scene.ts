@@ -18,6 +18,7 @@ import type {
 export interface ResolvedRenderSceneStyle {
   readonly metrics: RenderMetrics;
   readonly playfield: ResolvedPlayfieldSize;
+  readonly tailShortenMs: number;
 }
 
 export function createRenderScene(
@@ -73,7 +74,11 @@ export function resolveRenderSceneStyle(
     resolvedPlayfield.widthPx,
     metrics.noteInsetPx,
   );
-  return { metrics, playfield: resolvedPlayfield };
+  const tailShortenMs = theme?.tailShortenMs ?? renderDefaults.scene.tailShortenMs;
+  if (!Number.isFinite(tailShortenMs) || tailShortenMs < 0) {
+    throw new RangeError("theme.tailShortenMs must be finite and non-negative.");
+  }
+  return { metrics, playfield: resolvedPlayfield, tailShortenMs };
 }
 
 export function createRenderSceneFromProjection(
@@ -107,15 +112,20 @@ export function createRenderSceneFromProjection(
     };
   });
 
+  // A long note is visible while its drawn body reaches into the range. One shortened to its
+  // start is still drawn when it starts inside the range, as a tap is.
   const visibleNotes = chart.notes.filter((note) =>
     note.kind === "long"
-      ? note.endMs > projection.range.startMs && note.startMs < projection.range.endMs
+      ? (note.startMs >= projection.range.startMs ||
+          drawnEndMs(note, style.tailShortenMs) > projection.range.startMs) &&
+        note.startMs < projection.range.endMs
       : note.startMs >= projection.range.startMs && note.startMs < projection.range.endMs,
   );
   const notes = visibleNotes.map((note) =>
     createNoteGlyph(note, lanes[note.column] as RenderLane, {
       metrics,
       projection,
+      tailShortenMs: style.tailShortenMs,
     }),
   );
 
@@ -140,13 +150,17 @@ function createNoteGlyph(
   options: {
     metrics: RenderMetrics;
     projection: RenderTimeProjection;
+    tailShortenMs: number;
   },
 ): RenderNoteGlyph {
   const width = lane.width - options.metrics.noteInsetPx * 2;
   const laneTop = options.projection.contentTopPx;
   const laneBottom = laneTop + options.projection.contentHeightPx;
   const visibleStartMs = Math.max(note.startMs, options.projection.range.startMs);
-  const visibleEndMs = Math.min(note.endMs, options.projection.range.endMs);
+  const visibleEndMs = Math.min(
+    drawnEndMs(note, options.tailShortenMs),
+    options.projection.range.endMs,
+  );
   const startY = projectTimeFromValidatedProjection(options.projection, visibleStartMs);
   const endY = projectTimeFromValidatedProjection(options.projection, visibleEndMs);
   const isLong = note.kind === "long";
@@ -154,12 +168,18 @@ function createNoteGlyph(
     options.metrics.noteHeightPx,
     options.projection.contentHeightPx,
   );
-  const y = isLong
-    ? clamp(Math.min(startY, endY), laneTop, laneBottom)
-    : clamp(startY - effectiveNoteHeight / 2, laneTop, laneBottom - effectiveNoteHeight);
+  // Every glyph is at least one note tall and stays inside the lane, so no note can vanish.
   const height = isLong
-    ? Math.min(Math.max(Math.abs(endY - startY), effectiveNoteHeight), Math.max(laneBottom - y, 0))
+    ? Math.min(
+        Math.max(Math.abs(endY - startY), effectiveNoteHeight),
+        options.projection.contentHeightPx,
+      )
     : effectiveNoteHeight;
+  const y = clamp(
+    isLong ? Math.min(startY, endY) : startY - effectiveNoteHeight / 2,
+    laneTop,
+    laneBottom - height,
+  );
 
   return {
     id: note.id,
@@ -179,6 +199,11 @@ function createNoteGlyph(
     stroke: isLong ? "#257a78" : "#916f1d",
     sourceLine: note.sourceLine,
   };
+}
+
+/** Where a note is drawn to end: tailShortenMs before its end time, never before its start. */
+function drawnEndMs(note: ManiaNote, tailShortenMs: number): number {
+  return Math.max(note.startMs, note.endMs - tailShortenMs);
 }
 
 function resolveMetrics(theme: RenderThemeInput | undefined): RenderMetrics {

@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { renderDefaults } from "beatmap-lens";
 import { computed, onBeforeUnmount, onMounted, ref, shallowRef, triggerRef } from "vue";
 import AudioOffsetControl from "./AudioOffsetControl.vue";
 import AudioVolumeControl from "./AudioVolumeControl.vue";
@@ -19,6 +20,7 @@ import type {
   OpenComparison,
   VerdictRecord,
 } from "./compare/contracts";
+import LongNoteTailControl from "./LongNoteTailControl.vue";
 import WorkspaceModeSwitch from "./WorkspaceModeSwitch.vue";
 import type { WorkspaceMode } from "./workspace-mode";
 
@@ -61,6 +63,7 @@ const rate = ref<PlaybackRate>(1);
 const visualSpeed = ref(defaultVisualSpeed);
 const audioOffsetMs = ref(0);
 const audioVolume = ref(DEFAULT_AUDIO_VOLUME);
+const tailShortenMs = ref<number>(renderDefaults.scene.tailShortenMs);
 const mobilePanel = ref<"source" | "preview" | "details">("preview");
 const busy = ref(false);
 const saving = ref(false);
@@ -71,6 +74,7 @@ let preferenceWrite = Promise.resolve();
 const preferencesReady = sessions.getPreferences().then((preferences) => {
   audioOffsetMs.value = preferences?.audioOffsetMs ?? 0;
   audioVolume.value = preferences?.audioVolume ?? DEFAULT_AUDIO_VOLUME;
+  tailShortenMs.value = preferences?.tailShortenMs ?? renderDefaults.scene.tailShortenMs;
 }).catch((cause) => report(new Error(`Could not load Inspector preferences: ${String(cause)}`)));
 
 const pair = computed(() => opened.value?.pairs[pairIndex.value]);
@@ -263,6 +267,11 @@ function setAudioVolume(value: number) {
   audioVolume.value = value;
   clock?.setAudioVolume(value);
   savePreferences({ audioVolume: value });
+}
+
+function setTailShortenMs(value: number) {
+  tailShortenMs.value = value;
+  savePreferences({ tailShortenMs: value });
 }
 
 function savePreferences(patch: Partial<SessionPreferences>) {
@@ -568,6 +577,7 @@ function handleKeydown(event: KeyboardEvent) {
             :charts="blind.charts"
             :playhead-ms="playheadMs"
             :shown="shownCharts"
+            :tail-shorten-ms="tailShortenMs"
             :visual-speed="visualSpeed"
             v-bind="envelope ? { envelope } : {}"
           />
@@ -696,6 +706,11 @@ function handleKeydown(event: KeyboardEvent) {
                 :model-value="audioVolume"
                 :disabled="busy || !blind"
                 @update:model-value="setAudioVolume"
+              />
+              <LongNoteTailControl
+                :model-value="tailShortenMs"
+                :disabled="busy || !blind"
+                @update:model-value="setTailShortenMs"
               />
               <p class="setup-note">Space loops or pauses. A, B and S switch the view.</p>
             </div>

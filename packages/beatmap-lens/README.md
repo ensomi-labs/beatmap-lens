@@ -80,6 +80,9 @@ const svg = renderSvg(beatmap.chart, sceneOptions, { title: "60s to 75s" });
 ```
 
 `theme.metrics` is nested and partial: unspecified padding sides and metrics retain their defaults.
+`theme.tailShortenMs` draws each long note ending that many milliseconds before its end time, never
+before its start, as shortened-tail skins do; `0` draws the full length. It changes the drawing
+only: glyph `startMs`, `endMs` and `continuesAfter` keep the chart's times.
 SVG-only metadata such as `title` is a separate serializer option, accepted by the third argument
 of `renderSvg` or the second argument of `serializeSvg`.
 
@@ -96,6 +99,7 @@ of `renderSvg` or the second argument of `serializeSvg`.
 | `theme.metrics.noteHeightPx` | No | `8` |
 | `theme.metrics.noteInsetPx` | No | `5` |
 | `theme.metrics.noteRadiusPx` | No | `2` |
+| `theme.tailShortenMs` | No | `10`; finite and non-negative |
 | serializer `title` | No | Metadata artist/title/version plus the key-count label; the key-count label alone when metadata is absent |
 
 ### Fixed-size static review documents

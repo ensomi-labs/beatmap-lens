@@ -1,10 +1,20 @@
 // @vitest-environment happy-dom
 
+import { createRenderDocument } from "beatmap-lens";
 import { afterEach, expect, it, vi } from "vitest";
 import { createApp, nextTick } from "vue";
 import type { GoldenSet } from "./annotation/workflow/golden-set";
 import { workflowFixture } from "./annotation/workflow/test-fixtures";
 import GoldenSetBrowser from "./GoldenSetBrowser.vue";
+
+vi.mock("beatmap-lens", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("beatmap-lens")>();
+  return { ...actual, createRenderDocument: vi.fn(actual.createRenderDocument) };
+});
+vi.mock("./annotation/session-store", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./annotation/session-store")>()),
+  readTailShortenMs: async () => 37,
+}));
 
 const apps: ReturnType<typeof createApp>[] = [];
 afterEach(() => {
@@ -110,4 +120,14 @@ it("withholds stale source evidence and refreshes when a human label leaves the 
     expect(container.textContent).toContain("Zero usable current high-confidence"),
   );
   expect(container.querySelector(".golden-layout")).toBeNull();
+});
+
+it("draws the evidence with the stored long-note tail setting", async () => {
+  await fixture();
+  const container = mount();
+  await vi.waitFor(() => expect(container.querySelector(".golden-pages svg")).not.toBeNull());
+  expect(createRenderDocument).toHaveBeenLastCalledWith(
+    expect.anything(),
+    expect.objectContaining({ theme: { tailShortenMs: 37 } }),
+  );
 });

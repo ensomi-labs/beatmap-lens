@@ -1,5 +1,5 @@
 // @vitest-environment happy-dom
-import { parseOsu, toManiaChart } from "beatmap-lens";
+import { parseOsu, renderDefaults, toManiaChart } from "beatmap-lens";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { createApp, nextTick } from "vue";
 import { MediaPlaybackClock } from "./annotation/media-playback-clock";
@@ -229,6 +229,44 @@ it("defaults to 80% and restores volume without interrupting comparison playback
     0.35,
   );
 });
+
+it("defaults, validates, saves and restores the shared long-note tail setting", async () => {
+  await open();
+  expect(tailInput().value).toBe(String(renderDefaults.scene.tailShortenMs));
+  const previous = preferences.value;
+  for (const value of ["-5", ""]) {
+    await change(tailInput(), value);
+    expect(tailInput().closest("label")?.querySelector('[role="alert"]')).not.toBeNull();
+  }
+  await new Promise((resolve) => setTimeout(resolve));
+  expect(preferences.value).toBe(previous);
+
+  await change(tailInput(), "25");
+  expect(tailInput().closest("label")?.querySelector('[role="alert"]')).toBeNull();
+  await vi.waitFor(() => expect(preferences.value).toEqual({ ...previous, tailShortenMs: 25 }));
+
+  app.unmount();
+  vi.mocked(MediaPlaybackClock).mockClear();
+  vi.mocked(comparisonRequest).mockResolvedValue(new Response(new Uint8Array([1, 2, 3])));
+  app = createApp(CompareWorkspace);
+  app.mount(container);
+  await open();
+  expect(tailInput().value).toBe("25");
+});
+
+function tailInput() {
+  const input = container.querySelector<HTMLInputElement>(
+    'input[aria-label="Long-note tail shortening in milliseconds"]',
+  );
+  if (!input) throw new Error("No long-note tail control");
+  return input;
+}
+
+async function change(input: HTMLInputElement, value: string) {
+  input.value = value;
+  input.dispatchEvent(new Event("change"));
+  await nextTick();
+}
 
 async function open() {
   const input = container.querySelector<HTMLInputElement>('input[name="manifest"]');

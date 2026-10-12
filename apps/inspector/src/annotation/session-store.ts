@@ -1,3 +1,4 @@
+import { renderDefaults } from "beatmap-lens";
 import { toRaw } from "vue";
 import { normalizeAudioVolume } from "./audio-volume";
 import type { GoldExemplarRoleV1, StableNoteRefV1, TimeRangeV1 } from "./contracts";
@@ -43,6 +44,7 @@ export interface SessionPreferences {
   audioOffsetMs?: number;
   audioVolume?: number;
   musicEnabled: boolean;
+  tailShortenMs?: number;
   visualSpeed: number;
 }
 
@@ -188,6 +190,19 @@ export class IndexedDbSessionStore implements SessionStore {
 }
 
 type SessionStoreName = "drafts" | "handles" | "preferences";
+
+/**
+ * The stored long-note tail setting, for views that draw charts but keep no preferences of their
+ * own. Without a stored value or a readable store they draw with the renderer default.
+ */
+export async function readTailShortenMs(): Promise<number> {
+  try {
+    const preferences = await new IndexedDbSessionStore().getPreferences();
+    return preferences?.tailShortenMs ?? renderDefaults.scene.tailShortenMs;
+  } catch {
+    return renderDefaults.scene.tailShortenMs;
+  }
+}
 
 function openDatabase(indexedDb: IDBFactory, name: string): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {

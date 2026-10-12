@@ -5,6 +5,7 @@ import {
   toManiaChart,
 } from "beatmap-lens";
 import { computed, nextTick, onMounted, ref } from "vue";
+import { readTailShortenMs } from "./annotation/session-store";
 import { renderStaticPreviewSvg } from "./static-preview";
 import WorkspaceModeSwitch from "./WorkspaceModeSwitch.vue";
 import type { WorkspaceMode } from "./workspace-mode";
@@ -105,6 +106,7 @@ const chartSummary = ref<ChartSummary>({
 });
 const sourceLineCount = computed(() => source.value.split(/\r\n|\n|\r/).length);
 let runCount = 0;
+const storedTailShortenMs = readTailShortenMs();
 
 onMounted(() => {
   void runPipeline();
@@ -126,8 +128,9 @@ async function runPipeline(): Promise<void> {
     const chart = toManiaChart(document);
     const normalizeDuration = performance.now() - normalizeStartedAt;
 
+    const tailShortenMs = await storedTailShortenMs;
     const renderStartedAt = performance.now();
-    const svg = renderStaticPreviewSvg(chart);
+    const svg = renderStaticPreviewSvg(chart, tailShortenMs);
     const renderDuration = performance.now() - renderStartedAt;
 
     mountSvg(svg);

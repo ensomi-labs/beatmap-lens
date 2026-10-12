@@ -8,6 +8,8 @@ describe("render defaults", () => {
         pixelsPerSecond: 240,
         playfield: { widthPx: 640 },
         timeDirection: "bottom-to-top",
+        // A tunable default: its value is not part of this contract.
+        tailShortenMs: expect.any(Number),
         metrics: {
           paddingPx: { top: 24, right: 16, bottom: 24, left: 16 },
           laneGapPx: 4,

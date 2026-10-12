@@ -11,6 +11,7 @@ const props = defineProps<{
   playheadMs: number;
   /** Chart indexes to draw, in A, B order. */
   shown: readonly (0 | 1)[];
+  tailShortenMs: number;
   visualSpeed: number;
 }>();
 
@@ -43,6 +44,7 @@ const controllers = computed(() =>
             width: size.value.width,
             viewportHeight: size.value.height,
             pixelsPerSecond: props.visualSpeed,
+            theme: { tailShortenMs: props.tailShortenMs },
           }),
       )
     : [],

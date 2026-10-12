@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import type { ManiaNote } from "beatmap-lens";
+import { type ManiaNote, renderDefaults } from "beatmap-lens";
 import {
   computed,
   nextTick,
@@ -131,6 +131,7 @@ import {
   zoomTimelineViewRangeAtTime,
 } from "./annotation/timeline-view-range";
 import FallingNoteViewport from "./FallingNoteViewport.vue";
+import LongNoteTailControl from "./LongNoteTailControl.vue";
 import WorkspaceModeSwitch from "./WorkspaceModeSwitch.vue";
 import {
   createWorkspaceLifecycleState,
@@ -285,6 +286,7 @@ const musicEnabled = ref(false);
 const audioStatus = ref<AudioPlaybackStatus>({ kind: "idle" });
 const audioOffsetMs = ref(0);
 const audioVolume = ref(DEFAULT_AUDIO_VOLUME);
+const tailShortenMs = ref<number>(renderDefaults.scene.tailShortenMs);
 const timelineViewRange = ref<TimeRangeV1>({ startMs: 0, endMs: 1 });
 const focusedTagId = ref<string>();
 const editorUndoStack = ref<readonly EditorUndoState[]>([]);
@@ -497,6 +499,7 @@ onMounted(async () => {
       musicEnabled.value = preferences.musicEnabled;
       audioOffsetMs.value = preferences.audioOffsetMs ?? 0;
       audioVolume.value = preferences.audioVolume ?? DEFAULT_AUDIO_VOLUME;
+      tailShortenMs.value = preferences.tailShortenMs ?? renderDefaults.scene.tailShortenMs;
     }
 
     const storedDataset = await sessions.getDirectoryHandle<BrowserDirectoryHandle>("dataset");
@@ -618,6 +621,7 @@ async function startWorkspace(): Promise<void> {
       audioOffsetMs: audioOffsetMs.value,
       audioVolume: audioVolume.value,
       musicEnabled: musicEnabled.value,
+      tailShortenMs: tailShortenMs.value,
       visualSpeed: visualSpeed.value,
     });
 
@@ -885,6 +889,7 @@ function rebuildViewportController(): void {
     width,
     viewportHeight: height,
     pixelsPerSecond: visualSpeed.value,
+    theme: { tailShortenMs: tailShortenMs.value },
   });
   updateViewportFrame(transientViewportTimeMs ?? playheadMs.value);
   restartPlaybackInstrumentation();
@@ -1063,12 +1068,20 @@ async function setAudioVolume(value: number): Promise<void> {
   await persistSessionPreferences();
 }
 
+async function setTailShortenMs(value: number): Promise<void> {
+  tailShortenMs.value = value;
+  viewportController = undefined;
+  rebuildViewportController();
+  await persistSessionPreferences();
+}
+
 function persistSessionPreferences(): Promise<void> {
   const preferences = {
     annotatorId: annotatorId.value.trim(),
     audioOffsetMs: audioOffsetMs.value,
     audioVolume: audioVolume.value,
     musicEnabled: musicEnabled.value,
+    tailShortenMs: tailShortenMs.value,
     visualSpeed: visualSpeed.value,
   };
   preferenceWrite = preferenceWrite
@@ -3160,6 +3173,12 @@ function errorMessage(error: unknown): string {
                 :model-value="audioVolume"
                 :disabled="editorLocked"
                 @update:model-value="setAudioVolume"
+              />
+
+              <LongNoteTailControl
+                :model-value="tailShortenMs"
+                :disabled="editorLocked"
+                @update:model-value="setTailShortenMs"
               />
 
               <div class="timeline-zoom-control">
