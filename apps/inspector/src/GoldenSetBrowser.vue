@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { createRenderDocument, parseBeatmap, serializeSvgPages } from "beatmap-lens";
 import { computed, onBeforeUnmount, onMounted, ref, shallowRef, watch } from "vue";
+import { readTailShortenMs } from "./annotation/session-store";
 import { type GoldenSet, goldenAssessment } from "./annotation/workflow/golden-set";
 import { type RemoteSourceV2, reviewRequest } from "./annotation/workflow/remote-workspace";
 import { REVIEW_TARGETS } from "./annotation/workflow/review-sampling";
@@ -16,8 +17,10 @@ const selectedId = ref("");
 const evidence = shallowRef<RemoteSourceV2>();
 const evidenceLoading = ref(false);
 const evidenceError = ref("");
+const tailShortenMs = ref<number>();
 let stopped = false;
 let selection = 0;
+void readTailShortenMs().then((value) => { tailShortenMs.value = value; });
 
 const labelCount = computed(() => pool.value?.cases.reduce((sum, entry) => sum + Object.keys(entry.gold).length, 0) ?? 0);
 const filtered = computed(() => {
@@ -32,13 +35,14 @@ watch(filtered, entries => {
   if (!entries.some(entry => entry.caseId === selectedId.value)) selectedId.value = entries[0]?.caseId ?? "";
 });
 const pages = computed(() => {
-  if (!evidence.value || !selected.value) return [];
+  if (!evidence.value || !selected.value || tailShortenMs.value === undefined) return [];
   const chart = parseBeatmap(new TextDecoder().decode(Uint8Array.from(evidence.value.sourceBytes))).chart;
   const document = createRenderDocument(chart, {
     range: selected.value.reviewContext,
     page: { size: { widthPx: 1200, heightPx: 900 }, columns: "auto" },
     panel: { playfield: { laneWidthPx: 48 }, maxNoteRows: 32 },
     scale: { type: "row-aware" },
+    theme: { tailShortenMs: tailShortenMs.value },
   });
   // Keep the note layout and scale, removing unused space above short panels.
   return serializeSvgPages({ ...document, pages: document.pages.map(page => {
