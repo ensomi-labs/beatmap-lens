@@ -169,3 +169,7 @@ its writer when taking a consistent copy. A compact workflow file alone is not a
 standalone export. The Review CLI can read it in its workspace and export a full
 view. Raw execution logs and working research notes are local operational records,
 not required public documentation.
+
+Finished campaigns may store their task packets the same way, in the campaign's own
+`.workflow-objects/`. Run `expand-packets` before rerunning any of their steps; see
+[compact task packets](../../README.md#compact-task-packets).

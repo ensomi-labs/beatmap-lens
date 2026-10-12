@@ -402,6 +402,24 @@ describe("external annotation exchange CLI", () => {
   });
 });
 
+describe("task packet storage CLI", () => {
+  it("compacts a finished campaign's packets and expands them to the exact bytes", async () => {
+    const f = await workflowFixture();
+    const dir = await temporary();
+    const folder = join(dir, "dispatch/delivery/labeler-001/packets/case-1");
+    const path = join(folder, "task.json");
+    const canonical = serializeCanonicalJson(f.task);
+    await mkdir(folder, { recursive: true });
+    await writeFile(path, canonical);
+    const compacted = await exec(process.execPath, [script, "compact-packets", "--root", dir]);
+    expect(JSON.parse(compacted.stdout)).toMatchObject({ compacted: 1, kept: [] });
+    expect(JSON.parse(await readFile(path, "utf8")).storage).toBe("beatmap-lens-local-compact-v1");
+    const expanded = await exec(process.execPath, [script, "expand-packets", "--root", dir]);
+    expect(JSON.parse(expanded.stdout)).toEqual({ expanded: 1 });
+    expect(await readFile(path, "utf8")).toBe(canonical);
+  });
+});
+
 async function temporary(): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), "beatmap-lens-cli-"));
   directories.push(dir);

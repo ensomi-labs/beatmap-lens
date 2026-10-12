@@ -1,6 +1,6 @@
-import { mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { serializeCanonicalJson } from "../canonical-json";
@@ -11,9 +11,13 @@ import { workflowFixture } from "./test-fixtures";
 const adapterUrl = pathToFileURL(
   resolve("apps/inspector/server/workflow-local-directory.mjs"),
 ).href;
-const { LocalDirectoryHandle, compactReviewWorkspace } = await import(
-  /* @vite-ignore */ adapterUrl
-);
+const {
+  LocalDirectoryHandle,
+  compactReviewWorkspace,
+  compactTaskPackets,
+  expandTaskPackets,
+  readTaskPacketFile,
+} = await import(/* @vite-ignore */ adapterUrl);
 const workspaces: string[] = [];
 afterEach(async () => {
   await Promise.all(workspaces.splice(0).map((path) => rm(path, { recursive: true, force: true })));
@@ -136,5 +140,43 @@ describe("compact local workflow storage", () => {
     await expect(f.directory.read(f.inspected.source.sha256)).rejects.toThrow(
       "stored hash differs",
     );
+  });
+});
+
+describe("compact task packets", () => {
+  it("stores copied packets once, keeps their paths and restores the exact bytes", async () => {
+    const { task } = await workflowFixture();
+    const root = await mkdtemp(join(tmpdir(), "task-packets-"));
+    workspaces.push(root);
+    const canonical = serializeCanonicalJson(task);
+    const copies = [
+      join(root, "dispatch/delivery/labeler-001/packets/case-1/task.json"),
+      join(root, "dispatch/runs/auditor-001/sealed/case-1/task.json"),
+    ];
+    const reformatted = join(root, "notes/case-1-task.json");
+    const files: [string, string][] = [
+      ...copies.map((path): [string, string] => [path, canonical]),
+      [reformatted, JSON.stringify(task)],
+    ];
+    for (const [path, content] of files) {
+      await mkdir(dirname(path), { recursive: true });
+      await writeFile(path, content);
+    }
+
+    const result = await compactTaskPackets(root);
+    expect(result.files.map((file: { path: string }) => file.path)).toEqual(copies);
+    expect(result.kept).toEqual([{ path: reformatted, reason: "not a canonical task packet" }]);
+    expect(result.afterBytes).toBeLessThan(result.beforeBytes);
+    const pointers = await Promise.all(copies.map((path) => readFile(path, "utf8")));
+    expect(pointers[1]).toBe(pointers[0]);
+    expect(JSON.parse(pointers[0] ?? "").storage).toBe("beatmap-lens-local-compact-v1");
+    const names = await readdir(join(root, ".workflow-objects"));
+    expect(names.filter((name) => name.endsWith(".json.gz"))).toHaveLength(2); // Task, Foundation.
+    for (const path of copies) expect(await readTaskPacketFile(path, root)).toBe(canonical);
+    expect((await compactTaskPackets(root)).files).toEqual([]);
+
+    expect((await expandTaskPackets(root)).files).toHaveLength(2);
+    for (const path of copies) expect(await readFile(path, "utf8")).toBe(canonical);
+    expect(await readFile(reformatted, "utf8")).toBe(JSON.stringify(task));
   });
 });
