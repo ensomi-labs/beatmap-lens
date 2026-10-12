@@ -168,12 +168,18 @@ function createNoteGlyph(
     options.metrics.noteHeightPx,
     options.projection.contentHeightPx,
   );
-  const y = isLong
-    ? clamp(Math.min(startY, endY), laneTop, laneBottom)
-    : clamp(startY - effectiveNoteHeight / 2, laneTop, laneBottom - effectiveNoteHeight);
+  // Every glyph is at least one note tall and stays inside the lane, so no note can vanish.
   const height = isLong
-    ? Math.min(Math.max(Math.abs(endY - startY), effectiveNoteHeight), Math.max(laneBottom - y, 0))
+    ? Math.min(
+        Math.max(Math.abs(endY - startY), effectiveNoteHeight),
+        options.projection.contentHeightPx,
+      )
     : effectiveNoteHeight;
+  const y = clamp(
+    isLong ? Math.min(startY, endY) : startY - effectiveNoteHeight / 2,
+    laneTop,
+    laneBottom - height,
+  );
 
   return {
     id: note.id,

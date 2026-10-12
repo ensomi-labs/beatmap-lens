@@ -7,8 +7,8 @@ import {
   parseBeatmap,
   projectTime,
   type RenderScene,
+  type RenderSceneOptions,
   renderDefaults,
-  type TimeRange,
 } from "../src/index.js";
 
 const chart = parseBeatmap(`osu file format v14
@@ -20,6 +20,7 @@ CircleSize:4
 64,192,1000,128,0,2000:0:0:0:0:
 192,192,500,128,0,1005:0:0:0:0:
 320,192,1000,128,0,1005:0:0:0:0:
+448,192,2995,128,0,3005:0:0:0:0:
 `).chart;
 const range = { startMs: 0, endMs: 3000 };
 
@@ -53,14 +54,39 @@ describe("long-note tail shortening", () => {
   });
 
   it("omits a long note whose drawn end is before the range but keeps its true continuation", () => {
-    const before = tailScene(20, { startMs: 0, endMs: 1000 });
-    const after = tailScene(20, { startMs: 1000, endMs: 3000 });
+    const before = tailScene(20, { range: { startMs: 0, endMs: 1000 } });
+    const after = tailScene(20, { range: { startMs: 1000, endMs: 3000 } });
     expect(longNote(before, 500, 1005)).toMatchObject({ continuesAfter: true });
     expect(drawnSpan(before, 500, 1005)).toEqual(projectedSpan(before, 500, 985));
     expect(longNote(after, 500, 1005)).toBeUndefined();
     // A note shortened to its start still belongs to the range it starts in, as a tap does.
     expect(longNote(after, 1000, 1005)).toBeDefined();
   });
+
+  it.each(["bottom-to-top", "top-to-bottom"] as const)(
+    "draws a long note shorter than the note height at note height inside the lane, %s",
+    (timeDirection) => {
+      // At 1 px per ms the 5 ms notes are shorter than a note, and 20 ms shortens them to their
+      // start. One starts at the range start, the other just before the range end.
+      for (const tailShortenMs of [0, 20]) {
+        const short = tailScene(tailShortenMs, {
+          range: { startMs: 1000, endMs: 3000 },
+          timeDirection,
+        });
+        const laneTop = short.projection.contentTopPx;
+        const laneBottom = laneTop + short.projection.contentHeightPx;
+        for (const [startMs, endMs] of [
+          [1000, 1005],
+          [2995, 3005],
+        ] as const) {
+          const note = longNote(short, startMs, endMs);
+          expect(note?.height).toBe(short.metrics.noteHeightPx);
+          expect(note?.y).toBeGreaterThanOrEqual(laneTop);
+          expect((note?.y ?? 0) + (note?.height ?? 0)).toBeLessThanOrEqual(laneBottom);
+        }
+      }
+    },
+  );
 
   it("applies to document panels and animation frames", () => {
     const theme = { tailShortenMs: 100 };
@@ -74,10 +100,11 @@ describe("long-note tail shortening", () => {
 });
 
 /** One pixel per millisecond keeps every projected edge exact. */
-function tailScene(tailShortenMs?: number, sceneRange: TimeRange = range): RenderScene {
+function tailScene(tailShortenMs?: number, options: Partial<RenderSceneOptions> = {}): RenderScene {
   return createRenderScene(chart, {
-    range: sceneRange,
+    range,
     pixelsPerSecond: 1000,
+    ...options,
     ...(tailShortenMs === undefined ? {} : { theme: { tailShortenMs } }),
   });
 }
