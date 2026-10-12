@@ -43,6 +43,7 @@ export interface SessionPreferences {
   audioOffsetMs?: number;
   audioVolume?: number;
   musicEnabled: boolean;
+  tailShortenMs?: number;
   visualSpeed: number;
 }
 

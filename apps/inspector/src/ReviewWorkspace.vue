@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { parseBeatmap, renderSvgPages } from "beatmap-lens";
+import { parseBeatmap, renderDefaults, renderSvgPages } from "beatmap-lens";
 import { computed, onBeforeUnmount, onMounted, ref, shallowRef, watch } from "vue";
 import AnnotationTimeline from "./AnnotationTimeline.vue";
 import AudioVolumeControl from "./AudioVolumeControl.vue";
@@ -25,6 +25,7 @@ import { createRemoteReviewStore, type RemoteSourceV2, type ReviewStoreV2 } from
 import { reviewDraftStorage } from "./annotation/workflow/review-draft-storage";
 import { agentVersionLabel, reviewVersionOptions, skillKey } from "./annotation/workflow/review-provenance";
 import FallingNoteViewport from "./FallingNoteViewport.vue";
+import LongNoteTailControl from "./LongNoteTailControl.vue";
 import WorkflowClaimEditor from "./WorkflowClaimEditor.vue";
 import WorkflowSectionSliders from "./WorkflowSectionSliders.vue";
 import WorkspaceModeSwitch from "./WorkspaceModeSwitch.vue";
@@ -148,7 +149,7 @@ const agentActionCount = computed(() => agentReviews.value.filter(review => ["aw
 const endMs = computed(() => source.value ? chartEndMs(source.value.chart) : 1000);
 const sourceVisualSpeed = computed(() => speed.value / playbackRate.value);
 const controller = computed(() => source.value ? new BufferedSceneController(source.value.chart, {
-  viewportHeight: size.value.height, width: size.value.width, pixelsPerSecond: sourceVisualSpeed.value,
+  viewportHeight: size.value.height, width: size.value.width, pixelsPerSecond: sourceVisualSpeed.value, theme: { tailShortenMs: tailShortenMs.value },
 }) : undefined);
 const frame = computed(() => controller.value?.frame(playhead.value));
 const selectedNotes = computed(() => new Set((activeClaim.value?.evidence.noteRefs ?? []).concat(activeClaim.value?.evidence.contextNoteRefs ?? []).map(stableNoteRefKey)));
@@ -180,7 +181,7 @@ const calibrationPages = computed(() => {
   const example = calibrationExample.value;
   if (!example) return [];
   const chart = parseBeatmap(new TextDecoder().decode(Uint8Array.from(example.sourceBytes))).chart;
-  return renderSvgPages(chart, { range: example.claim.reviewContext, page: { size: { widthPx: 1200, heightPx: 900 }, columns: "auto" }, panel: { playfield: { laneWidthPx: 48 }, maxNoteRows: 32 }, scale: { type: "row-aware" } });
+  return renderSvgPages(chart, { range: example.claim.reviewContext, page: { size: { widthPx: 1200, heightPx: 900 }, columns: "auto" }, panel: { playfield: { laneWidthPx: 48 }, maxNoteRows: 32 }, scale: { type: "row-aware" }, theme: { tailShortenMs: tailShortenMs.value } });
 });
 
 const sessions = new IndexedDbSessionStore();
@@ -190,6 +191,7 @@ const playbackReady = ref(false);
 const musicEnabled = ref(false);
 const audioOffsetMs = ref(0);
 const audioVolume = ref(DEFAULT_AUDIO_VOLUME);
+const tailShortenMs = ref<number>(renderDefaults.scene.tailShortenMs);
 const audioStatus = shallowRef<AudioPlaybackStatus>({ kind: "idle" });
 let playback: AudioPlaybackController | undefined;
 let preferenceWrite = Promise.resolve();
@@ -199,6 +201,7 @@ const preferencesReady = sessions.getPreferences().then(preferences => {
   musicEnabled.value = preferences.musicEnabled;
   audioOffsetMs.value = preferences.audioOffsetMs ?? 0;
   audioVolume.value = preferences.audioVolume ?? DEFAULT_AUDIO_VOLUME;
+  tailShortenMs.value = preferences.tailShortenMs ?? renderDefaults.scene.tailShortenMs;
 }).catch(cause => { error.value = `Could not load Inspector preferences: ${String(cause)}`; });
 const transportDisabled = computed(() => !playbackReady.value || busy.value || sourceLoading.value || props.active === false || Boolean(calibrationExample.value));
 const audioDescription = computed(() => {
@@ -262,7 +265,7 @@ watch(() => [activeClaim.value?.scope.startMs, activeClaim.value?.scope.endMs], 
 function savePreferences(patch: Partial<SessionPreferences>): void {
   preferenceWrite = preferenceWrite.then(async () => {
     const previous = await sessions.getPreferences();
-    await sessions.setPreferences({ annotatorId: "", visualSpeed: speed.value, musicEnabled: musicEnabled.value, audioOffsetMs: audioOffsetMs.value, audioVolume: audioVolume.value, ...previous, ...patch });
+    await sessions.setPreferences({ annotatorId: "", visualSpeed: speed.value, musicEnabled: musicEnabled.value, audioOffsetMs: audioOffsetMs.value, audioVolume: audioVolume.value, tailShortenMs: tailShortenMs.value, ...previous, ...patch });
   }).catch(cause => { error.value = `Could not save Inspector preferences: ${String(cause)}`; });
 }
 
@@ -306,6 +309,11 @@ function setAudioOffset(value: number): void {
 function setAudioVolume(value: number): void {
   playback?.setAudioVolume(value);
   savePreferences({ audioVolume: value });
+}
+
+function setTailShortenMs(value: number): void {
+  tailShortenMs.value = value;
+  savePreferences({ tailShortenMs: value });
 }
 
 function setPlaybackRate(rate: number): void {
@@ -1310,6 +1318,11 @@ onBeforeUnmount(() => { window.removeEventListener("keydown", workspaceKeydown);
                 :model-value="audioVolume"
                 :disabled="transportDisabled"
                 @update:model-value="setAudioVolume"
+              />
+              <LongNoteTailControl
+                :model-value="tailShortenMs"
+                :disabled="transportDisabled"
+                @update:model-value="setTailShortenMs"
               />
               <section class="review-zoom" aria-label="Timeline lens">
                 <button type="button" aria-label="Zoom timeline in" @click="zoomTimeline(1)" @keydown="timelineControlKeydown">Zoom in</button>
