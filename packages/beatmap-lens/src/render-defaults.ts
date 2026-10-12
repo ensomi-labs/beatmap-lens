@@ -3,6 +3,8 @@ export const renderDefaults = deepFreeze({
     pixelsPerSecond: 240,
     playfield: { widthPx: 640 },
     timeDirection: "bottom-to-top",
+    /** Long notes are drawn ending this many ms before their end time, never before their start. */
+    tailShortenMs: 10,
     metrics: {
       paddingPx: {
         top: 24,

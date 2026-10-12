@@ -204,6 +204,11 @@ export interface RenderMetricOptions {
 
 export interface RenderThemeInput {
   readonly metrics?: RenderMetricOptions;
+  /**
+   * Draw each long note ending this many ms before its end time, never before its start, as
+   * shortened-tail skins do. Display only: glyph `endMs` and `continuesAfter` keep the end time.
+   */
+  readonly tailShortenMs?: number;
 }
 
 export type RenderPaddingInput = number | Partial<RenderPadding>;
@@ -245,6 +250,7 @@ export interface ResolvedRenderAnimationOptions {
   readonly timeDirection: RenderTimeDirection;
   readonly metrics: RenderMetrics;
   readonly playfield: ResolvedPlayfieldSize;
+  readonly tailShortenMs: number;
   readonly contentHeightPx: number;
   readonly visibleDurationMs: number;
   readonly durationMs: number;

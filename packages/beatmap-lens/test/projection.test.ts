@@ -331,7 +331,8 @@ CircleSize:4
 `),
     );
     const projection = piecewiseProjection("top-to-bottom");
-    const style = resolveRenderSceneStyle(chart);
+    // Full-length tails: the long note spans exactly its projected interval.
+    const style = resolveRenderSceneStyle(chart, undefined, { tailShortenMs: 0 });
     const scene = createRenderSceneFromProjection(
       chart,
       { ...projection, contentTopPx: style.metrics.paddingPx.top },

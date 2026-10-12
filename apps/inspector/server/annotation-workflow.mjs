@@ -108,6 +108,8 @@ if (
         page: { size: { widthPx: 1600, heightPx: 900 }, columns: "auto" },
         panel: { playfield: { laneWidthPx: 48 }, maxNoteRows: 32 },
         scale: { type: "row-aware" },
+        // Worker evidence keeps full-length tails, as the existing labels were judged on them.
+        theme: { tailShortenMs: 0 },
       });
       await mkdir(destination, { recursive: true });
       await writeFile(join(destination, "source.osu"), bytes);
