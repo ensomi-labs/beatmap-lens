@@ -42,6 +42,24 @@ The [selection repair procedure](docs/annotation/evidence-review.md) preserves
 label authority and evidence provenance, and supplements missing selections
 through concurrent agent judgment and note selection.
 
+## Feedback and contributing
+
+Feedback from mappers, players and developers decides what the tools and the
+dataset improve next. Short or general feedback is welcome, in English,
+Japanese or Chinese:
+
+- the Inspector, the renderer, the npm package or the annotation tools:
+  [tooling feedback](https://github.com/ensomi-labs/beatmap-lens/issues/new?template=tooling-feedback.yml),
+  for bugs, rough edges and tools you wish existed;
+- the published dataset:
+  [dataset feedback](https://github.com/ensomi-labs/beatmap-lens/issues/new?template=dataset-feedback.yml),
+  for a label that reads wrong to you, a Foundation concept, or another
+  problem; a reading you give is kept as your own judgment, credited to you;
+- ideas, questions and offers to annotate:
+  [Discussions](https://github.com/orgs/ensomi-labs/discussions).
+
+The [contribution guide](CONTRIBUTING.md) also covers code.
+
 ## Repository map
 
 | Location | Responsibility |

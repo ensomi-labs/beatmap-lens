@@ -1,0 +1,70 @@
+name: Dataset feedback
+description: A label in the published dataset or the Inspector reads wrong to you, a Foundation concept needs work, or the dataset has another problem.
+title: "[Dataset] "
+labels: ["dataset feedback"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The Foundation concepts and the dataset rest on mappers' readings of charts, so yours
+        counts. **Short or general feedback is welcome**; only "What you see" is required.
+        English, 日本語 and 中文 are all welcome.
+
+        A reading you give is kept as your own judgment, credited by the name you give below. It
+        never overwrites an existing human record; where readings differ, both stay visible.
+        Reports are public, and we publish them as an open dataset under CC BY 4.0.
+
+  - type: dropdown
+    id: kind
+    attributes:
+      label: What is it about?
+      options:
+        - A label on one section
+        - A Foundation concept, its definition or its examples
+        - "The dataset itself: a source link, a field, the format, coverage"
+        - Something else
+
+  - type: input
+    id: section
+    attributes:
+      label: Which section (for a label)
+      description: >-
+        The `record_id` or `section_id` from the dataset, or the beatmap link
+        (`https://osu.ppy.sh/beatmaps/...`) with the time range.
+
+  - type: input
+    id: label
+    attributes:
+      label: Which label (for a label)
+      description: The concept and the assessment the dataset gives it, as the dataset or the Inspector names them.
+
+  - type: textarea
+    id: reading
+    attributes:
+      label: What you see
+      description: >-
+        For a label, what you would label and the notes that decide it; osu! editor timestamps help
+        (select the notes in the editor and press Ctrl+C). For anything else, what is wrong or
+        missing, and where.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: confidence
+    attributes:
+      label: How sure are you? (for a label)
+      options:
+        - High
+        - Low
+
+  - type: input
+    id: experience
+    attributes:
+      label: Your mapping or playing experience (optional)
+      placeholder: e.g. mapped three ranked 4K sets; play around 5★
+
+  - type: input
+    id: credit
+    attributes:
+      label: How should we credit you?
+      description: An osu! username, your GitHub name, or "anonymous". Blank means your GitHub name.

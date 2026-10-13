@@ -1,10 +1,46 @@
 # Contributing
 
+beatmap-lens reads osu!mania charts the way mappers do, and mappers are the
+authority on whether it does. Its dataset, code and
+[research conclusions](docs/README.md#research) are open, so that anyone can
+use what mappers' readings teach and correct it. What mappers, players and
+developers tell us decides what the tools and the dataset improve next and
+what we choose to build. Most contributions need no code; short or general
+feedback is welcome, in English, Japanese or Chinese.
+
+## Without code
+
+- **Feedback on the tools.** For the Inspector, the chart renderer, the npm
+  package or the annotation tools, whether you map, play or develop: a bug,
+  something that gets in the way, or a tool you wish existed. Open a
+  [tooling feedback report](https://github.com/ensomi-labs/beatmap-lens/issues/new?template=tooling-feedback.yml);
+  for a bug, attach the `.osu` file renamed to `.txt`, because GitHub does not
+  accept `.osu` attachments.
+- **Feedback on the published dataset.** When a pattern label in the
+  [dataset](https://huggingface.co/datasets/sed-i/mania-pattern-annotations) or
+  in the Inspector does not match how you read the section, a Foundation
+  concept reads wrong to you, or the dataset has another problem, open a
+  [dataset feedback report](https://github.com/ensomi-labs/beatmap-lens/issues/new?template=dataset-feedback.yml).
+  A reading you give is kept as your own judgment, credited to you. It never
+  overwrites an existing human record; where readings differ, both stay visible.
+- **You would like to annotate.** Mappers who want to label sections in the
+  Inspector are welcome. Say so in
+  [Discussions](https://github.com/orgs/ensomi-labs/discussions) and we will
+  help you set up.
+- **Ideas and questions** about what ensomi should become go to Discussions,
+  where others can add to them and upvote them.
+
+Reports are public. Dataset feedback is published as an open dataset under
+CC BY 4.0, credited by the name each reporter gives. Never attach audio:
+songs are copyrighted.
+
+## Code
+
 Describe the real beatmap or development workflow a change serves. Keep changes
 focused, preserve the distinction between observed structure and semantic judgment,
 and avoid abstractions for hypothetical consumers.
 
-## Product and research boundaries
+### Product and research boundaries
 
 `packages/beatmap-lens` is the independent npm package. Keep its API curated,
 DOM-free, and free of implicit filesystem or network access. Parsing, normalized
@@ -32,7 +68,7 @@ locations through the supported configuration or CLI options. Keep ensomi
 model execution and training code in that repository. Do not introduce format
 adapters without a concrete consumer need.
 
-## Changes and documentation
+### Changes and documentation
 
 - Treat valid `.osu` files as the baseline. Add malformed-input handling only for
   an explicit requirement or demonstrated problem.
@@ -56,7 +92,7 @@ Do not change approved Foundation semantics or reinterpret a human annotation as
 part of directory cleanup, tooling maintenance, or an agent-only conclusion.
 Keep the label and its human authority separate from a proposed explanation.
 
-## Verification
+### Verification
 
 `pnpm check` verifies engineering behavior and packaging. Run
 `pnpm check:regression` separately for judgment-affecting method changes; its
