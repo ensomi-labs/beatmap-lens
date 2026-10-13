@@ -1,0 +1,71 @@
+name: Label feedback
+description: A pattern label in the dataset or the Inspector does not match how you read the section, or a Foundation concept reads wrong to you.
+title: "[Label] "
+labels: ["label feedback"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The Foundation concepts and the dataset rest on mappers' readings of charts, so yours
+        counts. English, 日本語 and 中文 are all welcome.
+
+        Your reading is kept as your own judgment, credited by the name you give below. It never
+        overwrites an existing human record; where readings differ, both stay visible. Reports
+        are public, and we publish them as an open dataset under CC BY 4.0.
+
+  - type: dropdown
+    id: kind
+    attributes:
+      label: What is it about?
+      options:
+        - One label on one section
+        - A Foundation concept itself, its definition or its examples
+        - Something else
+    validations:
+      required: true
+
+  - type: input
+    id: section
+    attributes:
+      label: Which section
+      description: >-
+        The `record_id` or `section_id` from the dataset, or the beatmap link
+        (`https://osu.ppy.sh/beatmaps/...`) with the time range.
+
+  - type: input
+    id: label
+    attributes:
+      label: Which label
+      description: The concept and the assessment the dataset gives it, as the dataset or the Inspector names them.
+
+  - type: textarea
+    id: reading
+    attributes:
+      label: Your reading
+      description: >-
+        What you would label, and the notes that decide it. osu! editor timestamps help (select
+        the notes in the editor and press Ctrl+C).
+    validations:
+      required: true
+
+  - type: dropdown
+    id: confidence
+    attributes:
+      label: How sure are you?
+      options:
+        - High
+        - Low
+    validations:
+      required: true
+
+  - type: input
+    id: experience
+    attributes:
+      label: Your mapping or playing experience (optional)
+      placeholder: e.g. mapped three ranked 4K sets; play around 5★
+
+  - type: input
+    id: credit
+    attributes:
+      label: How should we credit you?
+      description: An osu! username, your GitHub name, or "anonymous". Blank means your GitHub name.

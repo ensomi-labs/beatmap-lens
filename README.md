@@ -42,6 +42,17 @@ The [selection repair procedure](docs/annotation/evidence-review.md) preserves
 label authority and evidence provenance, and supplements missing selections
 through concurrent agent judgment and note selection.
 
+## Feedback and contributing
+
+Mappers' readings decide what the labels mean. If a label in the dataset or the
+Inspector does not match how you read a section, open a
+[label feedback report](https://github.com/ensomi-labs/beatmap-lens/issues/new?template=label-feedback.yml);
+your reading is kept as your own judgment, credited to you. Ideas, questions
+and offers to annotate go to
+[Discussions](https://github.com/orgs/ensomi-labs/discussions), in English,
+Japanese or Chinese. The [contribution guide](CONTRIBUTING.md) covers bug
+reports and code.
+
 ## Repository map
 
 | Location | Responsibility |
