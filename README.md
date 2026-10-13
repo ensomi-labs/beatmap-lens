@@ -44,14 +44,21 @@ through concurrent agent judgment and note selection.
 
 ## Feedback and contributing
 
-Mappers' readings decide what the labels mean. If a label in the dataset or the
-Inspector does not match how you read a section, open a
-[label feedback report](https://github.com/ensomi-labs/beatmap-lens/issues/new?template=label-feedback.yml);
-your reading is kept as your own judgment, credited to you. Ideas, questions
-and offers to annotate go to
-[Discussions](https://github.com/orgs/ensomi-labs/discussions), in English,
-Japanese or Chinese. The [contribution guide](CONTRIBUTING.md) covers bug
-reports and code.
+Feedback from mappers, players and developers decides what the tools and the
+dataset improve next. Short or general feedback is welcome, in English,
+Japanese or Chinese:
+
+- the Inspector, the renderer, the npm package or the annotation tools:
+  [tooling feedback](https://github.com/ensomi-labs/beatmap-lens/issues/new?template=tooling-feedback.yml),
+  for bugs, rough edges and tools you wish existed;
+- the published dataset:
+  [dataset feedback](https://github.com/ensomi-labs/beatmap-lens/issues/new?template=dataset-feedback.yml),
+  for a label that reads wrong to you, a Foundation concept, or another
+  problem; a reading you give is kept as your own judgment, credited to you;
+- ideas, questions and offers to annotate:
+  [Discussions](https://github.com/orgs/ensomi-labs/discussions).
+
+The [contribution guide](CONTRIBUTING.md) also covers code.
 
 ## Repository map
 

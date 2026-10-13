@@ -1,34 +1,38 @@
 # Contributing
 
 beatmap-lens reads osu!mania charts the way mappers do, and mappers are the
-authority on whether it does. Its dataset and code are open (MIT), so that
-anyone can use what mappers' readings teach and correct it. What mappers and
-players tell us decides what the tools and the dataset improve next and what we
-choose to build. Most contributions need no code, and English, Japanese and
-Chinese are all welcome.
+authority on whether it does. Its dataset, code and
+[research conclusions](docs/README.md#research) are open, so that anyone can
+use what mappers' readings teach and correct it. What mappers, players and
+developers tell us decides what the tools and the dataset improve next and
+what we choose to build. Most contributions need no code; short or general
+feedback is welcome, in English, Japanese or Chinese.
 
 ## Without code
 
-- **A label looks wrong.** When a pattern label in the
+- **Feedback on the tools.** For the Inspector, the chart renderer, the npm
+  package or the annotation tools, whether you map, play or develop: a bug,
+  something that gets in the way, or a tool you wish existed. Open a
+  [tooling feedback report](https://github.com/ensomi-labs/beatmap-lens/issues/new?template=tooling-feedback.yml);
+  for a bug, attach the `.osu` file renamed to `.txt`, because GitHub does not
+  accept `.osu` attachments.
+- **Feedback on the published dataset.** When a pattern label in the
   [dataset](https://huggingface.co/datasets/sed-i/mania-pattern-annotations) or
-  in the Inspector does not match how you read the section, or a Foundation
-  concept reads wrong to you, open a
-  [label feedback report](https://github.com/ensomi-labs/beatmap-lens/issues/new?template=label-feedback.yml).
-  Your reading is kept as your own judgment, credited to you. It never
+  in the Inspector does not match how you read the section, a Foundation
+  concept reads wrong to you, or the dataset has another problem, open a
+  [dataset feedback report](https://github.com/ensomi-labs/beatmap-lens/issues/new?template=dataset-feedback.yml).
+  A reading you give is kept as your own judgment, credited to you. It never
   overwrites an existing human record; where readings differ, both stay visible.
-- **A chart parses or renders wrong.** Open a
-  [bug report](https://github.com/ensomi-labs/beatmap-lens/issues/new?template=bug-report.yml)
-  with the `.osu` file renamed to `.txt`, because GitHub does not accept `.osu`
-  attachments.
 - **You would like to annotate.** Mappers who want to label sections in the
   Inspector are welcome. Say so in
   [Discussions](https://github.com/orgs/ensomi-labs/discussions) and we will
   help you set up.
-- **Ideas and questions** about what beatmap-lens should do go to Discussions,
+- **Ideas and questions** about what ensomi should become go to Discussions,
   where others can add to them and upvote them.
 
-Feedback reports are public, and we publish them as an open dataset under
-CC BY 4.0, credited by the name each reporter gives.
+Reports are public. Dataset feedback is published as an open dataset under
+CC BY 4.0, credited by the name each reporter gives. Never attach audio:
+songs are copyrighted.
 
 ## Code
 

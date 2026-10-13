@@ -1,33 +1,33 @@
-name: Label feedback
-description: A pattern label in the dataset or the Inspector does not match how you read the section, or a Foundation concept reads wrong to you.
-title: "[Label] "
-labels: ["label feedback"]
+name: Dataset feedback
+description: A label in the published dataset or the Inspector reads wrong to you, a Foundation concept needs work, or the dataset has another problem.
+title: "[Dataset] "
+labels: ["dataset feedback"]
 body:
   - type: markdown
     attributes:
       value: |
         The Foundation concepts and the dataset rest on mappers' readings of charts, so yours
-        counts. English, 日本語 and 中文 are all welcome.
+        counts. **Short or general feedback is welcome**; only "What you see" is required.
+        English, 日本語 and 中文 are all welcome.
 
-        Your reading is kept as your own judgment, credited by the name you give below. It never
-        overwrites an existing human record; where readings differ, both stay visible. Reports
-        are public, and we publish them as an open dataset under CC BY 4.0.
+        A reading you give is kept as your own judgment, credited by the name you give below. It
+        never overwrites an existing human record; where readings differ, both stay visible.
+        Reports are public, and we publish them as an open dataset under CC BY 4.0.
 
   - type: dropdown
     id: kind
     attributes:
       label: What is it about?
       options:
-        - One label on one section
-        - A Foundation concept itself, its definition or its examples
+        - A label on one section
+        - A Foundation concept, its definition or its examples
+        - "The dataset itself: a source link, a field, the format, coverage"
         - Something else
-    validations:
-      required: true
 
   - type: input
     id: section
     attributes:
-      label: Which section
+      label: Which section (for a label)
       description: >-
         The `record_id` or `section_id` from the dataset, or the beatmap link
         (`https://osu.ppy.sh/beatmaps/...`) with the time range.
@@ -35,28 +35,27 @@ body:
   - type: input
     id: label
     attributes:
-      label: Which label
+      label: Which label (for a label)
       description: The concept and the assessment the dataset gives it, as the dataset or the Inspector names them.
 
   - type: textarea
     id: reading
     attributes:
-      label: Your reading
+      label: What you see
       description: >-
-        What you would label, and the notes that decide it. osu! editor timestamps help (select
-        the notes in the editor and press Ctrl+C).
+        For a label, what you would label and the notes that decide it; osu! editor timestamps help
+        (select the notes in the editor and press Ctrl+C). For anything else, what is wrong or
+        missing, and where.
     validations:
       required: true
 
   - type: dropdown
     id: confidence
     attributes:
-      label: How sure are you?
+      label: How sure are you? (for a label)
       options:
         - High
         - Low
-    validations:
-      required: true
 
   - type: input
     id: experience

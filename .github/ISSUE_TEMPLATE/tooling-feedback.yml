@@ -1,0 +1,70 @@
+name: Tooling feedback
+description: The Inspector, the renderer, the npm package or the annotation tools, for mappers and developers. Bugs, rough edges and tools you wish existed.
+title: "[Tools] "
+labels: ["tooling feedback"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Something broken, something that gets in the way, or a tool you would like: all of it
+        helps decide what we build next. **Short or general feedback is welcome**; only the first
+        box is required. English, 日本語 and 中文 are all welcome.
+
+  - type: textarea
+    id: feedback
+    attributes:
+      label: What you were doing, and what happened or what you would like
+      description: >-
+        For a bug: the steps, what happened and what you expected. Attach the chart's `.osu` file
+        renamed to `.txt` (GitHub does not accept `.osu`), and a screenshot if the problem is
+        visual.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: kind
+    attributes:
+      label: What kind of feedback? (optional)
+      options:
+        - Something is broken
+        - Something is awkward or missing
+        - A tool or feature I would like
+
+  - type: dropdown
+    id: part
+    attributes:
+      label: Which tool (optional)
+      options:
+        - Inspector
+        - "Renderer: SVG, WebP or GIF"
+        - "npm package: parsing or analysis"
+        - Annotation tools
+        - Something new
+
+  - type: input
+    id: version
+    attributes:
+      label: Version (for a bug)
+      description: The npm version or the commit you ran.
+
+  - type: input
+    id: environment
+    attributes:
+      label: Environment (for a bug)
+      description: Node.js version and operating system; for the Inspector, the browser too.
+
+  - type: dropdown
+    id: perspective
+    attributes:
+      label: You are mostly
+      options:
+        - A mapper
+        - A player
+        - A developer
+        - Several of these
+
+  - type: input
+    id: credit
+    attributes:
+      label: How should we credit you?
+      description: An osu! username, your GitHub name, or "anonymous". Blank means your GitHub name.
