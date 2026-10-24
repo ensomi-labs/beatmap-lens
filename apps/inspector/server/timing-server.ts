@@ -7,11 +7,12 @@
  * Build the page first with `pnpm --filter @ensomi/beatmap-lens-inspector build`, or copy an
  * `apps/inspector/dist` built elsewhere: the bundle is platform independent.
  */
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { createServer } from "node:http";
-import { extname, resolve, sep } from "node:path";
+import { dirname, extname, isAbsolute, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
+import { parseSession } from "../src/timing/format.ts";
 import { fullPath } from "./local-service.ts";
 import { createTimingMiddleware } from "./timing.ts";
 
@@ -39,6 +40,7 @@ export async function startTimingServer(options: {
       `No Inspector build at ${staticRoot}. Run pnpm --filter @ensomi/beatmap-lens-inspector build.`,
     );
   });
+  const summary = options.session ? await checkSession(fullPath(options.session)) : undefined;
   const timing = createTimingMiddleware();
   const page = options.session
     ? `/timing?session=${encodeURIComponent(fullPath(options.session))}`
@@ -84,8 +86,34 @@ export async function startTimingServer(options: {
   const port = typeof address === "object" && address ? address.port : options.port;
   return {
     url: `http://127.0.0.1:${port}${page}`,
+    summary,
     close: () => new Promise<void>((done) => server.close(() => done())),
   };
+}
+
+/**
+ * Reads the session and checks that every PCM file exists with its stated size, so a wrong path
+ * fails here rather than in the browser. Hashes are checked when the page loads each recording.
+ */
+async function checkSession(sessionPath: string): Promise<string> {
+  const folder = dirname(sessionPath);
+  const session = parseSession(await readFile(sessionPath, "utf8"), (path) =>
+    isAbsolute(path) ? path : resolve(folder, path),
+  );
+  const recordings = new Map(
+    session.passages.map((passage) => [passage.audio.path, passage.audio]),
+  );
+  for (const audio of recordings.values()) {
+    const size = await stat(audio.path).then(
+      (info) => info.size,
+      () => undefined,
+    );
+    if (size === undefined) throw new Error(`Missing PCM file: ${audio.path}`);
+    if (size !== audio.frames * audio.channels * 4)
+      throw new Error(`PCM file size does not match its frames and channels: ${audio.path}`);
+  }
+  const rates = [...new Set(session.passages.map((passage) => passage.audio.sample_rate))];
+  return `${session.id}: ${session.passages.length} passages, ${recordings.size} recordings at ${rates.join(" and ")} Hz`;
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
@@ -107,7 +135,11 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     ...(values.session ? { session: values.session } : {}),
     ...(values.port ? { port: Number(values.port) } : {}),
     ...(values.static ? { staticRoot: values.static } : {}),
+  }).catch((error: Error) => {
+    process.stderr.write(`${error.message}\n`);
+    process.exit(1);
   });
+  if (service.summary) process.stdout.write(`${service.summary}\n`);
   process.stdout.write(`Timing mode: ${service.url}\n`);
   for (const signal of ["SIGINT", "SIGTERM"] as const)
     process.once(signal, () => service.close().then(() => process.exit(0)));
