@@ -119,10 +119,12 @@ The moving playhead follows the audio output clock and the playhead offset,
 which corrects delay the browser cannot see. It shows which beat is sounding to
 about one display frame; place and check marks on the still waveform. After an
 output device or rate change, choose **Reopen audio after a device change** (or
-the current passage again) and check the offset. The stage header warns when the
+the current passage again) and check the offset. The offset can be typed while
+the audio plays; <kbd>Enter</kbd>, <kbd>Tab</kbd> or leaving the field applies
+it, and −1/+1 step it (<kbd>Shift</kbd>: 10 ms). The stage header warns when the
 stated output device rate differs from the recording's, when the recording rate
 changes from the previous passage, and when the stated rate changed since the
-audio opened.
+audio opened. Save and reveal errors appear there too.
 
 ## Code map
 

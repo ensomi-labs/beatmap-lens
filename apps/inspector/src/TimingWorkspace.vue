@@ -2,6 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, shallowRef, triggerRef, watch } from "vue";
 import AudioVolumeControl from "./AudioVolumeControl.vue";
 import { isNativeActivationTarget, isTypingTarget } from "./annotation/keyboard-targets";
+import DraftNumberInput from "./DraftNumberInput.vue";
 import TimingStage, { type StageProposal } from "./TimingStage.vue";
 import { TimingAudioEngine } from "./timing/audio-engine";
 import { timingJson, timingRequest } from "./timing/client";
@@ -111,6 +112,8 @@ const silenceMs = ref<number>();
 let openedPath = "";
 /** The marks file and session id the drafts belong to; reopening the same session keeps them. */
 let draftsOwner = "";
+/** A passage asked for by key while another was loading; visited once that load finishes. */
+let queuedPassage: number | undefined;
 
 // Playback
 const audioState = ref<"none" | "loading" | "ready">("none");
@@ -449,6 +452,15 @@ async function select(index: number) {
   } finally {
     busy.value = false;
   }
+  // A timer, so that an open() waiting on this load has finished too.
+  setTimeout(visitQueuedPassage);
+}
+
+function visitQueuedPassage() {
+  const queued = queuedPassage;
+  queuedPassage = undefined;
+  if (queued === undefined || disposed || busy.value || !blind.value) return;
+  if (queued !== passageIndex.value) void select(queued);
 }
 
 /**
@@ -937,8 +949,24 @@ function releasePressed(event: Event) {
   if (control instanceof HTMLElement) control.blur();
 }
 
+/** Shift+[ and Shift+] move between passages, by key position so other layouts work too. */
+function passageStep(event: KeyboardEvent): number {
+  if (!event.shiftKey || event.metaKey || event.ctrlKey) return 0;
+  if (event.code === "BracketLeft") return -1;
+  return event.code === "BracketRight" ? 1 : 0;
+}
+
 function handleKeydown(event: KeyboardEvent) {
-  if (!blind.value || event.defaultPrevented || event.altKey) return;
+  if (event.defaultPrevented || event.altKey) return;
+  if (!blind.value) {
+    // While a passage loads, passage keys are kept for when it has loaded.
+    const step = passageStep(event);
+    const count = opened.value?.passages.length ?? 0;
+    if (!step || !busy.value || !count || isTypingTarget(event.target)) return;
+    event.preventDefault();
+    queuedPassage = Math.min(count - 1, Math.max(0, (queuedPassage ?? passageIndex.value) + step));
+    return;
+  }
   const key = event.key;
   // Save works from any field, including the setup line, instead of the browser's page save.
   if ((event.metaKey || event.ctrlKey) && key.toLowerCase() === "s") {
@@ -962,10 +990,10 @@ function handleKeydown(event: KeyboardEvent) {
     else togglePlayback();
     return;
   }
-  // Shift+[ and Shift+] move between passages, by key position so other layouts work too.
-  if (event.shiftKey && (event.code === "BracketLeft" || event.code === "BracketRight")) {
+  const step = passageStep(event);
+  if (step) {
     event.preventDefault();
-    const next = passageIndex.value + (event.code === "BracketLeft" ? -1 : 1);
+    const next = passageIndex.value + step;
     if (next >= 0 && next < (opened.value?.passages.length ?? 0)) void select(next);
     return;
   }
@@ -1218,6 +1246,10 @@ function handleKeydown(event: KeyboardEvent) {
               <span class="health-dot" aria-hidden="true"></span>
               {{ rateWarning }}
             </p>
+            <p v-if="error && blind" class="timing-hud-error" role="alert">
+              <span class="health-dot" aria-hidden="true"></span>
+              {{ error }}
+            </p>
           </header>
           <TimingStage
             v-if="blind && audioBuffer && passage"
@@ -1376,13 +1408,13 @@ function handleKeydown(event: KeyboardEvent) {
                 >
                   −1
                 </button>
-                <label>
+                <label for="timing-offset">
                   <span class="sr-only">Playhead offset in milliseconds</span>
-                  <input
-                    type="number"
+                  <DraftNumberInput
+                    id="timing-offset"
                     step="1"
-                    :value="preferences.playheadOffsetMs"
-                    @change="setPlayheadOffset(($event.target as HTMLInputElement).valueAsNumber)"
+                    :model-value="preferences.playheadOffsetMs"
+                    @update:model-value="setPlayheadOffset"
                   />
                   <small>ms</small>
                 </label>
@@ -1415,14 +1447,14 @@ function handleKeydown(event: KeyboardEvent) {
             </button>
 
             <div class="timing-field-pair">
-              <label class="field-stack timing-inline-field">
+              <label class="field-stack timing-inline-field" for="timing-preroll">
                 <span>Pre-roll ms (≥ {{ minimumPrerollMs }})</span>
-                <input
-                  type="number"
+                <DraftNumberInput
+                  id="timing-preroll"
                   :min="minimumPrerollMs"
                   step="10"
-                  :value="preferences.prerollMs"
-                  @change="setPreroll(($event.target as HTMLInputElement).valueAsNumber)"
+                  :model-value="preferences.prerollMs"
+                  @update:model-value="setPreroll"
                 />
               </label>
               <label class="field-stack timing-inline-field">
@@ -1628,9 +1660,6 @@ function handleKeydown(event: KeyboardEvent) {
             >
               {{ revealed ? "Names revealed" : "Reveal names" }}
             </button>
-            <p v-if="error && blind" class="inline-message inline-message--error" role="alert">
-              {{ error }}
-            </p>
             <p v-if="notice" class="inline-message" role="status">{{ notice }}</p>
             <p class="setup-note timing-output">
               Marks append to <span>{{ opened.marks_path }}</span>
@@ -1673,19 +1702,31 @@ function handleKeydown(event: KeyboardEvent) {
   font-weight: 620;
 }
 
-.timing-hud-warning {
+.timing-hud-warning,
+.timing-hud-error {
   display: flex;
   align-items: center;
   gap: 7px;
   margin: 0;
-  color: oklch(82% 0.14 76);
   font-size: 0.62rem;
   font-weight: 600;
   text-wrap: pretty;
 }
 
+.timing-hud-warning {
+  color: oklch(82% 0.14 76);
+}
+
 .timing-hud-warning .health-dot {
   background: var(--warning);
+}
+
+.timing-hud-error {
+  color: oklch(92% 0.01 255);
+}
+
+.timing-hud-error .health-dot {
+  background: var(--danger);
 }
 
 .timing-hud .health-status {

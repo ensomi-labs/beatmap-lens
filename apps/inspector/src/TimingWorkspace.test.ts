@@ -6,7 +6,12 @@ import { timingJson, timingRequest } from "./timing/client";
 import { type BlindPassageRow, type OpenTiming, staleSessionError } from "./timing/contracts";
 
 vi.mock("./timing/client", () => ({ timingJson: vi.fn(), timingRequest: vi.fn() }));
-const engine = vi.hoisted(() => ({ plays: 0, loudness: [] as number[] }));
+const engine = vi.hoisted(() => ({
+  plays: 0,
+  loudness: [] as number[],
+  positionMs: undefined as number | undefined,
+  offsets: [] as number[],
+}));
 vi.mock("./timing/audio-engine", () => ({
   TimingAudioEngine: class {
     readonly sampleRate: number;
@@ -32,8 +37,9 @@ vi.mock("./timing/audio-engine", () => ({
       this.playing = false;
       return undefined;
     }
-    position() {
-      return undefined;
+    position(offsetMs: number) {
+      engine.offsets.push(offsetMs);
+      return engine.positionMs;
     }
     setVolume() {}
     setLoudnessDb(db: number) {
@@ -97,7 +103,7 @@ beforeEach(() => {
     rates: [44_100, 44_100],
     saves: [],
   });
-  Object.assign(engine, { plays: 0, loudness: [] });
+  Object.assign(engine, { plays: 0, loudness: [], positionMs: undefined, offsets: [] });
   localStorage.setItem(
     "lens-timing-preferences",
     JSON.stringify({ setup: "DT 270 PRO · 44.1 kHz device", deviceRateHz: 44_100 }),
@@ -221,6 +227,8 @@ it("does not retry a save when the restarted service changed the legend the list
   server.colours = [6, 1];
   key("Enter");
   await vi.waitFor(() => expect(container.textContent).toContain("new proposal colours"));
+  // The explanation is in the stage header, which is always in view, not below the fold of the rail.
+  expect(hud()).toContain("gave this passage new proposal colours. Check them, then save again.");
   expect(server.saves).toHaveLength(0);
   key("Enter");
   await vi.waitFor(() => expect(status()).toBe("Saved"));
@@ -340,4 +348,75 @@ it("lists mark times to 0.001 ms with the sample index, so a one-sample nudge sh
   await nextTick();
   expect(row()).toContain("00:00.100273");
   expect(row()).toContain("n 4422");
+});
+
+it("keeps digits typed into the offset and pre-roll fields while playback redraws every frame", async () => {
+  await opened();
+  const frames: FrameRequestCallback[] = [];
+  vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => frames.push(callback));
+  key(" ");
+  await vi.waitFor(() => expect(frames).toHaveLength(1));
+  const redraw = async (positionMs: number) => {
+    engine.positionMs = positionMs;
+    frames.shift()?.(0);
+    await nextTick();
+    expect(hud()).toContain(`00:00.${positionMs}`);
+  };
+
+  const fields = container.querySelectorAll<HTMLInputElement>(
+    ".timing-details input[type='number']",
+  );
+  const [offset, preroll] = fields;
+  if (!offset || !preroll) throw new Error("No number fields");
+  offset.focus();
+  for (const [index, text] of ["1", "10", "100"].entries()) {
+    offset.value = text;
+    offset.dispatchEvent(new Event("input", { bubbles: true }));
+    await redraw(200 + index * 100);
+    expect(offset.value).toBe(text);
+  }
+  // Tab: the field commits on change, then blurs.
+  offset.dispatchEvent(new Event("change", { bubbles: true }));
+  offset.blur();
+  await redraw(500);
+  expect(offset.value).toBe("100");
+  expect(engine.offsets.at(-1)).toBe(100);
+  expect(JSON.parse(localStorage.getItem("lens-timing-preferences") ?? "{}")).toMatchObject({
+    playheadOffsetMs: 100,
+  });
+
+  // Enter commits and keeps focus; a pre-roll under the minimum shows the minimum.
+  preroll.focus();
+  preroll.value = "50";
+  preroll.dispatchEvent(new Event("input", { bubbles: true }));
+  await redraw(600);
+  expect(preroll.value).toBe("50");
+  preroll.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await redraw(700);
+  expect(preroll.value).toBe("120");
+  expect(document.activeElement).toBe(preroll);
+  expect(engine.plays).toBe(1);
+
+  // The buttons still step the stored value.
+  button("+1").click();
+  await nextTick();
+  expect(offset.value).toBe("101");
+});
+
+it("visits a passage asked for by key while another passage is loading", async () => {
+  await opened();
+  expect(hud()).toContain("Passage 02 of 2");
+  const passageKey = (code: string) =>
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: code, code, shiftKey: true }));
+  passageKey("BracketLeft");
+  await nextTick();
+  expect(hud()).toContain("Passage 01 of 2");
+  passageKey("BracketRight");
+  await vi.waitFor(() => expect(hud()).toContain("Passage 02 of 2"));
+  await opened();
+  const visited = vi
+    .mocked(timingJson)
+    .mock.calls.filter(([operation]) => operation === "passage")
+    .map(([, body]) => (body as { passage_index: number }).passage_index);
+  expect(visited).toEqual([1, 0, 1]);
 });
