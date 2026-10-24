@@ -165,13 +165,18 @@ it("keeps an unsaved passage's legend when the session is opened again", async (
   ).toEqual(shown.proposals);
 });
 
-it("refuses marks outside the passage", async () => {
+it("refuses marks outside the passage and marks whose time is not a number", async () => {
   const f = await fixture();
   const opened: OpenTiming = await f.post("open", { session_path: f.sessionPath });
   const target = { session_id: opened.session_id, passage_index: 0 };
   await expect(f.post("save", saveBody(target, [mark("m", "beat", 69_999)]))).rejects.toThrow(
     "inside",
   );
+  const coerced = { ...mark("m", "beat", 0), time_ms: "72000.5" } as unknown as Mark;
+  await expect(f.post("save", saveBody(target, [coerced]))).rejects.toThrow("finite numbers");
+  await expect(
+    f.post("save", saveBody(target, [{ ...mark("", "beat", 72_000.5) }])),
+  ).rejects.toThrow("id");
 });
 
 it("names an unknown session id so the page can reopen the session and retry", async () => {

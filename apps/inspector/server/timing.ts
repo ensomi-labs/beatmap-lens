@@ -260,7 +260,11 @@ async function save(
   if (!body.setup?.trim()) throw new Error("Describe the playback setup before saving.");
   const { start_ms, end_ms } = state.passage;
   for (const mark of body.marks) {
+    if (typeof mark.id !== "string" || !mark.id) throw new Error("Each mark needs an id.");
     if (mark.kind !== "beat" && mark.kind !== "unbeat") throw new Error("Unknown mark kind.");
+    // A string time would pass the range check by coercion and be written as a string.
+    if (typeof mark.time_ms !== "number" || !Number.isFinite(mark.time_ms))
+      throw new Error("Mark times must be finite numbers.");
     if (!(mark.time_ms >= start_ms && mark.time_ms <= end_ms))
       throw new Error("Marks must lie inside the passage.");
   }
