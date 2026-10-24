@@ -61,7 +61,7 @@ const server = vi.hoisted(() => ({
   saves: [] as Record<string, unknown>[],
 }));
 
-function row(id: string, saved: boolean, sample_rate: number): BlindPassageRow {
+function row(id: string, saved: boolean, sample_rate: number, loudness = -6): BlindPassageRow {
   return {
     id,
     title: id,
@@ -71,7 +71,7 @@ function row(id: string, saved: boolean, sample_rate: number): BlindPassageRow {
     context_after_ms: 2000,
     hint: "",
     flags: [],
-    loudness_gain_db: -6,
+    loudness_gain_db: loudness,
     audio: {
       handle: `a${sample_rate}`,
       format: "f32le-interleaved",
@@ -113,8 +113,8 @@ beforeEach(() => {
         clock: "osu",
         marks_path: "/s/session-01.timing.marks.jsonl",
         passages: [
-          row("passage-01", true, server.rates[0] as number),
-          row("passage-02", false, server.rates[1] as number),
+          row("passage-01", true, server.rates[0] as number, -4.2),
+          row("passage-02", false, server.rates[1] as number, -12.9),
         ],
       };
       return opened;
@@ -311,4 +311,17 @@ it("warns in the HUD when the device rate differs from the recording or the reco
   await vi.waitFor(() => expect(hud()).toContain("The recording rate changed to 44,100 Hz"));
   button("Reopen audio after a device change").click();
   await vi.waitFor(() => expect(container.querySelector(".timing-hud-warning")).toBeNull());
+});
+
+it("applies each passage's loudness gain when consecutive passages share a recording", async () => {
+  await opened();
+  const toggle = container.querySelector<HTMLInputElement>(".timing-check input");
+  if (!toggle) throw new Error("No loudness toggle");
+  toggle.click();
+  await vi.waitFor(() => expect(engine.loudness.at(-1)).toBe(-12.9));
+  window.dispatchEvent(
+    new KeyboardEvent("keydown", { key: "{", code: "BracketLeft", shiftKey: true }),
+  );
+  await vi.waitFor(() => expect(hud()).toContain("Passage 01 of 2"));
+  await vi.waitFor(() => expect(engine.loudness.at(-1)).toBe(-4.2));
 });

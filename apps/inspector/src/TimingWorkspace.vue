@@ -256,6 +256,9 @@ watch(playheadMs, (timeMs) => {
     setView(placeAt(view.value, timeMs, stageWidth.value, 0.15));
 });
 
+// The gain is per passage, and consecutive passages can share a loaded recording.
+watch(loudnessAppliedDb, (db) => engine?.setLoudnessDb(db));
+
 function isDirty(entry: Draft): boolean {
   return differsFrom(entry.state, entry.saved);
 }
@@ -680,7 +683,6 @@ function setVolume(value: number) {
 
 function setLoudnessMatch(value: boolean) {
   loudnessMatch.value = value;
-  engine?.setLoudnessDb(loudnessAppliedDb.value);
 }
 
 function setPlayheadOffset(value: number) {
