@@ -236,8 +236,20 @@ async function blindPassage(session: Session, state: PassageState): Promise<Blin
           marks: state.save.marks.map(markFromRecord),
         }
       : null,
-    ...(state.revealed ? { names: await names(session, state) } : {}),
+    ...(state.revealed ? await revealedView(session, state) : {}),
   };
+}
+
+/** An unreadable key file leaves a revealed passage openable, with the reason instead of names. */
+async function revealedView(
+  session: Session,
+  state: PassageState,
+): Promise<Pick<BlindPassage, "names" | "names_error">> {
+  try {
+    return { names: await names(session, state) };
+  } catch (error) {
+    return { names_error: (error as Error).message };
+  }
 }
 
 async function save(
@@ -281,6 +293,8 @@ async function reveal(
 ): Promise<{ names: RevealedName[] }> {
   if (!state.save) throw new Error("Save this passage's marks before revealing names.");
   if (state.save.id !== saveId) throw new Error("Save the current marks before revealing names.");
+  // Read before recording the reveal, so a missing key file records nothing and can be retried.
+  const revealed = await names(session, state);
   if (!state.revealed) {
     await append(
       session,
@@ -296,16 +310,23 @@ async function reveal(
     );
     state.revealed = true;
   }
-  return { names: await names(session, state) };
+  return { names: revealed };
 }
 
 async function names(session: Session, state: PassageState): Promise<RevealedName[]> {
-  return revealedNames(
-    await readFile(session.session.revealKeyPath, "utf8"),
-    session.session.id,
-    state.passage.id,
-    state.legend.map((entry) => entry.key),
-  );
+  try {
+    return revealedNames(
+      await readFile(session.session.revealKeyPath, "utf8"),
+      session.session.id,
+      state.passage.id,
+      state.legend.map((entry) => entry.key),
+    );
+  } catch (error) {
+    // A parse error can quote the file, which holds every passage's names, so the reason stays in
+    // the service's terminal.
+    console.warn(`Timing: ${session.session.revealKeyPath}: ${(error as Error).message}`);
+    throw new Error("The identity key file could not be read; the service's terminal shows why.");
+  }
 }
 
 function append(session: Session, line: string) {

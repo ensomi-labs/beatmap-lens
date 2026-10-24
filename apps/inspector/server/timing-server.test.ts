@@ -11,12 +11,13 @@ afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 });
 
-async function fixture(frames: number) {
+async function fixture(frames: number, { key = true } = {}) {
   const root = await realpath(await mkdtemp(join(tmpdir(), "lens-timing-server-")));
   cleanups.push(() => rm(root, { recursive: true, force: true }));
   await mkdir(join(root, "dist", "assets"), { recursive: true });
   await writeFile(join(root, "dist", "index.html"), "<!doctype html><title>Inspector</title>");
   await writeFile(join(root, "dist", "assets", "app.js"), "export {};");
+  if (key) await writeFile(join(root, "keys.json"), '{"version":1,"session_id":"s","passages":{}}');
   const pcm = new Uint8Array(new Float32Array(16).buffer);
   await writeFile(join(root, "audio.f32"), pcm);
   const session = {
@@ -106,4 +107,11 @@ it("refuses to start when a PCM file's size disagrees with the session", async (
   await expect(
     startTimingServer({ session: sessionPath, port: 0, staticRoot: join(root, "dist") }),
   ).rejects.toThrow("size");
+});
+
+it("refuses to start when the identity key file is missing", async () => {
+  const { root, sessionPath } = await fixture(8, { key: false });
+  await expect(
+    startTimingServer({ session: sessionPath, port: 0, staticRoot: join(root, "dist") }),
+  ).rejects.toThrow(`Missing identity key file: ${join(root, "keys.json")}`);
 });

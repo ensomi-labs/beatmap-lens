@@ -1453,6 +1453,9 @@ function handleKeydown(event: KeyboardEvent) {
               </li>
               <li v-if="!stageProposals.length" class="setup-note">No proposals for this passage.</li>
             </ul>
+            <p v-if="blind?.names_error" class="setup-note timing-warning">
+              Names unavailable: {{ blind.names_error }}
+            </p>
             <button
               v-if="stageProposals.length"
               class="button button--quiet timing-wide"

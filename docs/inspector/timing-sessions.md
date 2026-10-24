@@ -68,6 +68,9 @@ are relative to the session file unless absolute; `~` is not expanded.
 
 Read by the service only for a passage whose current marks are saved, on an
 explicit reveal, or for a passage already revealed. It is never served whole.
+The plain-Node server checks at startup that it exists, without reading it. If
+it cannot be read later, a reveal fails without being recorded, and a passage
+already revealed still opens with its names shown as unavailable.
 
 ```json
 { "version": 1, "session_id": "session-01",

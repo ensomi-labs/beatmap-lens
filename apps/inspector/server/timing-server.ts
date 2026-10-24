@@ -108,14 +108,20 @@ export async function startTimingServer(options: {
 }
 
 /**
- * Reads the session and checks that every PCM file exists with its stated size, so a wrong path
- * fails here rather than in the browser. Hashes are checked when the page loads each recording.
+ * Reads the session and checks that the identity key file exists and every PCM file exists with
+ * its stated size, so a wrong path fails here rather than in the browser or at the first reveal.
+ * The key file is only stat'ed, never read. Hashes are checked when the page loads each recording.
  */
 async function checkSession(sessionPath: string): Promise<string> {
   const folder = dirname(sessionPath);
   const session = parseSession(await readFile(sessionPath, "utf8"), (path) =>
     isAbsolute(path) ? path : resolve(folder, path),
   );
+  const keyFile = await stat(session.revealKeyPath).then(
+    (info) => info.isFile(),
+    () => false,
+  );
+  if (!keyFile) throw new Error(`Missing identity key file: ${session.revealKeyPath}`);
   const recordings = new Map(
     session.passages.map((passage) => [passage.audio.path, passage.audio]),
   );

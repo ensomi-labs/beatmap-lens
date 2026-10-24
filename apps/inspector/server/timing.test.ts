@@ -1,9 +1,9 @@
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import {
   type BlindPassage,
   type Mark,
@@ -127,6 +127,29 @@ it("saves anonymous keys and derived samples, and reveals only after a current s
     ["m2", 72_700.25],
   ]);
   expect(again.names).toEqual(revealed.names);
+});
+
+it("opens a revealed passage without names when the key file is gone, and records no failed reveal", async () => {
+  const f = await fixture();
+  const opened: OpenTiming = await f.post("open", { session_path: f.sessionPath });
+  const target = { session_id: opened.session_id, passage_index: 0 };
+  const saved = await f.post("save", saveBody(target, [mark("m1", "beat", 72_468.9342)]));
+  const keyPath = join(f.root, "private", "session-01.identities.json");
+  await rename(keyPath, `${keyPath}.away`);
+  vi.spyOn(console, "warn").mockImplementation(() => {});
+  await expect(f.post("reveal", { ...target, save_id: saved.save_id })).rejects.toThrow(
+    "identity key file could not be read",
+  );
+  expect((await readFile(opened.marks_path, "utf8")).trim().split("\n")).toHaveLength(1);
+
+  await rename(`${keyPath}.away`, keyPath);
+  await f.post("reveal", { ...target, save_id: saved.save_id });
+  await rm(keyPath);
+  const passage: BlindPassage = await f.post("passage", target);
+  expect(passage.saved?.marks).toHaveLength(1);
+  expect(passage.names).toBeUndefined();
+  expect(passage.names_error).toContain("identity key file could not be read");
+  expect(JSON.stringify(passage)).not.toContain("private");
 });
 
 it("keeps an unsaved passage's legend when the session is opened again", async () => {

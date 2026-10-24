@@ -90,6 +90,8 @@ export interface BlindPassage {
   saved: SavedSnapshot | null;
   /** Present only after a guarded reveal of this passage. */
   names?: RevealedName[];
+  /** Why a revealed passage's names could not be read, such as a missing key file. */
+  names_error?: string;
 }
 
 export interface PassageTarget {
