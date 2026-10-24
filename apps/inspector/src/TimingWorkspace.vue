@@ -92,7 +92,8 @@ const preferences = ref<TimingPreferences>({
 const sessionPath = ref(
   new URLSearchParams(window.location.search).get("session") ?? remembered(rememberedSession) ?? "",
 );
-const opened = shallowRef<OpenTiming>();
+/** Deep, so marking a row saved or revealed updates everything that reads it. */
+const opened = ref<OpenTiming>();
 const blind = shallowRef<BlindPassage>();
 const names = shallowRef<RevealedName[]>();
 const passageIndex = ref(0);
@@ -218,7 +219,10 @@ onBeforeUnmount(() => {
 watch(playheadMs, (timeMs) => {
   if (!playing.value || !follow.value || !stageWidth.value) return;
   const x = msToX(view.value, timeMs);
-  if (x < 0 || x > stageWidth.value) setView(placeAt(view.value, timeMs, stageWidth.value, 0.15));
+  // The pre-roll may start just left of the view; that alone does not move it.
+  const prerollPx = preferences.value.prerollMs / view.value.msPerPx;
+  if (x < -prerollPx - 1 || x > stageWidth.value)
+    setView(placeAt(view.value, timeMs, stageWidth.value, 0.15));
 });
 
 function isDirty(entry: Draft): boolean {
@@ -717,7 +721,6 @@ async function save() {
     if (latest) drafts.value.set(row.id, { ...latest, saved: snapshot, saveId: response.save_id });
     triggerRef(drafts);
     row.saved = true;
-    triggerRef(opened);
   } catch (cause) {
     report(cause);
   } finally {
@@ -739,7 +742,6 @@ async function revealNames() {
     if (disposed) return;
     names.value = result.names;
     row.revealed = true;
-    triggerRef(opened);
   } catch (cause) {
     report(cause);
   }

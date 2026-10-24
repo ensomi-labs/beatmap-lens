@@ -128,6 +128,19 @@ it("saves anonymous keys and derived samples, and reveals only after a current s
   expect(again.names).toEqual(revealed.names);
 });
 
+it("keeps an unsaved passage's legend when the session is opened again", async () => {
+  const f = await fixture();
+  const first: OpenTiming = await f.post("open", { session_path: f.sessionPath });
+  const shown: BlindPassage = await f.post("passage", {
+    session_id: first.session_id,
+    passage_index: 0,
+  });
+  const again: OpenTiming = await f.post("open", { session_path: f.sessionPath });
+  expect(
+    (await f.post("passage", { session_id: again.session_id, passage_index: 0 })).proposals,
+  ).toEqual(shown.proposals);
+});
+
 it("refuses marks outside the passage", async () => {
   const f = await fixture();
   const opened: OpenTiming = await f.post("open", { session_path: f.sessionPath });

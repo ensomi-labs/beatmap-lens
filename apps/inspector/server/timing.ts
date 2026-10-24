@@ -43,7 +43,6 @@ interface Session {
   passages: PassageState[];
   /** Opaque handle to audio input; the page never sees a path. */
   audio: Map<string, AudioInputV1>;
-  verified: Map<string, Promise<Buffer>>;
 }
 
 interface PassageState {
@@ -59,8 +58,12 @@ export const timingPlugin = () => localServicePlugin("inspector-timing", prefix,
 
 export const createTimingMiddleware = () => localService(prefix, timingHandler());
 
+/** Legend per session file and passage, so reopening (a page reload) keeps colours and order. */
+type Legends = Map<string, { key: string; colour_index: number }[]>;
+
 export function timingHandler() {
   const sessions = new Map<string, Session>();
+  const legends: Legends = new Map();
   return async (request: IncomingMessage, response: ServerResponse, url: URL) => {
     assertLocalRequest(request, url);
     if (request.method !== "POST") throw new Error("Use POST for timing operations.");
@@ -68,7 +71,7 @@ export function timingHandler() {
     const operation = url.pathname.slice(prefix.length + 1);
     if (operation === "open") {
       const id = randomUUID();
-      const session = await openSession(body.session_path);
+      const session = await openSession(body.session_path, legends);
       sessions.set(id, session);
       sendJson(response, describe(id, session));
       return;
@@ -90,7 +93,7 @@ export function timingHandler() {
   };
 }
 
-async function openSession(input: string): Promise<Session> {
+async function openSession(input: string, legends: Legends): Promise<Session> {
   const sessionPath = await realpath(fullPath(input));
   const folder = dirname(sessionPath);
   // Paths inside the session are relative to it unless absolute; `~` is not expanded.
@@ -116,25 +119,38 @@ async function openSession(input: string): Promise<Session> {
       audio.set(handle, passage.audio);
     }
     const save = saves.get(passage.id);
+    const legendKey = JSON.stringify([sessionPath, passage.id]);
+    const legend = legendFor(
+      passage.proposals.map((proposal) => proposal.key),
+      save,
+      legends.get(legendKey),
+    );
+    legends.set(legendKey, legend);
     return {
       passage,
       audioHandle: handle,
-      legend: legendFor(
-        passage.proposals.map((proposal) => proposal.key),
-        save,
-      ),
+      legend,
       ...(save ? { save } : {}),
       revealed: reveals.has(passage.id),
     };
   });
-  return { session, marksPath, passages, audio, verified: new Map() };
+  return { session, marksPath, passages, audio };
 }
 
-/** A saved passage keeps the legend it was saved with; other keys are shuffled with fresh colours. */
-function legendFor(keys: string[], save: SaveEventV1 | undefined) {
-  const legend = (save?.proposals_shown ?? [])
-    .filter((shown) => keys.includes(shown.key))
-    .sort((a, b) => a.legend_index - b.legend_index)
+/**
+ * A saved passage keeps the legend it was saved with, an unsaved one the legend this service
+ * already showed; other keys are shuffled in with unused colours.
+ */
+function legendFor(
+  keys: string[],
+  save: SaveEventV1 | undefined,
+  shown: { key: string; colour_index: number }[] | undefined,
+) {
+  const kept = save
+    ? [...save.proposals_shown].sort((a, b) => a.legend_index - b.legend_index)
+    : (shown ?? []);
+  const legend = kept
+    .filter((entry) => keys.includes(entry.key))
     .map(({ key, colour_index }) => ({ key, colour_index }));
   const used = new Set(legend.map((entry) => entry.colour_index));
   const colours = shuffle(
@@ -185,24 +201,19 @@ function describe(sessionId: string, { session, marksPath, passages }: Session):
   };
 }
 
-/** The PCM payload, checked once against its stated size and hash before the page receives it. */
-function verifiedAudio(session: Session, handle: string): Promise<Buffer> {
+/**
+ * The PCM payload, checked against its stated size and hash on every request before the page
+ * receives it. Nothing is cached: a session can name many recordings of 50–100 MB each.
+ */
+async function verifiedAudio(session: Session, handle: string): Promise<Buffer> {
   const audio = session.audio.get(handle);
   if (!audio) throw new Error("Unknown audio handle.");
-  let pending = session.verified.get(handle);
-  if (!pending) {
-    pending = readFile(audio.path).then((bytes) => {
-      if (bytes.length !== audio.frames * audio.channels * 4)
-        throw new Error("The PCM payload's size does not match its frames and channels.");
-      if (createHash("sha256").update(bytes).digest("hex") !== audio.pcm_sha256)
-        throw new Error("The PCM payload's SHA-256 does not match the session.");
-      return bytes;
-    });
-    // A failed check is retried on the next request instead of being cached.
-    pending.catch(() => session.verified.delete(handle));
-    session.verified.set(handle, pending);
-  }
-  return pending;
+  const bytes = await readFile(audio.path);
+  if (bytes.length !== audio.frames * audio.channels * 4)
+    throw new Error("The PCM payload's size does not match its frames and channels.");
+  if (createHash("sha256").update(bytes).digest("hex") !== audio.pcm_sha256)
+    throw new Error("The PCM payload's SHA-256 does not match the session.");
+  return bytes;
 }
 
 async function blindPassage(session: Session, state: PassageState): Promise<BlindPassage> {
