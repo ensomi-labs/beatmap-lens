@@ -3,9 +3,10 @@ import vue from "@vitejs/plugin-vue";
 import { defineConfig } from "vite";
 import { comparisonsPlugin } from "./server/comparisons.ts";
 import { localFilesPlugin } from "./server/local-files.ts";
+import { timingPlugin } from "./server/timing.ts";
 
 export default defineConfig({
-  plugins: [vue(), localFilesPlugin(), comparisonsPlugin()],
+  plugins: [vue(), localFilesPlugin(), comparisonsPlugin(), timingPlugin()],
   resolve: {
     alias: {
       "beatmap-lens": fileURLToPath(
