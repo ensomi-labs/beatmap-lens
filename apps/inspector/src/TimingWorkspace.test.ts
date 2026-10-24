@@ -213,3 +213,43 @@ it("brings unsaved marks back when the same session is opened again", async () =
   expect(hud()).toContain("Passage 02 of 2");
   expect(status()).toBe("Unsaved · 1 marks");
 });
+
+it("gives the keyboard back to the shortcuts after a rail control is used with the mouse", async () => {
+  await opened();
+  const plus = button("+1");
+  plus.focus();
+  plus.dispatchEvent(new Event("pointerdown", { bubbles: true }));
+  plus.click();
+  expect(document.activeElement).not.toBe(plus);
+  key(" ");
+  await vi.waitFor(() => expect(engine.plays).toBe(1));
+  expect(container.querySelector<HTMLInputElement>(".timing-offset-editor input")?.value).toBe("1");
+
+  // From the keyboard the control keeps focus and Space stays with it.
+  const follow = button("On");
+  follow.focus();
+  follow.click();
+  expect(document.activeElement).toBe(follow);
+  key(" ");
+  await nextTick();
+  expect(engine.plays).toBe(1);
+
+  for (const selector of ["input[type='range']", "select"]) {
+    const control = container.querySelector<HTMLElement>(`.timing-details ${selector}`);
+    if (!control) throw new Error(`No ${selector}`);
+    control.focus();
+    control.dispatchEvent(new Event("pointerdown", { bubbles: true }));
+    control.dispatchEvent(new Event("change", { bubbles: true }));
+    expect(document.activeElement).not.toBe(control);
+  }
+  key("b");
+  await nextTick();
+  expect(status()).toBe("Unsaved · 1 marks");
+
+  // Typing in a field never reaches the shortcuts.
+  const setup = container.querySelector<HTMLInputElement>("#timing-setup");
+  setup?.focus();
+  key("n", setup ?? undefined);
+  await nextTick();
+  expect(status()).toBe("Unsaved · 1 marks");
+});

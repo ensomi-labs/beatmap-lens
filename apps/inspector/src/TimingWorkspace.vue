@@ -207,6 +207,9 @@ const offsetNeedsCheck = computed(
 
 onMounted(() => {
   window.addEventListener("keydown", handleKeydown);
+  window.addEventListener("pointerdown", notePress, true);
+  window.addEventListener("click", releasePressed);
+  window.addEventListener("change", releasePressed);
   window.addEventListener("beforeunload", guardUnload);
   navigator.mediaDevices?.addEventListener?.("devicechange", markDeviceChanged);
   if (new URLSearchParams(window.location.search).get("session")) void open();
@@ -214,6 +217,9 @@ onMounted(() => {
 onBeforeUnmount(() => {
   disposed = true;
   window.removeEventListener("keydown", handleKeydown);
+  window.removeEventListener("pointerdown", notePress, true);
+  window.removeEventListener("click", releasePressed);
+  window.removeEventListener("change", releasePressed);
   window.removeEventListener("beforeunload", guardUnload);
   navigator.mediaDevices?.removeEventListener?.("devicechange", markDeviceChanged);
   cancelAnimationFrame(frame);
@@ -860,6 +866,33 @@ async function revealNames() {
 }
 
 // Keyboard
+/** The control the pointer last pressed; it gives the keyboard back once the mouse has used it. */
+let pressedControl: Element | null = null;
+
+function notePress(event: Event) {
+  pressedControl =
+    event.target instanceof Element
+      ? event.target.closest("button, select, input[type='range'], input[type='checkbox']")
+      : null;
+}
+
+/**
+ * A button, slider, checkbox or select used with the mouse would keep focus and take Space,
+ * Enter, the arrows or every shortcut; it is blurred once used so the shortcuts work again. A
+ * control used from the keyboard keeps focus. A select is released on change only, since a click
+ * can arrive while its menu is open. Text and number fields are never released.
+ */
+function releasePressed(event: Event) {
+  const kinds =
+    event.type === "change"
+      ? "select, input[type='range']"
+      : "button, input[type='range'], input[type='checkbox']";
+  const control = event.target instanceof Element ? event.target.closest(kinds) : null;
+  if (!control || control !== pressedControl) return;
+  pressedControl = null;
+  if (control instanceof HTMLElement) control.blur();
+}
+
 function handleKeydown(event: KeyboardEvent) {
   if (!blind.value || event.defaultPrevented || event.altKey) return;
   const key = event.key;
