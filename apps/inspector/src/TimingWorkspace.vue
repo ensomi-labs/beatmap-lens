@@ -18,6 +18,7 @@ import {
   type SaveResponse,
   staleSessionError,
 } from "./timing/contracts";
+import { nearestSample } from "./timing/format";
 import {
   addMark,
   adjacentMark,
@@ -1582,7 +1583,10 @@ function handleKeydown(event: KeyboardEvent) {
                   "
                 >
                   <span aria-hidden="true">{{ mark.kind === "beat" ? "▼" : "⊘" }}</span>
-                  <span class="timing-mark-time">{{ formatSourceTime(mark.time_ms, 1) }}</span>
+                  <span class="timing-mark-time">{{ formatSourceTime(mark.time_ms, 3) }}</span>
+                  <span class="timing-mark-sample">
+                    n {{ nearestSample(mark.time_ms, passage?.audio.sample_rate ?? 44_100) }}
+                  </span>
                   <span>{{ mark.kind }}{{ mark.blind ? "" : " · seen" }}</span>
                 </button>
               </li>
@@ -1816,9 +1820,14 @@ function handleKeydown(event: KeyboardEvent) {
 
 .timing-legend-index,
 .timing-legend-state,
-.timing-mark-time {
+.timing-mark-time,
+.timing-mark-sample {
   font-family: var(--font-data);
   font-variant-numeric: tabular-nums;
+}
+
+.timing-mark-sample {
+  color: var(--ink-muted);
 }
 
 .timing-legend-name strong {
@@ -1856,7 +1865,7 @@ function handleKeydown(event: KeyboardEvent) {
 }
 
 .timing-mark-list button {
-  grid-template-columns: 14px auto minmax(0, 1fr);
+  grid-template-columns: 14px auto auto minmax(0, 1fr);
 }
 
 .timing-mark-list button.is-active {

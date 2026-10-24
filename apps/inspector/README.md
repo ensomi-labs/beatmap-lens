@@ -74,14 +74,20 @@ passage's current marks are saved. The input format is
 [timing sessions](../../docs/inspector/timing-sessions.md).
 
 Run it from `pnpm dev` at `/timing`, or with plain Node and no install from a
-built bundle:
+built bundle. In the Ensomi workspace the bundle is built on the listening
+machine into the dated folder under ensomi-model's `artifacts/`, beside the
+sessions:
 
 ```sh
-# On a machine with the repository and pnpm: build the page and the server files.
-pnpm --filter @ensomi/beatmap-lens-inspector timing:bundle -- --out ~/timing-app
-# Anywhere with Node 22.18+ or 24+ (the bundle is platform independent):
-node ~/timing-app/server/timing-server.ts --session /path/to/session.timing.json --port 4177
+# With the repository and pnpm: build the page and the server files. Give --out
+# as an absolute or ~ path; pnpm runs the script from apps/inspector.
+pnpm --filter @ensomi/beatmap-lens-inspector timing:bundle -- --out ~/ensomi/ensomi-model/artifacts/timing-lens-20261024/app
+# Then with Node 22.18+ or 24+ only (the bundle is platform independent):
+node ~/ensomi/ensomi-model/artifacts/timing-lens-20261024/app/server/timing-server.ts --session /path/to/session.timing.json --port 4177
 ```
+
+The server checks the session, its PCM files and its identity key file before
+it listens, and stops with one line naming a missing file.
 
 Open the printed address; it opens the session directly. Marks append to
 `<session>.timing.marks.jsonl` beside the session.

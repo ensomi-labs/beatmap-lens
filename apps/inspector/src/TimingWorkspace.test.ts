@@ -327,3 +327,17 @@ it("applies each passage's loudness gain when consecutive passages share a recor
   await vi.waitFor(() => expect(hud()).toContain("Passage 01 of 2"));
   await vi.waitFor(() => expect(engine.loudness.at(-1)).toBe(-4.2));
 });
+
+it("lists mark times to 0.001 ms with the sample index, so a one-sample nudge shows", async () => {
+  await opened();
+  key("b");
+  await nextTick();
+  const row = () => container.querySelector(".timing-mark-list button")?.textContent ?? "";
+  expect(row()).toContain("00:00.100250");
+  expect(row()).toContain("n 4421");
+  button(row().trim()).click();
+  key(".");
+  await nextTick();
+  expect(row()).toContain("00:00.100273");
+  expect(row()).toContain("n 4422");
+});
