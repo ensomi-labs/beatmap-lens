@@ -761,13 +761,18 @@ async function revealNames() {
 // Keyboard
 function handleKeydown(event: KeyboardEvent) {
   if (!blind.value || event.defaultPrevented || event.altKey) return;
-  if (isTypingTarget(event.target)) return;
   const key = event.key;
+  // Save works from any field, including the setup line, instead of the browser's page save.
+  if ((event.metaKey || event.ctrlKey) && key.toLowerCase() === "s") {
+    event.preventDefault();
+    void save();
+    return;
+  }
+  if (isTypingTarget(event.target)) return;
   if (event.metaKey || event.ctrlKey) {
     const lower = key.toLowerCase();
-    if (lower === "z") updateMarks(event.shiftKey ? redo : undo);
-    else if (lower === "s") void save();
-    else return;
+    if (lower !== "z") return;
+    updateMarks(event.shiftKey ? redo : undo);
     event.preventDefault();
     return;
   }
@@ -1012,7 +1017,11 @@ function handleKeydown(event: KeyboardEvent) {
               <span>{{ formatSourceTime(playheadMs, devicePxMs < 1 ? 1 : 0) }}</span>
               <span>zoom {{ zoomLabel }}</span>
               <span>follow {{ follow ? "on" : "off" }}</span>
-              <span>loop {{ looping ? "on" : "off" }}</span>
+              <span>
+                loop {{ looping ? "on" : "off" }} {{ formatSourceTime(loopRegion.startMs) }}–{{
+                  formatSourceTime(loopRegion.endMs)
+                }}
+              </span>
               <span>{{ rate }}×</span>
               <span v-if="silenceMs !== undefined" class="timing-warning">
                 silence at {{ formatSourceTime(silenceMs) }}; an EQ app may soften the next onset
@@ -1406,7 +1415,7 @@ function handleKeydown(event: KeyboardEvent) {
                 :value="preferences.setup"
                 placeholder="DT 270 PRO · FineTune bypassed · 48 kHz device"
                 autocomplete="off"
-                @change="setPreference('setup', ($event.target as HTMLInputElement).value)"
+                @input="setPreference('setup', ($event.target as HTMLInputElement).value)"
               />
             </label>
             <button

@@ -566,10 +566,20 @@ function drawOverlay() {
     context.fillStyle = "#fff";
     context.fillText(label, textX, textY);
   }
-  const playX = crisp(deviceX(props.playheadMs));
+  // One translucent device pixel, so a bar or mark at the same time still shows through it; the
+  // ruler triangle makes it easy to find.
+  const playX = Math.round(deviceX(props.playheadMs));
   context.fillStyle = "#ff4d4f";
-  context.fillRect(playX - dpr, 0, 2 * dpr, L.overview.top * dpr);
-  const overviewX = crisp(deviceX(props.playheadMs, overviewView.value));
+  context.globalAlpha = 0.75;
+  context.fillRect(playX, L.ruler.top * dpr, 1, L.overview.top * dpr);
+  context.globalAlpha = 1;
+  context.beginPath();
+  context.moveTo(playX + 0.5 - 5 * dpr, L.ruler.top * dpr);
+  context.lineTo(playX + 0.5 + 5 * dpr, L.ruler.top * dpr);
+  context.lineTo(playX + 0.5, (L.ruler.top + 7) * dpr);
+  context.closePath();
+  context.fill();
+  const overviewX = Math.round(deviceX(props.playheadMs, overviewView.value));
   context.fillRect(overviewX - dpr, L.overview.top * dpr, 2 * dpr, L.overview.height * dpr);
 }
 
