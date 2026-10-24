@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { request } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, it } from "vitest";
@@ -70,6 +71,34 @@ it("serves the built page and the service, opening the session from the root add
     body: JSON.stringify({ session_path: sessionPath }),
   });
   expect((await opened.json()).passages).toHaveLength(1);
+});
+
+it("answers malformed requests without stopping", async () => {
+  const { root, sessionPath } = await fixture(8);
+  const server = await startTimingServer({
+    session: sessionPath,
+    port: 0,
+    staticRoot: join(root, "dist"),
+  });
+  cleanups.push(server.close);
+  const origin = new URL(server.url).origin;
+  expect((await fetch(`${origin}/%E0%A4%A`)).status).toBe(400);
+  expect((await fetch(`${origin}/assets/%E0%A4%A.js`)).status).toBe(400);
+  // A Host header that is not a URL authority fails while routing the service request.
+  const status = await new Promise<number | undefined>((done, fail) => {
+    const sent = request(
+      `${origin}/api/inspector/timing/open`,
+      { method: "POST", headers: { Host: "a b" } },
+      (response) => {
+        response.resume();
+        done(response.statusCode);
+      },
+    );
+    sent.on("error", fail);
+    sent.end("{}");
+  });
+  expect(status).toBe(400);
+  expect((await fetch(`${origin}/timing`)).status).toBe(200);
 });
 
 it("refuses to start when a PCM file's size disagrees with the session", async () => {

@@ -45,25 +45,41 @@ export async function startTimingServer(options: {
   const page = options.session
     ? `/timing?session=${encodeURIComponent(fullPath(options.session))}`
     : "/timing";
+  // No request may end the process: the page holds unsaved marks that only this service can save.
   const server = createServer((request, response) => {
-    timing(request, response, () => {
-      void serveStatic(request.url ?? "/", request.method ?? "GET").then(
-        ({ status, headers, body }) => {
-          response.writeHead(status, { "Cache-Control": "no-cache", ...headers });
-          response.end(request.method === "HEAD" ? undefined : body);
-        },
-      );
-    });
+    const fail = (status: number, error: unknown) => {
+      if (status === 500) process.stderr.write(`Timing server: ${String(error)}\n`);
+      if (!response.headersSent) response.writeHead(status);
+      response.end();
+    };
+    try {
+      timing(request, response, () => {
+        serveStatic(request.url ?? "/", request.method ?? "GET").then(
+          ({ status, headers, body }) => {
+            response.writeHead(status, { "Cache-Control": "no-cache", ...headers });
+            response.end(request.method === "HEAD" ? undefined : body);
+          },
+          (error) => fail(500, error),
+        );
+      });
+    } catch (error) {
+      fail(400, error);
+    }
   });
 
   async function serveStatic(rawUrl: string, method: string) {
     if (method !== "GET" && method !== "HEAD")
       return { status: 405, headers: {}, body: "Read-only static content." };
-    const path = new URL(rawUrl, "http://127.0.0.1").pathname;
+    let path: string;
+    try {
+      path = decodeURIComponent(new URL(rawUrl, "http://127.0.0.1").pathname);
+    } catch {
+      return { status: 400, headers: {}, body: "Malformed address." };
+    }
     if (path === "/") return { status: 302, headers: { Location: page }, body: "" };
     if (path === "/timing" || path === "/compare")
       return { status: 200, headers: { "Content-Type": mime[".html"] }, body: index };
-    const filename = resolve(staticRoot, decodeURIComponent(path).replace(/^\/+/, ""));
+    const filename = resolve(staticRoot, path.replace(/^\/+/, ""));
     if (!filename.startsWith(`${staticRoot}${sep}`))
       return { status: 404, headers: {}, body: "Unknown static file." };
     try {
@@ -138,6 +154,9 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   }).catch((error: Error) => {
     process.stderr.write(`${error.message}\n`);
     process.exit(1);
+  });
+  process.on("unhandledRejection", (reason) => {
+    process.stderr.write(`Timing server: ${String(reason)}\n`);
   });
   if (service.summary) process.stdout.write(`${service.summary}\n`);
   process.stdout.write(`Timing mode: ${service.url}\n`);

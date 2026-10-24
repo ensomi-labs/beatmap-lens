@@ -22,6 +22,10 @@ export function localService(prefix: string, handle: Handler): Connect.NextHandl
     response.setHeader("Cache-Control", "no-store");
     response.setHeader("X-Content-Type-Options", "nosniff");
     void handle(request, response, url).catch((error: Error & { code?: string }) => {
+      if (response.headersSent) {
+        response.end();
+        return;
+      }
       const name =
         error.code === "ENOENT"
           ? "NotFoundError"
