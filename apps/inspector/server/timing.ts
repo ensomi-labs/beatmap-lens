@@ -3,13 +3,14 @@ import { constants } from "node:fs";
 import { appendFile, readFile, realpath } from "node:fs/promises";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
-import type {
-  BlindPassage,
-  OpenTiming,
-  PassageTarget,
-  RevealedName,
-  SaveRequest,
-  SaveResponse,
+import {
+  type BlindPassage,
+  type OpenTiming,
+  type PassageTarget,
+  type RevealedName,
+  type SaveRequest,
+  type SaveResponse,
+  staleSessionError,
 } from "../src/timing/contracts.ts";
 import {
   type AudioInputV1,
@@ -77,7 +78,10 @@ export function timingHandler() {
       return;
     }
     const session = sessions.get(body.session_id);
-    if (!session) throw new Error("Reopen the session to reconnect the local service.");
+    if (!session)
+      throw Object.assign(new Error("Reopen the session to reconnect the local service."), {
+        name: staleSessionError,
+      });
     if (operation === "audio") {
       const bytes = await verifiedAudio(session, body.handle);
       response.setHeader("Content-Type", "application/octet-stream");

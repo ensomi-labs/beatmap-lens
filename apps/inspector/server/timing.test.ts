@@ -4,12 +4,13 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, it } from "vitest";
-import type {
-  BlindPassage,
-  Mark,
-  OpenTiming,
-  PageProvenance,
-  PlaybackSetup,
+import {
+  type BlindPassage,
+  type Mark,
+  type OpenTiming,
+  type PageProvenance,
+  type PlaybackSetup,
+  staleSessionError,
 } from "../src/timing/contracts";
 import type { SaveEventV1, SessionFileV1 } from "../src/timing/format";
 import { createTimingMiddleware } from "./timing";
@@ -148,6 +149,12 @@ it("refuses marks outside the passage", async () => {
   await expect(f.post("save", saveBody(target, [mark("m", "beat", 69_999)]))).rejects.toThrow(
     "inside",
   );
+});
+
+it("names an unknown session id so the page can reopen the session and retry", async () => {
+  const f = await fixture();
+  const response = await f.request("save", saveBody({ session_id: "gone", passage_index: 0 }, []));
+  expect(await response.json()).toMatchObject({ name: staleSessionError });
 });
 
 function mark(id: string, kind: Mark["kind"], time_ms: number): Mark {

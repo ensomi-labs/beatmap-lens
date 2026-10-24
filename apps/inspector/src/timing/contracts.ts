@@ -3,6 +3,12 @@
  * key file, marks output) are defined in `format.ts`; this module holds only the wire shapes.
  */
 
+/**
+ * The error name for an operation on a session id the service does not know, as after a restart.
+ * The page reopens the same session path and retries; reopening reveals nothing.
+ */
+export const staleSessionError = "StaleSessionError";
+
 export type MarkKind = "beat" | "unbeat";
 
 export type MarkMethod = "click" | "key-playhead";

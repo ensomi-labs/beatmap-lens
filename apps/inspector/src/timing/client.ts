@@ -1,13 +1,16 @@
 const prefix = "/api/inspector/timing";
 
-/** Calls the local timing service; a failure carries the service's message. */
+/** Calls the local timing service; a failure carries the service's error name and message. */
 export async function timingRequest(operation: string, body: unknown): Promise<Response> {
   const response = await fetch(`${prefix}/${operation}`, {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Beatmap-Lens-Local": "1" },
     body: JSON.stringify(body),
   });
-  if (!response.ok) throw new Error((await response.json()).error);
+  if (!response.ok) {
+    const failure: { name: string; error: string } = await response.json();
+    throw Object.assign(new Error(failure.error), { name: failure.name });
+  }
   return response;
 }
 

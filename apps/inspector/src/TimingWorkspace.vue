@@ -5,17 +5,18 @@ import { isNativeActivationTarget, isTypingTarget } from "./annotation/keyboard-
 import TimingStage, { type StageProposal } from "./TimingStage.vue";
 import { TimingAudioEngine } from "./timing/audio-engine";
 import { timingJson, timingRequest } from "./timing/client";
-import type {
-  BlindPassage,
-  BlindPassageRow,
-  Mark,
-  MarkKind,
-  MarkMethod,
-  OpenTiming,
-  PageProvenance,
-  PlaybackSetup,
-  RevealedName,
-  SaveResponse,
+import {
+  type BlindPassage,
+  type BlindPassageRow,
+  type Mark,
+  type MarkKind,
+  type MarkMethod,
+  type OpenTiming,
+  type PageProvenance,
+  type PlaybackSetup,
+  type RevealedName,
+  type SaveResponse,
+  staleSessionError,
 } from "./timing/contracts";
 import {
   addMark,
@@ -103,7 +104,12 @@ const hiddenByP = ref<string[]>();
 const busy = ref(false);
 const saving = ref(false);
 const error = ref("");
+const notice = ref("");
 const silenceMs = ref<number>();
+/** The path the open session was opened with, for reconnecting after a service restart. */
+let openedPath = "";
+/** The marks file and session id the drafts belong to; reopening the same session keeps them. */
+let draftsOwner = "";
 
 // Playback
 const audioState = ref<"none" | "loading" | "ready">("none");
@@ -278,15 +284,19 @@ function report(cause: unknown) {
 async function open() {
   busy.value = true;
   error.value = "";
+  notice.value = "";
   try {
     const result = await timingJson<OpenTiming>("open", { session_path: sessionPath.value });
     if (disposed) return;
     try {
       localStorage.setItem(rememberedSession, sessionPath.value);
     } catch {}
-    drafts.value = new Map();
+    const owner = JSON.stringify([result.marks_path, result.id]);
+    if (owner !== draftsOwner) drafts.value = new Map();
+    draftsOwner = owner;
+    openedPath = sessionPath.value;
     opened.value = result;
-    await select(0);
+    await select(firstPassage(result));
   } catch (cause) {
     report(cause);
   } finally {
@@ -294,10 +304,71 @@ async function open() {
   }
 }
 
+/** A session opens on a passage with unsaved marks, else the first unsaved passage, else 01. */
+function firstPassage(session: OpenTiming): number {
+  const drafted = session.passages.findIndex((row) => {
+    const entry = drafts.value.get(row.id);
+    return entry ? isDirty(entry) : false;
+  });
+  if (drafted >= 0) return drafted;
+  return Math.max(0, session.passages.findIndex((row) => !row.saved));
+}
+
+function isStale(cause: unknown): boolean {
+  return cause instanceof Error && cause.name === staleSessionError;
+}
+
+/**
+ * Reopens the open session after the service restarted, keeping the drafts and the current
+ * passage. The service replays saves, reveals and saved legends from the marks file, so this
+ * reveals nothing new; an unsaved passage gets a new legend.
+ */
+async function reconnect() {
+  const current = opened.value;
+  const result = await timingJson<OpenTiming>("open", { session_path: openedPath });
+  if (result.marks_path !== current?.marks_path || result.id !== current.id)
+    throw new Error("The service now serves another session. Open this session again.");
+  opened.value = result;
+  notice.value =
+    "Reconnected to the restarted service. Proposal colours of unsaved passages may have changed.";
+}
+
+/** A passage's blind view, reconnecting once if the service restarted. */
+async function passageView(index: number): Promise<BlindPassage> {
+  const request = () =>
+    timingJson<BlindPassage>("passage", {
+      session_id: opened.value?.session_id,
+      passage_index: index,
+    });
+  try {
+    return await request();
+  } catch (cause) {
+    if (!isStale(cause)) throw cause;
+    await reconnect();
+    return request();
+  }
+}
+
+/**
+ * Reconnects and reloads the current passage's proposals in place, keeping its marks, audio and
+ * view. Returns whether the legend the listener saw changed.
+ */
+async function reconnectPassage(): Promise<boolean> {
+  const legend = (view: BlindPassage | undefined) =>
+    JSON.stringify(view?.proposals.map((p) => [p.key, p.colour_index]));
+  const shown = legend(blind.value);
+  await reconnect();
+  const result = await passageView(passageIndex.value);
+  if (disposed) return false;
+  // Names are present only if the marks file already records this passage's reveal.
+  names.value = result.names;
+  blind.value = result;
+  return legend(result) !== shown;
+}
+
 /** Choosing the current passage again reopens its audio in a new context (after a device change). */
 async function select(index: number) {
-  const row = opened.value?.passages[index];
-  if (!row) return;
+  if (!opened.value?.passages[index]) return;
   stop();
   if (index === passageIndex.value && engine) await closeAudio();
   passageIndex.value = index;
@@ -306,11 +377,9 @@ async function select(index: number) {
   busy.value = true;
   error.value = "";
   try {
-    const result = await timingJson<BlindPassage>("passage", {
-      session_id: opened.value?.session_id,
-      passage_index: index,
-    });
-    if (disposed) return;
+    const result = await passageView(index);
+    const row = opened.value?.passages[index];
+    if (disposed || !row) return;
     await loadAudio(row);
     if (disposed) return;
     if (!drafts.value.has(row.id)) {
@@ -391,18 +460,21 @@ async function closeAudio() {
   audioState.value = "none";
 }
 
+/** Drafts stay in the page, so reopening the same session brings them back. */
 function close() {
   if (
     unsavedPassages.value &&
-    !window.confirm(`${unsavedPassages.value} passage(s) have unsaved marks. Close the session?`)
+    !window.confirm(
+      `${unsavedPassages.value} passage(s) have unsaved marks. They stay in this page only for reopening this session. Close it?`,
+    )
   )
     return;
   stop();
   void closeAudio();
   opened.value = undefined;
   blind.value = undefined;
-  drafts.value = new Map();
   error.value = "";
+  notice.value = "";
 }
 
 // View
@@ -717,8 +789,8 @@ async function save() {
   const snapshot = current.state.marks;
   saving.value = true;
   error.value = "";
-  try {
-    const response = await timingJson<SaveResponse>("save", {
+  const request = () =>
+    timingJson<SaveResponse>("save", {
       session_id: opened.value?.session_id,
       passage_index: passageIndex.value,
       marks: snapshot,
@@ -727,13 +799,32 @@ async function save() {
       page: pageProvenance(),
       visible_keys: stageProposals.value.filter((p) => p.visible).map((p) => p.key),
     });
+  try {
+    let response: SaveResponse;
+    try {
+      response = await request();
+    } catch (cause) {
+      if (!isStale(cause)) throw cause;
+      // The save records the legend the listener saw, so it is retried only if that is unchanged.
+      if (await reconnectPassage()) {
+        error.value =
+          "The service restarted and gave this passage new proposal colours. Check them, then save again.";
+        return;
+      }
+      response = await request();
+    }
     if (disposed) return;
     const latest = drafts.value.get(row.id);
     if (latest) drafts.value.set(row.id, { ...latest, saved: snapshot, saveId: response.save_id });
     triggerRef(drafts);
-    row.saved = true;
+    const savedRow = opened.value?.passages.find((entry) => entry.id === row.id);
+    if (savedRow) savedRow.saved = true;
   } catch (cause) {
-    report(cause);
+    // fetch rejects with a TypeError when nothing answers.
+    if (cause instanceof TypeError)
+      error.value =
+        "The local timing service is not answering. Start it again, then save; the marks stay in this page.";
+    else report(cause);
   } finally {
     saving.value = false;
   }
@@ -754,7 +845,17 @@ async function revealNames() {
     names.value = result.names;
     row.revealed = true;
   } catch (cause) {
-    report(cause);
+    if (!isStale(cause)) {
+      report(cause);
+      return;
+    }
+    // Reconnecting does not reveal; the listener presses Reveal again on the reopened session.
+    try {
+      await reconnectPassage();
+      error.value = "Reconnected to the restarted service. Press Reveal names again.";
+    } catch (failure) {
+      report(failure);
+    }
   }
 }
 
@@ -905,6 +1006,10 @@ function handleKeydown(event: KeyboardEvent) {
         <p class="setup-note">
           Paths starting with ~/ work. Marks are appended to &lt;session&gt;.timing.marks.jsonl
           beside the session file.
+        </p>
+        <p v-if="unsavedPassages" class="inline-message">
+          Unsaved marks in {{ unsavedPassages }} passage(s) are kept in this page. Reopen the same
+          session to save them.
         </p>
         <p v-if="error" class="inline-message inline-message--error" role="alert">{{ error }}</p>
         <button class="button button--primary onboarding-submit" type="submit" :disabled="busy">
@@ -1443,6 +1548,7 @@ function handleKeydown(event: KeyboardEvent) {
             <p v-if="error && blind" class="inline-message inline-message--error" role="alert">
               {{ error }}
             </p>
+            <p v-if="notice" class="inline-message" role="status">{{ notice }}</p>
             <p class="setup-note timing-output">
               Marks append to <span>{{ opened.marks_path }}</span>
             </p>
