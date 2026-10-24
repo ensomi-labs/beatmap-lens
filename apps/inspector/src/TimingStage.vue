@@ -268,14 +268,12 @@ function drawBase() {
   drawOverview(context);
 }
 
-const greyLut = (() => {
-  const from = [16, 24, 32];
-  const to = [179, 179, 179];
-  return Array.from({ length: 256 }, (_, index) =>
-    from.map((value, channel) => Math.round(value + ((to[channel] as number) - value) * (index / 255))),
-  );
-})();
-const columnCache = new Map<number, Uint8Array>();
+/** The grey ramp as packed RGBA words (little-endian canvas memory: 0xAABBGGRR). */
+const greyLut = Uint32Array.from({ length: 256 }, (_, index) => {
+  const [r, g, b] = [16, 24, 32].map((from) => Math.round(from + (179 - from) * (index / 255)));
+  return ((255 << 24) | ((b as number) << 16) | ((g as number) << 8) | (r as number)) >>> 0;
+});
+const columnCache = new Map<number, Uint32Array>();
 
 /** Each device column shows the frame whose centre is nearest its time; no raster is stretched. */
 function drawSpectrogram(context: CanvasRenderingContext2D) {
@@ -287,7 +285,7 @@ function drawSpectrogram(context: CanvasRenderingContext2D) {
   if (!data || rows <= 0 || width <= 0) return;
   const binsForRows = rowBins(rows, data.sampleRate);
   const image = context.createImageData(width, rows);
-  const pixels = image.data;
+  const pixels = new Uint32Array(image.data.buffer);
   for (let x = 0; x < width; x++) {
     const timeMs = xToMs(props.view, (x + 0.5) / dpr);
     const frame = nearestFrame(timeMs, data.sampleRate);
@@ -295,24 +293,17 @@ function drawSpectrogram(context: CanvasRenderingContext2D) {
     if (index < 0 || index >= data.frameCount) continue;
     let column = columnCache.get(frame);
     if (!column) {
-      column = new Uint8Array(rows);
+      column = new Uint32Array(rows);
       const offset = index * data.bins;
       for (let row = 0; row < rows; row++) {
         const { lo, hi } = binsForRows[row] as { lo: number; hi: number };
         let db = Number.NEGATIVE_INFINITY;
         for (let bin = lo; bin <= hi; bin++) db = Math.max(db, data.db[offset + bin] ?? -200);
-        column[row] = Math.round(level(db) * 255);
+        column[row] = greyLut[Math.round(level(db) * 255)] as number;
       }
       columnCache.set(frame, column);
     }
-    for (let row = 0; row < rows; row++) {
-      const colour = greyLut[column[row] as number] as number[];
-      const at = (row * width + x) * 4;
-      pixels[at] = colour[0] as number;
-      pixels[at + 1] = colour[1] as number;
-      pixels[at + 2] = colour[2] as number;
-      pixels[at + 3] = 255;
-    }
+    for (let row = 0, at = x; row < rows; row++, at += width) pixels[at] = column[row] as number;
   }
   context.putImageData(image, 0, Math.round(lane.top * dpr));
 }
@@ -429,7 +420,9 @@ function drawProposals(context: CanvasRenderingContext2D) {
     const rowHeight = (stripRowHeight - 1) * dpr;
     const first = deviceX(beats[0] as number);
     const last = deviceX(beats.at(-1) as number);
-    const dense = beats.length > 1 && (last - first) / (beats.length - 1) < 3;
+    // Closer than 3 CSS pixels on average (6 device pixels on a 2x display), lines would hide
+    // the spectrogram, so the proposal becomes a shade until the user zooms in.
+    const dense = beats.length > 1 && (last - first) / (beats.length - 1) < 3 * dpr;
     context.fillStyle = colour;
     if (dense) {
       context.globalAlpha = 0.55;
@@ -595,6 +588,9 @@ function localPoint(event: PointerEvent | WheelEvent | MouseEvent) {
 }
 
 function onPointerDown(event: PointerEvent) {
+  // A rail button keeps focus after a click and would take Space; working on the stage returns
+  // the keyboard to the workspace shortcuts.
+  if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
   const { x, y } = localPoint(event);
   press = {
     x,
