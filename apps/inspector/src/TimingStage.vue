@@ -576,12 +576,13 @@ function drawOverlay() {
     context.fillStyle = "#fff";
     context.fillText(label, textX, textY);
   }
-  // One translucent device pixel, so a bar or mark at the same time still shows through it; the
-  // ruler triangle makes it easy to find.
+  // One CSS pixel, translucent so a bar or mark at the same time still shows through it, and
+  // placed like a mark of the same width so the two coincide; the ruler triangle makes it easy to
+  // find.
   const playX = deviceX(props.playheadMs);
   context.fillStyle = "#ff4d4f";
   context.globalAlpha = 0.75;
-  vline(context, playX, L.ruler.top * dpr, L.overview.top * dpr);
+  vline(context, playX, L.ruler.top * dpr, L.overview.top * dpr, Math.max(1, Math.round(dpr)));
   context.globalAlpha = 1;
   context.beginPath();
   context.moveTo(playX - 5 * dpr, L.ruler.top * dpr);
