@@ -106,13 +106,17 @@ Open the printed address; it opens the session directly. Marks append to
   toggles follow.
 - <kbd>1</kbd>–<kbd>9</kbd> switch proposals, <kbd>P</kbd> hides all of them and
   brings them back. <kbd>Cmd/Ctrl+S</kbd> or <kbd>Enter</kbd> saves; the first save
-  needs the playback setup line (headphones, EQ app state, device rate).
+  needs the playback setup line (headphones, EQ app state, device rate) and the
+  **Output device rate** field. Both are remembered by the browser.
 
 The moving playhead follows the audio output clock and the playhead offset,
 which corrects delay the browser cannot see. It shows which beat is sounding to
 about one display frame; place and check marks on the still waveform. After an
 output device or rate change, choose **Reopen audio after a device change** (or
-the current passage again) and check the offset.
+the current passage again) and check the offset. The stage header warns when the
+stated output device rate differs from the recording's, when the recording rate
+changes from the previous passage, and when the stated rate changed since the
+audio opened.
 
 ## Code map
 

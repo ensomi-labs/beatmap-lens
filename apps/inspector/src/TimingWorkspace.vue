@@ -126,6 +126,10 @@ const latencies = ref<{ base_latency_ms: number | null; output_latency_ms: numbe
 });
 const contextRate = ref<number>();
 const deviceChanged = ref(false);
+/** The context opened at another rate than the previous one; cleared by reopening the audio. */
+const rateChanged = ref(false);
+/** The stated device rate changed after the context opened; cleared by a new context. */
+const reopenNeeded = ref(false);
 
 // Stage
 const stage = ref<InstanceType<typeof TimingStage>>();
@@ -196,6 +200,21 @@ const conversion = computed(() => {
   return device === source
     ? "No rate conversion"
     : `Device converts ${source.toLocaleString()} → ${device.toLocaleString()} Hz`;
+});
+/** The output-rate condition to fix before listening, shown in the stage HUD. */
+const rateWarning = computed(() => {
+  const source = passage.value?.audio.sample_rate;
+  if (!source) return "";
+  const hz = (value: number) => `${value.toLocaleString()} Hz`;
+  const device = preferences.value.deviceRateHz;
+  if (!device)
+    return `Output device rate not stated. This recording is ${hz(source)}; set the output device to it in Audio MIDI Setup and choose it under Output device rate before saving.`;
+  if (device !== source)
+    return `The output device is at ${hz(device)} and this recording at ${hz(source)}, so the system resamples. Set the output device to ${hz(source)} in Audio MIDI Setup, choose it under Output device rate, then Reopen audio.`;
+  if (reopenNeeded.value) return "The output device rate changed. Reopen audio before listening.";
+  if (rateChanged.value)
+    return `The recording rate changed to ${hz(source)}. Check that the output device is at ${hz(source)}, then Reopen audio.`;
+  return "";
 });
 const offsetNeedsCheck = computed(
   () =>
@@ -376,7 +395,10 @@ async function reconnectPassage(): Promise<boolean> {
 async function select(index: number) {
   if (!opened.value?.passages[index]) return;
   stop();
-  if (index === passageIndex.value && engine) await closeAudio();
+  if (index === passageIndex.value && engine) {
+    rateChanged.value = false;
+    await closeAudio();
+  }
   passageIndex.value = index;
   blind.value = undefined;
   names.value = undefined;
@@ -439,7 +461,10 @@ async function loadAudio(row: BlindPassageRow) {
     engine = undefined;
   }
   if (!engine) {
+    const previousRate = contextRate.value;
     engine = new TimingAudioEngine(audio.sample_rate);
+    if (previousRate !== undefined && previousRate !== engine.sampleRate) rateChanged.value = true;
+    reopenNeeded.value = false;
     engine.onEnded = (positionMs) => {
       cancelAnimationFrame(frame);
       playing.value = false;
@@ -665,6 +690,12 @@ function setPlayheadOffset(value: number) {
   deviceChanged.value = false;
 }
 
+function setDeviceRate(value: number | null) {
+  setPreference("deviceRateHz", value);
+  rateChanged.value = false;
+  if (engine) reopenNeeded.value = true;
+}
+
 function setPreroll(value: number) {
   if (Number.isFinite(value)) setPreference("prerollMs", Math.max(minimumPrerollMs, value));
 }
@@ -790,6 +821,11 @@ async function save() {
   if (!preferences.value.setup.trim()) {
     error.value = "Describe the playback setup before saving.";
     document.getElementById("timing-setup")?.focus();
+    return;
+  }
+  if (!preferences.value.deviceRateHz) {
+    error.value = "Choose the output device rate before saving.";
+    document.getElementById("timing-device-rate")?.focus();
     return;
   }
   const snapshot = current.state.marks;
@@ -1170,6 +1206,10 @@ function handleKeydown(event: KeyboardEvent) {
                 silence at {{ formatSourceTime(silenceMs) }}; an EQ app may soften the next onset
               </span>
             </div>
+            <p v-if="rateWarning" class="timing-hud-warning" role="status">
+              <span class="health-dot" aria-hidden="true"></span>
+              {{ rateWarning }}
+            </p>
           </header>
           <TimingStage
             v-if="blind && audioBuffer && passage"
@@ -1380,13 +1420,9 @@ function handleKeydown(event: KeyboardEvent) {
               <label class="field-stack timing-inline-field">
                 <span>Output device rate</span>
                 <select
+                  id="timing-device-rate"
                   :value="preferences.deviceRateHz ?? ''"
-                  @change="
-                    setPreference(
-                      'deviceRateHz',
-                      Number(($event.target as HTMLSelectElement).value) || null,
-                    )
-                  "
+                  @change="setDeviceRate(Number(($event.target as HTMLSelectElement).value) || null)"
                 >
                   <option value="">Not stated</option>
                   <option v-for="value in deviceRates" :key="value" :value="value">
@@ -1624,6 +1660,21 @@ function handleKeydown(event: KeyboardEvent) {
 .timing-hud-line strong {
   font-family: var(--font-data);
   font-weight: 620;
+}
+
+.timing-hud-warning {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 0;
+  color: oklch(82% 0.14 76);
+  font-size: 0.62rem;
+  font-weight: 600;
+  text-wrap: pretty;
+}
+
+.timing-hud-warning .health-dot {
+  background: var(--warning);
 }
 
 .timing-hud .health-status {

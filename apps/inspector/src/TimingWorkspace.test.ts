@@ -57,10 +57,11 @@ const server = vi.hoisted(() => ({
   live: new Set<string>(),
   opens: 0,
   colours: [3, 5],
+  rates: [44_100, 44_100],
   saves: [] as Record<string, unknown>[],
 }));
 
-function row(id: string, saved: boolean): BlindPassageRow {
+function row(id: string, saved: boolean, sample_rate: number): BlindPassageRow {
   return {
     id,
     title: id,
@@ -71,7 +72,13 @@ function row(id: string, saved: boolean): BlindPassageRow {
     hint: "",
     flags: [],
     loudness_gain_db: -6,
-    audio: { handle: "a1", format: "f32le-interleaved", sample_rate: 44_100, channels: 2, frames },
+    audio: {
+      handle: `a${sample_rate}`,
+      format: "f32le-interleaved",
+      sample_rate,
+      channels: 2,
+      frames,
+    },
     saved,
     revealed: false,
   };
@@ -81,7 +88,13 @@ let app: ReturnType<typeof createApp>;
 let container: HTMLElement;
 
 beforeEach(() => {
-  Object.assign(server, { live: new Set(), opens: 0, colours: [3, 5], saves: [] });
+  Object.assign(server, {
+    live: new Set(),
+    opens: 0,
+    colours: [3, 5],
+    rates: [44_100, 44_100],
+    saves: [],
+  });
   Object.assign(engine, { plays: 0, loudness: [] });
   localStorage.setItem(
     "lens-timing-preferences",
@@ -99,7 +112,10 @@ beforeEach(() => {
         id: "session-01",
         clock: "osu",
         marks_path: "/s/session-01.timing.marks.jsonl",
-        passages: [row("passage-01", true), row("passage-02", false)],
+        passages: [
+          row("passage-01", true, server.rates[0] as number),
+          row("passage-02", false, server.rates[1] as number),
+        ],
       };
       return opened;
     }
@@ -156,6 +172,15 @@ function button(text: string): HTMLButtonElement {
   );
   if (!found) throw new Error(`No button ${text}`);
   return found;
+}
+
+async function mount(preferences: object, rates = [44_100, 44_100]) {
+  app.unmount();
+  server.rates = rates;
+  localStorage.setItem("lens-timing-preferences", JSON.stringify(preferences));
+  app = createApp(TimingWorkspace);
+  app.mount(container);
+  await opened();
 }
 
 async function opened() {
@@ -252,4 +277,38 @@ it("gives the keyboard back to the shortcuts after a rail control is used with t
   key("n", setup ?? undefined);
   await nextTick();
   expect(status()).toBe("Unsaved · 1 marks");
+});
+
+it("asks for the output device rate before the first save", async () => {
+  await mount({ setup: "DT 270 PRO", deviceRateHz: null });
+  expect(hud()).toContain("Output device rate not stated");
+  key("b");
+  key("Enter");
+  await nextTick();
+  expect(container.textContent).toContain("Choose the output device rate before saving.");
+  expect(server.saves).toHaveLength(0);
+  const rate = container.querySelector<HTMLSelectElement>("#timing-device-rate");
+  if (!rate) throw new Error("No device rate field");
+  expect(document.activeElement).toBe(rate);
+  rate.dispatchEvent(new Event("pointerdown", { bubbles: true }));
+  rate.value = "44100";
+  rate.dispatchEvent(new Event("change", { bubbles: true }));
+  await nextTick();
+  expect(hud()).toContain("Reopen audio before listening");
+  key("Enter");
+  await vi.waitFor(() => expect(status()).toBe("Saved"));
+  expect(server.saves[0]).toMatchObject({ playback: { device_rate_hz: 44_100 } });
+});
+
+it("warns in the HUD when the device rate differs from the recording or the recording rate changes", async () => {
+  await mount({ setup: "DT 270 PRO", deviceRateHz: 44_100 }, [44_100, 48_000]);
+  expect(hud()).toContain("Passage 02 of 2");
+  expect(hud()).toContain("output device is at 44,100 Hz and this recording at 48,000 Hz");
+  window.dispatchEvent(
+    new KeyboardEvent("keydown", { key: "{", code: "BracketLeft", shiftKey: true }),
+  );
+  await vi.waitFor(() => expect(hud()).toContain("Passage 01 of 2"));
+  await vi.waitFor(() => expect(hud()).toContain("The recording rate changed to 44,100 Hz"));
+  button("Reopen audio after a device change").click();
+  await vi.waitFor(() => expect(container.querySelector(".timing-hud-warning")).toBeNull());
 });
