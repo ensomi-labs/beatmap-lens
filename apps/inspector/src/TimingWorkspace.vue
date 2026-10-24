@@ -294,10 +294,12 @@ async function open() {
   }
 }
 
+/** Choosing the current passage again reopens its audio in a new context (after a device change). */
 async function select(index: number) {
   const row = opened.value?.passages[index];
   if (!row) return;
   stop();
+  if (index === passageIndex.value && engine) await closeAudio();
   passageIndex.value = index;
   blind.value = undefined;
   names.value = undefined;
@@ -381,6 +383,14 @@ async function loadAudio(row: BlindPassageRow) {
   audioState.value = "ready";
 }
 
+async function closeAudio() {
+  await engine?.close();
+  engine = undefined;
+  loadedHandle = "";
+  audioBuffer.value = undefined;
+  audioState.value = "none";
+}
+
 function close() {
   if (
     unsavedPassages.value &&
@@ -388,6 +398,7 @@ function close() {
   )
     return;
   stop();
+  void closeAudio();
   opened.value = undefined;
   blind.value = undefined;
   drafts.value = new Map();
@@ -1194,6 +1205,14 @@ function handleKeydown(event: KeyboardEvent) {
                 The output changed since the offset was set; check it again.
               </small>
             </div>
+            <button
+              class="button button--quiet timing-wide"
+              type="button"
+              :disabled="busy || saving"
+              @click="select(passageIndex)"
+            >
+              Reopen audio after a device change
+            </button>
 
             <div class="timing-field-pair">
               <label class="field-stack timing-inline-field">
