@@ -784,6 +784,13 @@ function handleKeydown(event: KeyboardEvent) {
     else togglePlayback();
     return;
   }
+  // Shift+[ and Shift+] move between passages, by key position so other layouts work too.
+  if (event.shiftKey && (event.code === "BracketLeft" || event.code === "BracketRight")) {
+    event.preventDefault();
+    const next = passageIndex.value + (event.code === "BracketLeft" ? -1 : 1);
+    if (next >= 0 && next < (opened.value?.passages.length ?? 0)) void select(next);
+    return;
+  }
   const fine = event.shiftKey ? 0.1 : 1;
   const actions: Record<string, () => void> = {
     Escape: () => {
@@ -813,8 +820,6 @@ function handleKeydown(event: KeyboardEvent) {
     n: () => place("unbeat", playheadMs.value, "key-playhead"),
     "[": () => selectAdjacent(-1),
     "]": () => selectAdjacent(1),
-    "{": () => void select(Math.max(0, passageIndex.value - 1)),
-    "}": () => void select(passageIndex.value + 1),
     k: () => updateMarks((state) => flipSelected(state, revealed.value)),
     Delete: () => updateMarks(removeSelected),
     Backspace: () => updateMarks(removeSelected),

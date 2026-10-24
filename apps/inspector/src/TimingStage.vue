@@ -579,7 +579,16 @@ function drawOverlay() {
 // Pointer: a press that moves beyond the threshold drags (pan, loop selection, overview jump);
 // otherwise it clicks (seek on the ruler and overview, select or place on the lanes).
 let press:
-  | { x: number; y: number; lane: LaneName; button: number; shift: boolean; view: TimeView; dragging: boolean }
+  | {
+      x: number;
+      y: number;
+      lane: LaneName;
+      /** Right button, or Control+click (the macOS secondary click). */
+      secondary: boolean;
+      shift: boolean;
+      view: TimeView;
+      dragging: boolean;
+    }
   | undefined;
 
 function localPoint(event: PointerEvent | WheelEvent | MouseEvent) {
@@ -596,7 +605,7 @@ function onPointerDown(event: PointerEvent) {
     x,
     y,
     lane: laneAt(y),
-    button: event.button,
+    secondary: event.button === 2 || (event.button === 0 && event.ctrlKey),
     shift: event.shiftKey,
     view: props.view,
     dragging: false,
@@ -652,7 +661,7 @@ function onPointerUp(event: PointerEvent) {
   }
   if (near) emit("select", near.id);
   else if (timeMs < props.span.startMs || timeMs > props.span.endMs) emit("seek", timeMs);
-  else emit("place", current.button === 2 ? "unbeat" : "beat", timeMs);
+  else emit("place", current.secondary ? "unbeat" : "beat", timeMs);
 }
 
 function onPointerCancel() {
