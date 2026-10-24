@@ -63,6 +63,8 @@ export interface OpenTiming {
   id: string;
   clock: string;
   marks_path: string;
+  /** Lines of the marks file that could not be read and were skipped. */
+  marks_warning?: string;
   passages: BlindPassageRow[];
 }
 

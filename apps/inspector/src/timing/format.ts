@@ -227,18 +227,30 @@ export function encodeEvent(event: TimingEvent): string {
   return `${JSON.stringify(event)}\n`;
 }
 
-/** The latest save per passage is current; a passage stays revealed once any reveal is recorded. */
+/**
+ * The latest save per passage is current; a passage stays revealed once any reveal is recorded.
+ * A line that does not parse, such as the end of an append cut short by a crash, is skipped and
+ * its 1-based number returned for the caller to report; the file is never rewritten.
+ */
 export function readMarksFile(text: string, sessionId: string) {
   const saves = new Map<string, SaveEventV1>();
   const reveals = new Set<string>();
-  for (const line of text.split("\n")) {
+  const skipped: number[] = [];
+  const lines = text.split("\n");
+  for (const [index, line] of lines.entries()) {
     if (!line) continue;
-    const event: TimingEvent = JSON.parse(line);
+    let event: TimingEvent;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      skipped.push(index + 1);
+      continue;
+    }
     if (event.session_id !== sessionId) continue;
     if (event.type === "save") saves.set(event.passage_id, event);
     else reveals.add(event.passage_id);
   }
-  return { saves, reveals };
+  return { saves, reveals, skipped };
 }
 
 /** Back from a record to the page's mark: the derived sample is dropped, `time_ms` is kept. */

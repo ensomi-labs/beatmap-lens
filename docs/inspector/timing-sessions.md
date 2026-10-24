@@ -88,7 +88,10 @@ stay the same while the service runs and are replayed from the last save.
 ## Marks output
 
 `<name>.timing.marks.jsonl` beside the session, append-only, one event per
-line. The latest `save` of a passage is its current snapshot.
+line. The latest `save` of a passage is its current snapshot. A line that does
+not parse, such as the end of an append cut short by a crash, is skipped with a
+warning in the service's terminal and on the page; the file is never rewritten,
+and the next event starts on a new line.
 
 ```json
 { "version": 1, "type": "save", "id": "…uuid…", "session_id": "session-01",

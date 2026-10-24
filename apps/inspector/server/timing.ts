@@ -44,6 +44,10 @@ interface Session {
   passages: PassageState[];
   /** Opaque handle to audio input; the page never sees a path. */
   audio: Map<string, AudioInputV1>;
+  /** The marks file ends inside a line (an append cut short), so the next event starts a line. */
+  pendingNewline: boolean;
+  /** Lines of the marks file that did not parse and were skipped. */
+  marksWarning?: string;
 }
 
 interface PassageState {
@@ -112,7 +116,11 @@ async function openSession(input: string, legends: Legends): Promise<Session> {
     if (error.code !== "ENOENT") throw error;
     return "";
   });
-  const { saves, reveals } = readMarksFile(text, session.id);
+  const { saves, reveals, skipped } = readMarksFile(text, session.id);
+  const marksWarning = skipped.length
+    ? `${basename(marksPath)}: line ${skipped.join(", ")} could not be read and was skipped; the file is left as it is.`
+    : undefined;
+  if (marksWarning) console.warn(`Timing: ${folder}/${marksWarning}`);
   const audio = new Map<string, AudioInputV1>();
   const handles = new Map<string, string>();
   const passages = session.passages.map((passage): PassageState => {
@@ -138,7 +146,14 @@ async function openSession(input: string, legends: Legends): Promise<Session> {
       revealed: reveals.has(passage.id),
     };
   });
-  return { session, marksPath, passages, audio };
+  return {
+    session,
+    marksPath,
+    passages,
+    audio,
+    pendingNewline: text !== "" && !text.endsWith("\n"),
+    ...(marksWarning ? { marksWarning } : {}),
+  };
 }
 
 /**
@@ -176,12 +191,16 @@ function shuffle<T>(values: T[]): T[] {
   return result;
 }
 
-function describe(sessionId: string, { session, marksPath, passages }: Session): OpenTiming {
+function describe(
+  sessionId: string,
+  { session, marksPath, passages, marksWarning }: Session,
+): OpenTiming {
   return {
     session_id: sessionId,
     id: session.id,
     clock: session.clock,
     marks_path: marksPath,
+    ...(marksWarning ? { marks_warning: marksWarning } : {}),
     passages: passages.map(({ passage, audioHandle, save, revealed }) => ({
       id: passage.id,
       title: passage.title,
@@ -333,8 +352,9 @@ async function names(session: Session, state: PassageState): Promise<RevealedNam
   }
 }
 
-function append(session: Session, line: string) {
-  return appendFile(session.marksPath, line, {
+async function append(session: Session, line: string) {
+  await appendFile(session.marksPath, session.pendingNewline ? `\n${line}` : line, {
     flag: constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | constants.O_NOFOLLOW,
   });
+  session.pendingNewline = false;
 }

@@ -324,6 +324,7 @@ async function open() {
     draftsOwner = owner;
     openedPath = sessionPath.value;
     opened.value = result;
+    notice.value = result.marks_warning ?? "";
     await select(firstPassage(result));
   } catch (cause) {
     report(cause);

@@ -152,6 +152,36 @@ it("opens a revealed passage without names when the key file is gone, and record
   expect(JSON.stringify(passage)).not.toContain("private");
 });
 
+it("skips a marks line cut short with a warning, never rewriting the file", async () => {
+  const f = await fixture();
+  const first: OpenTiming = await f.post("open", { session_path: f.sessionPath });
+  const target = { session_id: first.session_id, passage_index: 0 };
+  await f.post("save", saveBody(target, [mark("m1", "beat", 72_468.9342)]));
+  const intact = await readFile(first.marks_path, "utf8");
+  await writeFile(first.marks_path, `${intact}{"version":1,"type":"save","id":"cut`);
+  const before = await readFile(first.marks_path, "utf8");
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+  const opened: OpenTiming = await f.post("open", { session_path: f.sessionPath });
+  expect(opened.marks_warning).toContain("line 2");
+  expect(warn).toHaveBeenCalledOnce();
+  const again = { session_id: opened.session_id, passage_index: 0 };
+  const shown: BlindPassage = await f.post("passage", again);
+  expect(shown.saved?.marks.map((m) => m.id)).toEqual(["m1"]);
+
+  const saved = await f.post("save", saveBody(again, [mark("m2", "beat", 72_500)]));
+  const after = await readFile(first.marks_path, "utf8");
+  expect(after.startsWith(before)).toBe(true);
+  expect(after.slice(before.length).startsWith("\n")).toBe(true);
+  const reopened: OpenTiming = await f.post("open", { session_path: f.sessionPath });
+  expect(reopened.marks_warning).toContain("line 2");
+  const latest: BlindPassage = await f.post("passage", {
+    session_id: reopened.session_id,
+    passage_index: 0,
+  });
+  expect(latest.saved?.save_id).toBe(saved.save_id);
+});
+
 it("keeps an unsaved passage's legend when the session is opened again", async () => {
   const f = await fixture();
   const first: OpenTiming = await f.post("open", { session_path: f.sessionPath });
