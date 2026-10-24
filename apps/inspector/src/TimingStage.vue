@@ -13,6 +13,7 @@ import {
 } from "./timing/spectrogram";
 import {
   formatSourceTime,
+  lineLeft,
   msDecimals,
   msToX,
   type TimeRange,
@@ -243,6 +244,25 @@ function crisp(x: number): number {
   return Math.round(x) + 0.5;
 }
 
+/** A crisp vertical line at device coordinate `x`; see `lineLeft` for its placement. */
+function vline(context: CanvasRenderingContext2D, x: number, top: number, height: number, width = 1) {
+  context.fillRect(lineLeft(x, width), top, width, height);
+}
+
+/** The same line drawn as dashes, for unbeat marks. */
+function dashedVline(
+  context: CanvasRenderingContext2D,
+  x: number,
+  top: number,
+  height: number,
+  width: number,
+  dash: number,
+  gap: number,
+) {
+  for (let y = top; y < top + height; y += dash + gap)
+    vline(context, x, y, Math.min(dash, top + height - y), width);
+}
+
 function drawBase() {
   const canvas = base.value;
   const context = canvas?.getContext("2d");
@@ -384,14 +404,14 @@ function drawRuler(context: CanvasRenderingContext2D) {
   const range = { startMs: props.view.startMs, endMs: xToMs(props.view, width) };
   context.fillStyle = "rgba(255, 255, 255, 0.28)";
   for (const tick of ticks(range, minor))
-    context.fillRect(Math.round(deviceX(tick)), (lane.top + lane.height - 4) * dpr, 1, 4 * dpr);
+    vline(context, deviceX(tick), (lane.top + lane.height - 4) * dpr, 4 * dpr);
   context.fillStyle = "rgba(255, 255, 255, 0.72)";
   context.font = `${10 * dpr}px "Azeret Mono Variable", ui-monospace, monospace`;
   context.textBaseline = "top";
   const digits = Math.max(0, msDecimals(step));
   for (const tick of ticks(range, step)) {
-    const x = Math.round(deviceX(tick));
-    context.fillRect(x, (lane.top + lane.height - 9) * dpr, 1, 9 * dpr);
+    const x = deviceX(tick);
+    vline(context, x, (lane.top + lane.height - 9) * dpr, 9 * dpr);
     context.fillText(formatSourceTime(tick, digits), x + 3 * dpr, (lane.top + 3) * dpr);
   }
 }
@@ -433,11 +453,11 @@ function drawProposals(context: CanvasRenderingContext2D) {
       return;
     }
     for (const beat of beats) {
-      const x = Math.round(deviceX(beat));
+      const x = deviceX(beat);
       context.globalAlpha = 1;
-      context.fillRect(x - dpr, rowTop, 2 * dpr + 1, rowHeight);
+      vline(context, x, rowTop, rowHeight, 2 * Math.round(dpr) + 1);
       context.globalAlpha = 0.85;
-      context.fillRect(x, lineTop, 1, lineHeight);
+      vline(context, x, lineTop, lineHeight);
     }
     context.globalAlpha = 1;
   });
@@ -463,15 +483,12 @@ function drawMarks(context: CanvasRenderingContext2D) {
   };
   for (const mark of marks) {
     const selected = mark.id === props.selectedId;
-    const x = crisp(deviceX(mark.time_ms));
-    context.strokeStyle = selected ? "#8fb3ff" : "#ffffff";
-    context.lineWidth = selected ? 2 * dpr : Math.max(1, dpr);
-    context.setLineDash(mark.kind === "unbeat" ? [4 * dpr, 3 * dpr] : []);
-    context.beginPath();
-    context.moveTo(x, lineTop);
-    context.lineTo(x, lineTop + lineHeight);
-    context.stroke();
-    context.setLineDash([]);
+    const x = deviceX(mark.time_ms);
+    const lineWidth = Math.max(1, Math.round(dpr)) * (selected ? 2 : 1);
+    context.fillStyle = selected ? "#8fb3ff" : "#ffffff";
+    if (mark.kind === "unbeat")
+      dashedVline(context, x, lineTop, lineHeight, lineWidth, 4 * dpr, 3 * dpr);
+    else vline(context, x, lineTop, lineHeight, lineWidth);
     if (x - groupX < dragThreshold * dpr) {
       groupCount++;
       continue;
@@ -543,9 +560,9 @@ function drawOverlay() {
   }
   if (hoverX.value !== undefined) {
     const timeMs = xToMs(props.view, hoverX.value);
-    const x = crisp(hoverX.value * dpr);
+    const x = hoverX.value * dpr;
     context.fillStyle = "rgba(255, 255, 255, 0.35)";
-    context.fillRect(x - 0.5, L.strip.top * dpr, 1, (L.overview.top - L.strip.top) * dpr);
+    vline(context, x, L.strip.top * dpr, (L.overview.top - L.strip.top) * dpr);
     const digits = props.view.msPerPx < 0.1 ? 2 : props.view.msPerPx < 1 ? 1 : 0;
     let label = formatSourceTime(timeMs, digits);
     if (props.view.msPerPx < 1) label += ` · n ${nearestSample(timeMs, sampleRate.value)}`;
@@ -561,15 +578,15 @@ function drawOverlay() {
   }
   // One translucent device pixel, so a bar or mark at the same time still shows through it; the
   // ruler triangle makes it easy to find.
-  const playX = Math.round(deviceX(props.playheadMs));
+  const playX = deviceX(props.playheadMs);
   context.fillStyle = "#ff4d4f";
   context.globalAlpha = 0.75;
-  context.fillRect(playX, L.ruler.top * dpr, 1, L.overview.top * dpr);
+  vline(context, playX, L.ruler.top * dpr, L.overview.top * dpr);
   context.globalAlpha = 1;
   context.beginPath();
-  context.moveTo(playX + 0.5 - 5 * dpr, L.ruler.top * dpr);
-  context.lineTo(playX + 0.5 + 5 * dpr, L.ruler.top * dpr);
-  context.lineTo(playX + 0.5, (L.ruler.top + 7) * dpr);
+  context.moveTo(playX - 5 * dpr, L.ruler.top * dpr);
+  context.lineTo(playX + 5 * dpr, L.ruler.top * dpr);
+  context.lineTo(playX, (L.ruler.top + 7) * dpr);
   context.closePath();
   context.fill();
   const overviewX = Math.round(deviceX(props.playheadMs, overviewView.value));

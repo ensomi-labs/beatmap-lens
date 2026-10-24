@@ -3,6 +3,7 @@ import {
   clampView,
   fitView,
   formatSourceTime,
+  lineLeft,
   msDecimals,
   msToX,
   placeAt,
@@ -75,6 +76,22 @@ describe("zoom and clamps", () => {
     });
     const placed = placeAt({ startMs: 0, msPerPx: 2 }, 10_000, 1000, 0.15);
     expect(msToX(placed, 10_000)).toBeCloseTo(150, 9);
+  });
+});
+
+describe("line placement", () => {
+  it("keeps a crisp line's centre within half a pixel of its time, with no average shift", () => {
+    for (const width of [1, 2, 3, 4]) {
+      let sum = 0;
+      for (let step = 0; step < 100; step++) {
+        const x = 40 + step / 100;
+        const centre = lineLeft(x, width) + width / 2;
+        expect(Math.abs(centre - x)).toBeLessThanOrEqual(0.5);
+        expect(Number.isInteger(lineLeft(x, width))).toBe(true);
+        sum += centre - x;
+      }
+      expect(Math.abs(sum / 100)).toBeLessThan(0.01);
+    }
   });
 });
 

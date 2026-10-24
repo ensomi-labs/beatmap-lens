@@ -78,6 +78,16 @@ export function placeAt(
   return { startMs: timeMs - widthPx * fraction * view.msPerPx, msPerPx: view.msPerPx };
 }
 
+/**
+ * Left edge of a crisp vertical line `width` device pixels wide for device coordinate `x`, with no
+ * systematic shift: an odd width fills the pixel that contains `x`, an even width centres on the
+ * nearest pixel boundary. Either way the line's centre is within half a pixel of `x`, where the
+ * waveform draws its samples.
+ */
+export function lineLeft(x: number, width: number): number {
+  return width % 2 === 0 ? Math.round(x) - width / 2 : Math.floor(x) - (width - 1) / 2;
+}
+
 const niceSteps = [1, 2, 5];
 
 /** The smallest 1-2-5 step in ms whose ticks are at least `minSpacingPx` apart. */
