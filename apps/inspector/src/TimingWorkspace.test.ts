@@ -22,9 +22,11 @@ vi.mock("./timing/audio-engine", () => ({
         getChannelData: (channel: number) => channels[channel],
       };
     }
+    starting = false;
     async play() {
       engine.plays++;
       this.playing = true;
+      return true;
     }
     stop() {
       this.playing = false;

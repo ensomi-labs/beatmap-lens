@@ -567,12 +567,13 @@ async function start(fromMs: number, endMs: number, loop: boolean) {
   if (!engine || audioState.value !== "ready") return;
   error.value = "";
   try {
-    await engine.play({
+    const started = await engine.play({
       fromMs: prerollStart(fromMs, preferences.value.prerollMs),
       endMs,
       rate: rate.value,
       loop: loop ? { ...loopRegion.value } : null,
     });
+    if (!started) return;
     latencies.value = engine.latencies();
     playing.value = true;
     cancelAnimationFrame(frame);
@@ -589,9 +590,12 @@ function tick() {
   frame = requestAnimationFrame(tick);
 }
 
-/** Space: pause keeps the heard position; play resumes there (inside the loop when looping). */
+/**
+ * Space: pause keeps the heard position; play resumes there (inside the loop when looping). A
+ * press while a start waits for the audio to resume cancels it.
+ */
 function togglePlayback() {
-  if (playing.value) {
+  if (playing.value || engine?.starting) {
     stop();
     return;
   }

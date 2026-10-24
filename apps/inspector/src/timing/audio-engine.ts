@@ -16,6 +16,10 @@ export class TimingAudioEngine {
   private source: AudioBufferSourceNode | undefined;
   private anchor: PlaybackAnchor | undefined;
   private frozenMs = 0;
+  /** Bumped by every play and stop, so only the latest call can start a source. */
+  private playToken = 0;
+  /** The token of a play waiting for the context to resume, or 0. */
+  private resuming = 0;
   onEnded: ((positionMs: number) => void) | undefined;
 
   constructor(sampleRate: number) {
@@ -40,6 +44,11 @@ export class TimingAudioEngine {
     return Boolean(this.source);
   }
 
+  /** A play is waiting for the context to resume; a stop cancels it. */
+  get starting(): boolean {
+    return this.resuming !== 0;
+  }
+
   get loaded(): AudioBuffer | undefined {
     return this.buffer;
   }
@@ -59,17 +68,28 @@ export class TimingAudioEngine {
     return buffer;
   }
 
-  /** Starts at `fromMs` (the caller applies pre-roll); loops `loop` or stops at `endMs`. */
+  /**
+   * Starts at `fromMs` (the caller applies pre-roll); loops `loop` or stops at `endMs`. Resolves
+   * false without starting when a stop or a later play came while the context resumed, so two
+   * quick presses never leave an untracked source playing.
+   */
   async play(options: {
     fromMs: number;
     endMs: number;
     rate: number;
     loop: { startMs: number; endMs: number } | null;
-  }): Promise<void> {
+  }): Promise<boolean> {
     const buffer = this.buffer;
     if (!buffer) throw new Error("The audio is not loaded yet.");
     this.stop();
-    await this.context.resume();
+    const token = ++this.playToken;
+    this.resuming = token;
+    try {
+      await this.context.resume();
+    } finally {
+      if (this.resuming === token) this.resuming = 0;
+    }
+    if (token !== this.playToken) return false;
     const source = new AudioBufferSourceNode(this.context, {
       buffer,
       playbackRate: options.rate,
@@ -99,6 +119,7 @@ export class TimingAudioEngine {
     this.source = source;
     this.anchor = anchor;
     this.frozenMs = options.fromMs;
+    return true;
   }
 
   /**
@@ -118,8 +139,13 @@ export class TimingAudioEngine {
     return this.frozenMs;
   }
 
-  /** Stops at once, without a fade; returns the position that was being heard. */
+  /**
+   * Stops at once, without a fade, and cancels a play waiting to start; returns the position that
+   * was being heard. Stopping when nothing plays does nothing else.
+   */
   stop(offsetMs = 0): number | undefined {
+    this.playToken++;
+    this.resuming = 0;
     const heard = this.position(offsetMs);
     if (this.source) {
       this.source.onended = null;
