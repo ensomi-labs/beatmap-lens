@@ -382,21 +382,32 @@ async function passageView(index: number): Promise<BlindPassage> {
   }
 }
 
+/** The proposal keys and colours a listener saw. */
+function legend(view: BlindPassage | undefined): string {
+  return JSON.stringify(view?.proposals.map((p) => [p.key, p.colour_index]));
+}
+
 /**
- * Reconnects and reloads the current passage's proposals in place, keeping its marks, audio and
- * view. Returns whether the legend the listener saw changed.
+ * Whether passage `index` is on the stage with its view loaded, so a response that arrives late
+ * may update what the stage shows. The listener can move on while a request is in flight.
  */
-async function reconnectPassage(): Promise<boolean> {
-  const legend = (view: BlindPassage | undefined) =>
-    JSON.stringify(view?.proposals.map((p) => [p.key, p.colour_index]));
-  const shown = legend(blind.value);
+function showing(index: number): boolean {
+  return index === passageIndex.value && blind.value !== undefined;
+}
+
+/**
+ * Reconnects and reloads passage `index`'s proposals. They replace the stage's only while that
+ * passage is still shown, keeping its marks, audio and view.
+ */
+async function reconnectPassage(index: number): Promise<BlindPassage> {
   await reconnect();
-  const result = await passageView(passageIndex.value);
-  if (disposed) return false;
-  // Names are present only if the marks file already records this passage's reveal.
-  names.value = result.names;
-  blind.value = result;
-  return legend(result) !== shown;
+  const result = await passageView(index);
+  if (!disposed && showing(index)) {
+    // Names are present only if the marks file already records this passage's reveal.
+    names.value = result.names;
+    blind.value = result;
+  }
+  return result;
 }
 
 /** Choosing the current passage again reopens its audio in a new context (after a device change). */
@@ -848,19 +859,24 @@ async function save() {
     document.getElementById("timing-device-rate")?.focus();
     return;
   }
+  // The passage, marks, legend and playback are taken as they are now, since the listener can move
+  // to another passage or change the playback before a retry. Only the session id is read again,
+  // because reconnecting replaces it.
+  const index = passageIndex.value;
+  const shown = legend(blind.value);
   const snapshot = current.state.marks;
+  const body = {
+    passage_index: index,
+    marks: snapshot,
+    setup: preferences.value.setup,
+    playback: playbackSetup(),
+    page: pageProvenance(),
+    visible_keys: stageProposals.value.filter((p) => p.visible).map((p) => p.key),
+  };
   saving.value = true;
   error.value = "";
   const request = () =>
-    timingJson<SaveResponse>("save", {
-      session_id: opened.value?.session_id,
-      passage_index: passageIndex.value,
-      marks: snapshot,
-      setup: preferences.value.setup,
-      playback: playbackSetup(),
-      page: pageProvenance(),
-      visible_keys: stageProposals.value.filter((p) => p.visible).map((p) => p.key),
-    });
+    timingJson<SaveResponse>("save", { session_id: opened.value?.session_id, ...body });
   try {
     let response: SaveResponse;
     try {
@@ -868,9 +884,8 @@ async function save() {
     } catch (cause) {
       if (!isStale(cause)) throw cause;
       // The save records the legend the listener saw, so it is retried only if that is unchanged.
-      if (await reconnectPassage()) {
-        error.value =
-          "The service restarted and gave this passage new proposal colours. Check them, then save again.";
+      if (legend(await reconnectPassage(index)) !== shown) {
+        error.value = `The service restarted and gave passage ${String(index + 1).padStart(2, "0")} new proposal colours. Check them, then save again.`;
         return;
       }
       response = await request();
@@ -896,16 +911,19 @@ async function revealNames() {
   const row = passage.value;
   const current = draft.value;
   if (!row || !current?.saveId || !canReveal.value) return;
+  const index = passageIndex.value;
   error.value = "";
   try {
     const result = await timingJson<{ names: RevealedName[] }>("reveal", {
       session_id: opened.value?.session_id,
-      passage_index: passageIndex.value,
+      passage_index: index,
       save_id: current.saveId,
     });
     if (disposed) return;
-    names.value = result.names;
-    row.revealed = true;
+    // The service has recorded the reveal, but the names go beside this passage's proposals only.
+    const revealedRow = opened.value?.passages[index];
+    if (revealedRow) revealedRow.revealed = true;
+    if (showing(index)) names.value = result.names;
   } catch (cause) {
     if (!isStale(cause)) {
       report(cause);
@@ -913,8 +931,9 @@ async function revealNames() {
     }
     // Reconnecting does not reveal; the listener presses Reveal again on the reopened session.
     try {
-      await reconnectPassage();
-      error.value = "Reconnected to the restarted service. Press Reveal names again.";
+      await reconnectPassage(index);
+      if (showing(index))
+        error.value = "Reconnected to the restarted service. Press Reveal names again.";
     } catch (failure) {
       report(failure);
     }

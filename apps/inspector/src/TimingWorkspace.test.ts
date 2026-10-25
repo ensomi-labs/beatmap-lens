@@ -144,6 +144,13 @@ beforeEach(() => {
       server.saves.push(request);
       return { save_id: `save-${server.saves.length}`, time: "2026-10-25T01:00:00.000Z" };
     }
+    if (operation === "reveal")
+      return {
+        names: [
+          { key: "p1", name: "model-a" },
+          { key: "p2", name: "model-b" },
+        ],
+      };
     throw new Error(operation);
   });
   vi.mocked(timingRequest).mockImplementation(
@@ -180,6 +187,24 @@ function button(text: string): HTMLButtonElement {
   );
   if (!found) throw new Error(`No button ${text}`);
   return found;
+}
+
+/** Holds every `operation` request until the returned function is called. */
+function hold(operation: string): () => void {
+  let release = () => {};
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const answer = vi.mocked(timingJson).getMockImplementation();
+  vi.mocked(timingJson).mockImplementation(async (name, body) => {
+    if (name === operation) await held;
+    return answer?.(name, body);
+  });
+  return release;
+}
+
+function passageKey(code: "BracketLeft" | "BracketRight") {
+  window.dispatchEvent(new KeyboardEvent("keydown", { key: code, code, shiftKey: true }));
 }
 
 async function mount(preferences: object, rates = [44_100, 44_100]) {
@@ -228,11 +253,67 @@ it("does not retry a save when the restarted service changed the legend the list
   key("Enter");
   await vi.waitFor(() => expect(container.textContent).toContain("new proposal colours"));
   // The explanation is in the stage header, which is always in view, not below the fold of the rail.
-  expect(hud()).toContain("gave this passage new proposal colours. Check them, then save again.");
+  expect(hud()).toContain("gave passage 02 new proposal colours. Check them, then save again.");
   expect(server.saves).toHaveLength(0);
   key("Enter");
   await vi.waitFor(() => expect(status()).toBe("Saved"));
   expect(server.saves[0]).toMatchObject({ session_id: "s2", marks: [{ time_ms: 100.25 }] });
+});
+
+it("retries a save after a service restart on the passage and playback it was made with", async () => {
+  await opened();
+  key("b");
+  await nextTick();
+  const release = hold("save");
+  key("Enter");
+  passageKey("BracketLeft");
+  await vi.waitFor(() => expect(hud()).toContain("Passage 01 of 2"));
+  await opened();
+
+  server.live.clear();
+  release();
+  await vi.waitFor(() => expect(server.saves).toHaveLength(1));
+  expect(server.saves[0]).toMatchObject({
+    session_id: "s2",
+    passage_index: 1,
+    marks: [{ time_ms: 100.25 }],
+    playback: { loudness_gain_db: -12.9 },
+  });
+  await vi.waitFor(() => expect(button("Save marks").disabled).toBe(false));
+  expect(hud()).toContain("Passage 01 of 2");
+  expect(status()).toBe("No marks saved");
+
+  passageKey("BracketRight");
+  await vi.waitFor(() => expect(hud()).toContain("Passage 02 of 2"));
+  await opened();
+  expect(status()).toBe("Saved");
+});
+
+it("shows revealed names only beside the passage they were revealed for", async () => {
+  await opened();
+  key("b");
+  await nextTick();
+  key("Enter");
+  await vi.waitFor(() => expect(status()).toBe("Saved"));
+
+  const release = hold("reveal");
+  button("Reveal names").click();
+  passageKey("BracketLeft");
+  await vi.waitFor(() => expect(hud()).toContain("Passage 01 of 2"));
+  await opened();
+  const { mock } = vi.mocked(timingJson);
+  const reveal = mock.calls.findIndex(([operation]) => operation === "reveal");
+  release();
+  await vi.waitFor(() => expect(mock.settledResults[reveal]?.type).toBe("fulfilled"));
+  await nextTick();
+  expect(hud()).toMatch(/Passage 01 of 2 .* Blind/);
+  expect(container.querySelector(".timing-legend")?.textContent).not.toContain("model-a");
+
+  // The service recorded the reveal, so the passage it was for reads as revealed.
+  passageKey("BracketRight");
+  await vi.waitFor(() => expect(hud()).toContain("Passage 02 of 2"));
+  await opened();
+  expect(hud()).toMatch(/Passage 02 of 2 .* Revealed/);
 });
 
 it("brings unsaved marks back when the same session is opened again", async () => {
@@ -406,8 +487,6 @@ it("keeps digits typed into the offset and pre-roll fields while playback redraw
 it("visits a passage asked for by key while another passage is loading", async () => {
   await opened();
   expect(hud()).toContain("Passage 02 of 2");
-  const passageKey = (code: string) =>
-    window.dispatchEvent(new KeyboardEvent("keydown", { key: code, code, shiftKey: true }));
   passageKey("BracketLeft");
   await nextTick();
   expect(hud()).toContain("Passage 01 of 2");
