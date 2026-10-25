@@ -9,7 +9,8 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "typecheck": "vue-tsc --project tsconfig.json --noEmit"
+    "typecheck": "vue-tsc --project tsconfig.json --noEmit",
+    "timing:bundle": "node scripts/timing-bundle.mjs"
   },
   "dependencies": {
     "@fontsource-variable/azeret-mono": "5.3.0",

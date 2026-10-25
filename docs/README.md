@@ -8,10 +8,12 @@ and design choices.
 ## Inspector
 
 - [Inspector guide](../apps/inspector/README.md): running Inspector, its workspaces,
-  and judging two charts in Compare.
+  judging two charts in Compare and marking beats in Timing.
 - [Model comparison packets](inspector/model-comparison.md): the manifest and verdict
   format for blind two-model listening, how excerpts are proposed, and the limits of
   the energy strip.
+- [Timing sessions](inspector/timing-sessions.md): the session, identity key and marks
+  format for blind beat-timing labels, on the `osu` clock.
 
 ## Annotation
 
