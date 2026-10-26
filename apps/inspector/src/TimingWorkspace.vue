@@ -1427,7 +1427,7 @@ function handleKeydown(event: KeyboardEvent) {
                 title="Place a beat at the playhead, or where it is heard while playing (B)"
                 @click="placeAtPlayhead('beat', $event.timeStamp)"
               >
-                Beat · B
+                Beat <kbd>B</kbd>
               </button>
             </fieldset>
 
@@ -1498,7 +1498,7 @@ function handleKeydown(event: KeyboardEvent) {
                   aria-keyshortcuts="C"
                   @change="setMarkClicks(($event.target as HTMLInputElement).checked)"
                 />
-                <span>Click on my beats · C</span>
+                <span>Click on my beats <kbd>C</kbd></span>
               </label>
             </div>
           </section>
@@ -1666,7 +1666,7 @@ function handleKeydown(event: KeyboardEvent) {
                 aria-keyshortcuts="B"
                 @click="placeAtPlayhead('beat', $event.timeStamp)"
               >
-                Beat at playhead · B
+                Beat at playhead <kbd>B</kbd>
               </button>
               <button
                 type="button"
@@ -1674,7 +1674,7 @@ function handleKeydown(event: KeyboardEvent) {
                 aria-keyshortcuts="N"
                 @click="placeAtPlayhead('unbeat', $event.timeStamp)"
               >
-                Unbeat at playhead · N
+                Unbeat at playhead <kbd>N</kbd>
               </button>
               <button
                 type="button"
@@ -1897,18 +1897,6 @@ function handleKeydown(event: KeyboardEvent) {
   outline-offset: 1px;
 }
 
-.timing-nudge {
-  min-width: 0;
-  padding: 0;
-  border: 0;
-  display: grid;
-  grid-template-columns: 56px minmax(0, 1fr);
-  align-items: center;
-  gap: 8px;
-  margin-top: 8px;
-  font-size: 11px;
-}
-
 .details-transport .speed-controls {
   grid-template-columns: 56px minmax(0, 1fr);
 }
@@ -2076,6 +2064,34 @@ function handleKeydown(event: KeyboardEvent) {
 .timing-output span {
   font-family: var(--font-data);
   overflow-wrap: anywhere;
+}
+
+.timing-nudge {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  margin: 10px 0 0;
+  padding: 0;
+  border: 0;
+  font-size: 11px;
+}
+
+.timing-nudge .speed-presets {
+  display: grid;
+  grid-template-columns: repeat(var(--count), minmax(0, 1fr));
+}
+
+.timing-nudge .speed-presets button {
+  min-width: 0;
+  padding: 0;
+}
+
+.timing-mark-actions kbd,
+.timing-check kbd {
+  margin-left: 4px;
+  font-family: var(--font-data);
+  font-size: 0.85em;
+  opacity: 0.72;
 }
 
 .timing-desktop-note {
