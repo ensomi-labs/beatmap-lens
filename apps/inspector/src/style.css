@@ -3256,7 +3256,7 @@ fieldset.toolbar-group,
   flex: 0 0 auto;
   flex-wrap: wrap;
   align-items: center;
-  gap: 4px 12px;
+  gap: 4px 10px;
   padding: 3px 8px;
   border-bottom: 1px solid var(--seam);
   background: var(--surface-2);
@@ -3264,8 +3264,8 @@ fieldset.toolbar-group,
 
 .stage-identity {
   display: flex;
-  min-width: 160px;
-  flex: 1 1 200px;
+  min-width: 96px;
+  flex: 1 1 auto;
   align-items: baseline;
   gap: 8px;
   overflow: hidden;
