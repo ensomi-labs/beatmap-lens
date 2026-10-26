@@ -364,7 +364,11 @@ function steadySummary(run) {
 
 /**
  * Per frame: the drawn playhead's source time against the audio clock at the frame time.
- * Frames right before a base draw are skipped (a view jump moves the element before the bars).
+ * A sample's `frame` is the instrument's count of the page's own animation frames, so it names
+ * the last page frame (and base draw) before the sample. Samples in the display frame right
+ * before a base draw, or in the draw's frame ahead of the page's callback, are skipped (a view
+ * jump may move the element before the bars). That frame is found by time stamp: a build with no
+ * frame loop runs a page frame only to draw, so the count stands still between draws.
  */
 function positionsSummary(run) {
   const clock = clockReference(run.stamps);
@@ -372,18 +376,29 @@ function positionsSummary(run) {
   const mappings = barMappings(run.baseDraws);
   if (!clock || !start || !mappings.length) return { error: "missing clock, start or bars" };
   const drawFrames = new Set(mappings.map((m) => m.frame));
+  const frameTs = new Map((run.frames ?? []).map((f) => [f.frame, f.ts]));
+  // One display frame: the page's frame interval, or 60 Hz when it runs frames only to draw.
+  const frameMs = Math.min(
+    median((run.frames ?? []).slice(1).map((f, i) => f.ts - run.frames[i].ts)) ?? Infinity,
+    1000 / 60,
+  );
+  const beforeDraw = (p) => {
+    if (!drawFrames.has(p.frame + 1)) return false;
+    const drawTs = frameTs.get(p.frame + 1);
+    return drawTs === undefined || drawTs - p.ts <= 1.5 * frameMs;
+  };
   const stopAt = stopTime(run);
   const rows = [];
   for (const p of run.playhead ?? []) {
-    if (drawFrames.has(p.frame + 1) || p.ts >= stopAt) continue;
+    if (beforeDraw(p) || p.ts >= stopAt) continue;
     const mapping = mappings.filter((m) => m.frame <= p.frame).at(-1);
     if (!mapping) continue;
     const audioMs = heardAt(clock, start, p.ts);
     if (audioMs <= start.offsetMs + 1) continue;
-    rows.push({ ts: p.ts, shownMs: sourceOf(mapping, p.x, audioMs), audioMs, frame: p.frame });
+    rows.push({ ts: p.ts, shownMs: sourceOf(mapping, p.x, audioMs), audioMs });
   }
-  // One sample per frame (the canvas may draw the playhead twice in a frame).
-  const byFrame = [...new Map(rows.map((r) => [r.frame, r])).values()];
+  // One sample per display frame (the canvas may draw the playhead twice in a frame).
+  const byFrame = [...new Map(rows.map((r) => [r.ts, r])).values()];
   const fit = lineFit(
     byFrame.map((r) => r.ts),
     byFrame.map((r) => r.shownMs),
