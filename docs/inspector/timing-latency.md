@@ -29,16 +29,17 @@ clocks; the Vue components only wire them.
 | --- | --- |
 | `clock.ts` | Clock model. `OutputClock` relates page time to the context time heard at the output: a robust straight line through the last second of `getOutputTimestamp()` pairs (median gate, then two least-squares passes keeping residuals within 3 · 1.4826 · MAD, at least 0.1 ms), following a step after three stamps. `PlaybackAnchor` and `sourceAtContext` relate context time to source time for one source, holding the start before it, clamping a non-looping end and wrapping a loop after its first pass. |
 | `transport.ts` | Transport and scheduler. `planPlay` puts the start time, the buffer offset and the loop edges on whole frames, and the anchor on the frame really played. `clickTimes` maps the listener's beats to context times (fractional, so a click's onset is exact to a fraction of a sample); `clickWindow` schedules them 1 s ahead and drops a click that can no longer start on time instead of playing it late. |
-| `display.ts` | Display path. A frame that begins at page time `f` shows the source time heard at `f − offset`; `offset` is the listener's playhead offset, applied here and nowhere else. Within one play that is a straight line in page time (`PlayheadMotion`), held before the start, clamped at the end or wrapping in a loop. `needsResync` keeps the running motion through refits that move it by less than 0.25 ms; `followView` decides view jumps. |
+| `display.ts` | Display path. A frame that begins at page time `f` shows the source time heard at `f − offset`; `offset` is the listener's playhead offset, applied here and nowhere else. Within one play that is a straight line in page time (`PlayheadMotion`), held before the start, clamped at the end or wrapping in a loop. `needsResync` keeps the running motion through refits that move it by less than 0.25 ms. A loop's compositor piece starts at a recent wrap, and `loopReanchorDue` replaces it every 32 passes, since the compositor may round each pass to whole microseconds. `followView` decides view jumps. |
 | `input.ts` | Input path. A key or button press maps through the same clock model at its own `timeStamp`, without the offset; a press before the sound reached the output gives nothing. |
-| `audio-engine.ts` | Web Audio adapter: the context at the recording's rate, the music and click sources, feeding stamps to the clock model. A running context starts at once, without awaiting `resume()`. |
-| `playhead-layer.ts` | DOM adapter: the playhead element moved only by `transform`. Standing still, a transform placed like a mark of the same width; playing, the motion's pieces as Web Animations whose start times are page times, run by the compositor. |
+| `audio-engine.ts` | Web Audio adapter: the context at the recording's rate, the music and click sources, feeding stamps to the clock model. A running context starts at once, without awaiting `resume()`. A context that stops running mid-play freezes the playhead, and a pause, at the position last shown. |
+| `playhead-layer.ts` | DOM adapter: the playhead element moved only by `transform`. Standing still, a transform placed like a mark of the same width; playing, the motion's pieces as Web Animations whose start times are page times, run by the compositor, each holding its end until a later piece takes over. |
 
 `TimingWorkspace.vue` runs no animation-frame loop while playing: with one, a main-thread stall can
 hold even the compositor's playhead, by about a frame ([Measurements](#measurements)). A 25 ms timer
 step feeds the clock model, hands the stage a new motion only when `needsResync` says so, refreshes
-the HUD readout every 100 ms and follows the playhead; it also runs exactly when the playhead will
-leave the view or a loop wraps (`nextFollowCheckMs`), so follow jumps stay on time.
+the HUD readout every 100 ms and follows the playhead; it also runs when the playhead will leave
+the view or a loop wraps (`nextFollowCheckMs`, the delay rounded up to whole milliseconds), so
+follow jumps stay on time.
 `TimingStage.vue` places the playhead with the frame that redraws a new view, so the line never
 shows the new view over the old picture.
 
