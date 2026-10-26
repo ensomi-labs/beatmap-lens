@@ -3,9 +3,9 @@ import { type ClockLine, contextAt, type PlaybackAnchor, sourceAtContext } from 
 import {
   followView,
   motionAt,
-  nextFollowCheckMs,
   motionSegments,
   needsResync,
+  nextFollowCheckMs,
   type PlayheadMotion,
   planMotion,
 } from "./display";
