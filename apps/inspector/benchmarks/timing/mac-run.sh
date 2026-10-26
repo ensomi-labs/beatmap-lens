@@ -6,6 +6,7 @@
 #   apps/inspector/benchmarks/timing/mac-run.sh OUT [REPEATS] [LABEL=REF ...]
 #
 # The default builds are baseline=4954249 (the version before the engine) and engine=HEAD.
+# LAB=0 skips the lab runs.
 # Ports 4190-4199 only. Nothing is committed; the temporary worktrees and servers are removed.
 set -euo pipefail
 
@@ -64,8 +65,10 @@ fi
 } > "$out/environment.json"
 
 for i in $(seq 1 "$repeats"); do
-  echo "== lab $i"
-  nice -n 10 node "$here/run.mjs" lab --label "lab-$i" --out "$out" --port 4199
+  if [[ "${LAB:-1}" != 0 ]]; then
+    echo "== lab $i"
+    nice -n 10 node "$here/run.mjs" lab --label "lab-$i" --out "$out" --port 4199
+  fi
   port=4190
   for build in $builds; do
     label=${build%%=*}

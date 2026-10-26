@@ -386,6 +386,7 @@ async function record(page, act, { browser, trace = false, samplePlayhead = fals
   await page.evaluate((samplePlayhead) => {
     performance.mark("bench-sync");
     window.__bench.samplePlayhead = samplePlayhead;
+    if (samplePlayhead) window.__bench.startSampler();
     window.__bench.recording = true;
   }, samplePlayhead);
   await act();
@@ -394,7 +395,8 @@ async function record(page, act, { browser, trace = false, samplePlayhead = fals
     window.__bench.samplePlayhead = false;
   });
   const bench = await page.evaluate(() => {
-    const { contexts, current, baseDraw, lastBaseDraw, elementPlayheadX, ...rest } = window.__bench;
+    const { contexts, current, baseDraw, lastBaseDraw, elementPlayheadX, startSampler, ...rest } =
+      window.__bench;
     const result = {
       ...rest,
       baseDraws: [lastBaseDraw, ...rest.baseDraws].filter(Boolean),

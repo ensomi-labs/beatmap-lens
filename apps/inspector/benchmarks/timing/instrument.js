@@ -8,12 +8,12 @@
 //   style, layout, paint and commit on the main thread);
 // - playhead: the playhead's device x per frame: from the overlay canvas's fillRect in the
 //   playhead colour (baseline), or from the playhead element's computed transform when
-//   `samplePlayhead` is on (engine build; reading it forces a style update, so it is off while
-//   main-thread time is measured);
+//   `samplePlayhead` is on (engine build; reading it forces a style update and runs a frame loop,
+//   so it is on only in the positions scenario);
 // - baseDraws: each redraw of the base canvas, its duration, how many mark lines it drew, and its
 //   proposal lines (one every 250 ms of source), so the analysis maps device x to source time
 //   without reading the page's state; the last draw before recording is kept as `lastBaseDraw`;
-// - stamps: AudioContext.getOutputTimestamp() every frame and every 4 ms;
+// - stamps: AudioContext.getOutputTimestamp() every 4 ms (and every frame while sampling);
 // - starts: every AudioBufferSourceNode.start(), with the context time when it was called;
 // - keys: each keydown's timeStamp and when the page received it;
 // - loafs: Long Animation Frame entries (frames over 50 ms), with their script attribution.
@@ -132,15 +132,19 @@
     bench.stamps.push([now(), stamp.contextTime, stamp.performanceTime, context.currentTime]);
   }
   setInterval(sample, 4);
+  // A frame loop of the instrument's own runs only while the playhead is sampled: a page with any
+  // animation-frame loop makes the compositor wait for the main thread, which is what the
+  // presented scenario must not have unless the app itself runs one.
   const sampleFrame = (ts) => {
+    if (!bench.samplePlayhead) return;
     sample();
-    if (bench.recording && bench.samplePlayhead) {
+    if (bench.recording) {
       const x = elementPlayheadX();
       if (x !== null) bench.playhead.push({ frame: bench.frame, ts, x, at: now() });
     }
     raf(sampleFrame);
   };
-  raf(sampleFrame);
+  bench.startSampler = () => raf(sampleFrame);
 
   const start = AudioBufferSourceNode.prototype.start;
   AudioBufferSourceNode.prototype.start = function (when, offset, duration) {

@@ -610,6 +610,7 @@ if (summary.apps.length) {
       (a) =>
         `${fmt(a.steady.rafIntervalMs)}/${fmt(a.steady.rafIntervalMs, "p95")}/${fmt(a.steady.rafIntervalMs, "max")}`,
     ),
+    row("steady: animation frames recorded", (a) => a.steady.frames),
     row("steady: long frames (>1.5× median)", (a) => a.steady.longFrames),
     row(
       "steady: rAF callbacks per frame p50/p95/max ms",
