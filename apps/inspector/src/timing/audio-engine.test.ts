@@ -1,10 +1,20 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { TimingAudioEngine } from "./audio-engine";
 
+/** What the test sees of an `AudioBufferSourceNode`: its options, start and stop. */
+interface SourceRecord {
+  started: boolean;
+  stopped: boolean;
+  at?: number;
+  offset?: number;
+  stopAt?: number;
+  options?: AudioBufferSourceOptions;
+}
+
 /** The Web Audio surface the engine uses, with a resume the test settles by hand. */
 const audio = vi.hoisted(() => ({
   resumes: [] as (() => void)[],
-  sources: [] as { started: boolean; stopped: boolean; at?: number; offset?: number }[],
+  sources: [] as SourceRecord[],
   context: undefined as
     | { currentTime: number; state: string; getOutputTimestamp: () => object }
     | undefined,
@@ -74,13 +84,11 @@ beforeEach(() => {
   vi.stubGlobal(
     "AudioBufferSourceNode",
     class extends Node {
-      readonly record: { started: boolean; stopped: boolean; at?: number; offset?: number } = {
-        started: false,
-        stopped: false,
-      };
+      readonly record: SourceRecord = { started: false, stopped: false };
       onended: (() => void) | null = null;
-      constructor() {
+      constructor(_context: unknown, options?: AudioBufferSourceOptions) {
         super();
+        if (options) this.record.options = options;
         audio.sources.push(this.record);
       }
       start(at?: number, offset?: number) {
@@ -88,8 +96,9 @@ beforeEach(() => {
         if (at !== undefined) this.record.at = at;
         if (offset !== undefined) this.record.offset = offset;
       }
-      stop() {
-        this.record.stopped = true;
+      stop(at?: number) {
+        if (at === undefined) this.record.stopped = true;
+        else this.record.stopAt = at;
       }
     },
   );
@@ -97,7 +106,6 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.unstubAllGlobals();
-  vi.restoreAllMocks();
 });
 
 function loaded() {
@@ -265,4 +273,31 @@ it("freezes where the playhead was when the context stops running mid-play, and 
   expect(engine.shownAt(nowMs, 0)).toBeCloseTo(2070, 6);
   setState("suspended");
   expect(engine.stop(0)).toBeCloseTo(2070, 6);
+});
+
+it("hands the source node the plan's loop edges and stop time, on whole frames", async () => {
+  const engine = loaded();
+  const first = engine.play({
+    fromMs: 90.01,
+    endMs: 10_000,
+    rate: 1,
+    loop: { startMs: 100.01, endMs: 200.02 },
+  });
+  audio.resumes[0]?.();
+  await first;
+  const looped = audio.sources.at(-1)?.options;
+  expect(looped).toMatchObject({ loop: true, playbackRate: 1 });
+  // 100.01 ms is frame 4410.4, 200.02 ms frame 8820.9: their nearest frames, never above them.
+  const frame = (seconds = Number.NaN) => seconds * 44_100;
+  expect(Math.ceil(frame(looped?.loopStart))).toBe(4410);
+  expect(frame(looped?.loopStart)).toBeCloseTo(4410, 9);
+  expect(Math.ceil(frame(looped?.loopEnd))).toBe(8821);
+  expect(frame(looped?.loopEnd)).toBeCloseTo(8821, 9);
+  expect(audio.sources.at(-1)?.stopAt).toBeUndefined();
+  // Not looping, at half speed: it stops when the end frame's sample has played.
+  void engine.play({ fromMs: 90.01, endMs: 200.02, rate: 0.5, loop: null });
+  const once = audio.sources.at(-1);
+  expect(once?.options).toMatchObject({ loop: false, playbackRate: 0.5 });
+  expect(once?.options?.loopStart).toBeUndefined();
+  expect(((once?.stopAt ?? 0) - (once?.at ?? 0)) * 44_100).toBeCloseTo((8821 - 3969) * 2, 6);
 });

@@ -142,7 +142,6 @@ afterEach(() => {
   app.unmount();
   document.body.replaceChildren();
   vi.unstubAllGlobals();
-  vi.restoreAllMocks();
 });
 
 function overlay(): HTMLCanvasElement {

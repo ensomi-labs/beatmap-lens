@@ -7,6 +7,7 @@ import { type BlindPassageRow, type OpenTiming, staleSessionError } from "./timi
 import type { PlayheadMotion } from "./timing/display";
 
 vi.mock("./timing/client", () => ({ timingJson: vi.fn(), timingRequest: vi.fn() }));
+const { motionAt } = await vi.hoisted(() => import("./timing/display"));
 const engine = vi.hoisted(() => ({
   plays: 0,
   loudness: [] as number[],
@@ -15,7 +16,7 @@ const engine = vi.hoisted(() => ({
   offsets: [] as number[],
   positionTimes: [] as (number | undefined)[],
   clicks: [] as (number[] | null)[],
-  instance: undefined as { onEnded?: (positionMs: number) => void } | undefined,
+  instance: undefined as { onEnded: ((positionMs: number) => void) | undefined } | undefined,
 }));
 vi.mock("./timing/audio-engine", () => ({
   TimingAudioEngine: class {
@@ -50,10 +51,12 @@ vi.mock("./timing/audio-engine", () => ({
       engine.offsets.push(offsetMs);
       return this.playing && engine.motion ? { ...engine.motion } : undefined;
     }
+    /** The motion at the frame time when one is set (it carries the offset), or `positionMs`. */
     shownAt(frameMs: number, offsetMs: number) {
       engine.offsets.push(offsetMs);
       engine.positionTimes.push(frameMs);
-      return this.playing ? engine.positionMs : undefined;
+      if (!this.playing) return undefined;
+      return engine.motion ? motionAt(engine.motion, frameMs) : engine.positionMs;
     }
     heardAt(nowMs: number) {
       engine.positionTimes.push(nowMs);
@@ -757,4 +760,105 @@ it("ends a play that ran out inside the passage's bounds, holding the playhead t
   expect(stage.props["playhead-ms"]).toBe(1000);
   expect(stage.props["playhead-motion"]).toBeUndefined();
   expect(hud()).toContain("00:01.000");
+});
+
+/** Fake timers and page clock, a 1000 px stage showing `view`, and playback started: page time. */
+async function playing(view: { startMs: number; msPerPx: number }): Promise<number> {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
+  onTestFinished(() => {
+    vi.useRealTimers();
+  });
+  stageEmit("resize", 1000, 1);
+  stageEmit("update:view", view);
+  await nextTick();
+  expect(stage.props.view).toEqual(view);
+  key(" ");
+  await vi.waitFor(() => expect(engine.plays).toBe(1));
+  return performance.now();
+}
+
+/** Moves the fake page clock to `atMs`, running the transport's timers on the way. */
+async function until(atMs: number) {
+  vi.advanceTimersByTime(atMs - performance.now());
+  await nextTick();
+}
+
+it("follows on the timer: a jump right when the playhead leaves the view, not up to 25 ms later", async () => {
+  await opened();
+  const view = { startMs: 300, msPerPx: 0.2 };
+  const t0 = await playing(view);
+  // Moving from 400 ms at page time t0 + 10: past the right edge (500 ms) at t0 + 110.
+  engine.motion = { startPerfMs: t0 + 10, holdMs: 400, speed: 1, firstEndMs: 1000, loop: null };
+  await until(t0 + 109.9);
+  expect(stage.props.view).toEqual(view);
+  // Checked 0.5 ms after the crossing, the delay rounded up to whole milliseconds: the playhead,
+  // placed at 15 % of the width, is at most 1.5 ms past the edge.
+  await until(t0 + 111.6);
+  const jumped = (stage.props.view as { startMs: number }).startMs + 30;
+  expect(jumped).toBeGreaterThanOrEqual(500.5);
+  expect(jumped).toBeLessThan(501.5);
+});
+
+it("follows a loop's wrap out of the view at the wrap", async () => {
+  await opened();
+  const view = { startMs: 300, msPerPx: 0.2 };
+  const t0 = await playing(view);
+  // From 450 ms, wrapping at 480 ms (page time t0 + 40) back to 150 ms, left of the view.
+  engine.motion = {
+    startPerfMs: t0 + 10,
+    holdMs: 450,
+    speed: 1,
+    firstEndMs: 480,
+    loop: { startMs: 150, endMs: 480 },
+  };
+  await until(t0 + 39.9);
+  expect(stage.props.view).toEqual(view);
+  await until(t0 + 41.6);
+  const jumped = (stage.props.view as { startMs: number }).startMs + 30;
+  expect(jumped).toBeGreaterThanOrEqual(150.5);
+  expect(jumped).toBeLessThan(151.5);
+});
+
+it("does not jump for the pre-roll just left of the view", async () => {
+  await opened();
+  const view = { startMs: 300, msPerPx: 0.2 };
+  const t0 = await playing(view);
+  // The pre-roll starts 50 ms (250 px) left of the view; 120 ms of pre-roll is 600 px.
+  engine.motion = { startPerfMs: t0 + 10, holdMs: 250, speed: 1, firstEndMs: 1000, loop: null };
+  await until(t0 + 100);
+  expect(stage.props.view).toEqual(view);
+});
+
+it("reads the exact playhead, not the HUD's readout, for zoom, the adjacent mark and loop edges", async () => {
+  await opened();
+  stageEmit("place", "beat", 340);
+  stageEmit("place", "beat", 380);
+  key("Escape");
+  await nextTick();
+  expect(stage.props["selected-ids"]).toEqual([]);
+  const view = { startMs: 300, msPerPx: 0.2 };
+  const t0 = await playing(view);
+  engine.motion = { startPerfMs: t0, holdMs: 300, speed: 1, firstEndMs: 1000, loop: null };
+  // A readout at the next step; 40 ms later the HUD still shows it, while the playhead is further.
+  await until(t0 + 25);
+  const readout = hud().match(/00:00\.(\d{3})/)?.[1];
+  await until(t0 + 65);
+  expect(hud()).toContain(`00:00.${readout}`);
+  const exactMs = 365;
+  // Zoom keeps the playhead where it is on screen.
+  key("+");
+  await nextTick();
+  const zoomed = stage.props.view as { startMs: number; msPerPx: number };
+  expect((exactMs - zoomed.startMs) / zoomed.msPerPx).toBeCloseTo((exactMs - 300) / 0.2, 6);
+  expect(engine.positionTimes.at(-1)).toBe(t0 + 65);
+  // ] selects the first mark after the playhead: 380 ms, where the readout would give 340 ms.
+  key("]");
+  await nextTick();
+  const marks = stage.props.marks as { id: string; time_ms: number }[];
+  expect(stage.props["selected-ids"]).toEqual([marks.find((mark) => mark.time_ms === 380)?.id]);
+  // I sets the loop start at the playhead (the play restarts for the new region).
+  key("i");
+  await nextTick();
+  expect(stage.props["loop-region"]).toEqual({ startMs: exactMs, endMs: 900 });
+  await vi.waitFor(() => expect(engine.plays).toBe(2));
 });

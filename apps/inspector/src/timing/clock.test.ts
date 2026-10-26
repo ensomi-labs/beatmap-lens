@@ -118,6 +118,34 @@ describe("OutputClock", () => {
     expect(often.line()).toEqual(once.line());
   });
 
+  it("keeps the newest stamp's offset with ratio 1 when the fitted rate is no device clock's", () => {
+    // 2000 ppm is beyond any device's drift: the line keeps ratio 1 at the median offset.
+    const clock = new OutputClock();
+    for (const stamp of stamps(90, 0))
+      clock.observe({ ...stamp, contextTime: stamp.contextTime * 1.002 });
+    expect(clock.line()?.ratio).toBe(1);
+  });
+
+  it("starts over when the context time goes backwards (a new context's clock)", () => {
+    const clock = new OutputClock();
+    for (const stamp of stamps(40, 0.1)) clock.observe(stamp);
+    expect(clock.observe({ contextTime: 0.5, performanceTime: 9000 })).toBe(true);
+    expect(clock.line()).toEqual({ perfMs: 9000, ctxS: 0.5, ratio: 1 });
+  });
+
+  it("gates out scattered stamps far off the line, and does not take them for a step", () => {
+    const clock = new OutputClock();
+    // One stamp in four reads 8 ms late, beyond the 5 ms gate: never three in a row.
+    const all = stamps(90, 0.05).map((stamp, index) =>
+      index % 4 === 3 ? { ...stamp, performanceTime: stamp.performanceTime + 8 } : stamp,
+    );
+    for (const stamp of all) clock.observe(stamp);
+    const line = clock.line();
+    if (!line) throw new Error("No line");
+    for (const t of [2600, 2900, 2950])
+      expect(Math.abs(contextAt(line, t) - trueCtx(t)) * 1000).toBeLessThan(0.05);
+  });
+
   it("starts over after a reset", () => {
     const clock = new OutputClock();
     for (const stamp of stamps(20, 0)) clock.observe(stamp);
