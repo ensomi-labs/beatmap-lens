@@ -1,576 +1,681 @@
 /**
- * Statistics from run.mjs output.
+ * Statistics from run.mjs output: every lab.json and <label>.json in a results directory.
  *
- *   node analyze.mjs RAW.json [--json SUMMARY.json]       one block per scenario run
- *   node analyze.mjs A.json B.json ...                     key metrics side by side (medians)
+ *   node analyze.mjs DIR [--json SUMMARY.json]     a Markdown summary on stdout
  *
- * The reference for "what is heard when" is the browser's own output clock: a robust straight-line
- * fit of every getOutputTimestamp() sample of the run (context time against performance time),
- * plus the music source's scheduled start. The fit stands in for the true clock: stamp errors are
- * its residuals. The drawn playhead is read in device pixels and mapped to source time through
- * the proposal bars drawn on the base canvas (one every 250 ms), so the page's state is never
- * read. Click timing is measured in the captured output against the pulses in the music itself.
+ * The reference for "what is heard when" is the page's own output clock: a robust straight line
+ * through every distinct getOutputTimestamp() pair of a run, plus the music source's scheduled
+ * start (from the start() calls). The drawn playhead is read in device pixels (canvas fillRect,
+ * element transform, or screencast pixels) and mapped to source time through the proposal bars of
+ * the base canvas (one every 250 ms of source), so the page's state is never read.
  */
-import { readFileSync, writeFileSync } from "node:fs";
+import { readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { parseArgs } from "node:util";
-import { clickOffsetSamples, recordings } from "./session.mjs";
+import { OutputClock } from "../../src/timing/clock.ts";
 
-const quantile = (values, p) => {
-  if (!values.length) return null;
-  const sorted = [...values].sort((a, b) => a - b);
-  const at = p * (sorted.length - 1);
-  const low = Math.floor(at);
-  return sorted[low] + (sorted[Math.min(low + 1, sorted.length - 1)] - sorted[low]) * (at - low);
+const { positionals, values } = parseArgs({
+  allowPositionals: true,
+  options: { json: { type: "string" } },
+});
+const dir = positionals[0];
+if (!dir) {
+  process.stderr.write("Usage: analyze.mjs DIR [--json SUMMARY.json]\n");
+  process.exit(1);
+}
+
+// --- Statistics ---------------------------------------------------------------------------------
+
+const sorted = (values) => values.filter(Number.isFinite).sort((a, b) => a - b);
+function quantile(values, p) {
+  const s = sorted(values);
+  if (!s.length) return null;
+  const i = (s.length - 1) * p;
+  const lo = Math.floor(i);
+  const hi = Math.ceil(i);
+  return s[lo] + (s[hi] - s[lo]) * (i - lo);
+}
+const mean = (values) => {
+  const s = values.filter(Number.isFinite);
+  return s.length ? s.reduce((a, b) => a + b, 0) / s.length : null;
 };
-const mean = (values) => (values.length ? values.reduce((a, b) => a + b, 0) / values.length : null);
-const sd = (values) => {
-  if (values.length < 2) return null;
-  const m = mean(values);
-  return Math.sqrt(values.reduce((a, b) => a + (b - m) ** 2, 0) / (values.length - 1));
-};
+function sd(values) {
+  const s = values.filter(Number.isFinite);
+  const m = mean(s);
+  return s.length > 1 ? Math.sqrt(s.reduce((a, b) => a + (b - m) ** 2, 0) / (s.length - 1)) : null;
+}
 const round = (value, digits = 3) =>
-  value === null || value === undefined || Number.isNaN(value) ? null : Number(value.toFixed(digits));
+  value === null || value === undefined || !Number.isFinite(value)
+    ? null
+    : Number(value.toFixed(digits));
 function spread(values, digits = 3) {
+  const s = values.filter(Number.isFinite);
+  if (!s.length) return { n: 0 };
+  const abs = s.map(Math.abs);
   return {
-    n: values.length,
-    mean: round(mean(values), digits),
-    sd: round(sd(values), digits),
-    p50: round(quantile(values, 0.5), digits),
-    p90: round(quantile(values, 0.9), digits),
-    p99: round(quantile(values, 0.99), digits),
-    max: round(values.length ? Math.max(...values) : null, digits),
+    n: s.length,
+    mean: round(mean(s), digits),
+    sd: round(sd(s), digits),
+    p50: round(quantile(s, 0.5), digits),
+    p95: round(quantile(s, 0.95), digits),
+    max: round(Math.max(...s), digits),
+    min: round(Math.min(...s), digits),
+    p95abs: round(quantile(abs, 0.95), digits),
+    maxabs: round(Math.max(...abs), digits),
   };
 }
-
-/**
- * Robust straight-line fit of the output clock: offset o = contextTime·1000 − performanceTime (ms)
- * against performance time, over unique stamps after the first 250 ms. Residuals are the stamps'
- * own errors against that line.
- */
-export function fitClock(stamps) {
-  const unique = [];
-  let last = -1;
-  for (const [, contextTime, performanceTime] of stamps)
-    if (contextTime > 0 && performanceTime > 0 && performanceTime !== last) {
-      unique.push([performanceTime, contextTime * 1000 - performanceTime]);
-      last = performanceTime;
-    }
-  if (unique.length < 10) return null;
-  const settled = unique.filter(([t]) => t > unique[0][0] + 250);
-  const line = (points) => {
-    const mt = mean(points.map(([t]) => t));
-    const mo = mean(points.map(([, o]) => o));
-    let sxy = 0;
-    let sxx = 0;
-    for (const [t, o] of points) {
-      sxy += (t - mt) * (o - mo);
-      sxx += (t - mt) ** 2;
-    }
-    const b = sxx ? sxy / sxx : 0;
-    return { a: mo - b * mt, b };
-  };
-  const median = quantile(
-    settled.map(([, o]) => o),
-    0.5,
-  );
-  let fit = line(settled.filter(([, o]) => Math.abs(o - median) < 1.5));
-  const residuals = () => settled.map(([t, o]) => o - (fit.a + fit.b * t));
-  const mad = quantile(
-    residuals().map(Math.abs),
-    0.5,
-  );
-  const limit = Math.max(0.3, 3 * mad);
-  fit = line(settled.filter(([t, o]) => Math.abs(o - (fit.a + fit.b * t)) < limit));
-  const r = residuals();
-  const abs = r.map(Math.abs);
-  return {
-    a: fit.a,
-    b: fit.b,
-    /** Context time (s) being output at performance time `t` (ms). */
-    ctxAt: (t) => (t + fit.a + fit.b * t) / 1000,
-    /** Performance time (ms) at which context time `ctxS` is output. */
-    perfAt: (ctxS) => (ctxS * 1000 - fit.a) / (1 + fit.b),
-    summary: {
-      stamps: settled.length,
-      updateIntervalMs: round(quantile(settled.slice(1).map(([t], i) => t - settled[i][0]), 0.5)),
-      driftPpm: round(fit.b * 1e6, 1),
-      residualSdMs: round(sd(r)),
-      residualP99Ms: round(quantile(abs, 0.99)),
-      residualMaxMs: round(Math.max(...abs)),
-      over1ms: abs.filter((value) => value > 1).length,
-      over02ms: abs.filter((value) => value > 0.2).length,
-    },
-  };
+function median(values) {
+  return quantile(values, 0.5);
 }
 
-/** Music starts (the long buffers) with the sample Chromium starts from: the offset, rounded. */
-function musicStarts(run, sampleRate) {
-  return run.starts
-    .filter((start) => start.length > 100_000)
-    .map((start) => ({
-      ...start,
-      sampleRate,
-      startIndex: Math.round(start.offset * sampleRate),
-      startSourceMs: (Math.round(start.offset * sampleRate) * 1000) / sampleRate,
-    }));
-}
-
-/** Source ms heard at performance time `t` for a non-looping start, or null before it. */
-function idealAt(clock, start, t) {
-  const ctx = clock.ctxAt(t);
-  if (ctx < start.when) return null;
-  return start.startSourceMs + (ctx - start.when) * 1000 * start.rate;
-}
-
-/** Per frame: the drawn playhead's source time, from the proposal bars of the current view. */
-function drawnPlayhead(run, clock, start) {
-  const drawsByFrame = new Map();
-  for (const draw of run.playhead) if (draw.overlay !== false) drawsByFrame.set(draw.frame, draw);
-  const barsByFrame = new Map();
-  for (const bar of run.bars) {
-    if (!barsByFrame.has(bar.frame)) barsByFrame.set(bar.frame, []);
-    barsByFrame.get(bar.frame).push(bar.x + bar.w / 2);
+/** Least squares y = a + b x. */
+function lineFit(xs, ys) {
+  const n = xs.length;
+  const mx = mean(xs);
+  const my = mean(ys);
+  let sxx = 0;
+  let sxy = 0;
+  for (let i = 0; i < n; i++) {
+    sxx += (xs[i] - mx) ** 2;
+    sxy += (xs[i] - mx) * (ys[i] - my);
   }
-  const rows = [];
-  let mapping = null;
-  for (const frame of run.frames) {
-    const bars = barsByFrame.get(frame.frame);
-    if (bars && bars.length >= 2) {
-      const sorted = [...bars].sort((a, b) => a - b);
-      const step = quantile(
-        sorted.slice(1).map((c, i) => c - sorted[i]),
-        0.5,
-      );
-      // Least squares of centre against bar index, so the line is not one bar's rounding.
-      const index = sorted.map((c) => Math.round((c - sorted[0]) / step));
-      const mi = mean(index);
-      const mc = mean(sorted);
-      let sxy = 0;
-      let sxx = 0;
-      index.forEach((i, j) => {
-        sxy += (i - mi) * (sorted[j] - mc);
-        sxx += (i - mi) ** 2;
-      });
-      const pxPerBar = sxx ? sxy / sxx : step;
-      mapping = { c0: mc - pxPerBar * mi, msPerPx: 250 / pxPerBar, beat0: null };
-    }
-    const draw = drawsByFrame.get(frame.frame);
-    if (!draw || !mapping) {
-      rows.push({ frame, drawn: null });
-      continue;
-    }
-    const centre = draw.x + draw.w / 2;
-    const ideal = idealAt(clock, start, frame.ts);
-    if (mapping.beat0 === null) {
-      if (ideal === null) {
-        rows.push({ frame, drawn: null });
-        continue;
-      }
-      mapping.beat0 = 250 * Math.round((ideal - (centre - mapping.c0) * mapping.msPerPx) / 250);
-    }
-    rows.push({
-      frame,
-      draw,
-      drawn: mapping.beat0 + (centre - mapping.c0) * mapping.msPerPx,
-      msPerPx: mapping.msPerPx,
-    });
-  }
-  return rows;
+  const b = sxx ? sxy / sxx : 0;
+  return { a: my - b * mx, b };
 }
 
-function playbackStats(run) {
-  const sampleRate = run.contexts.at(-1)?.sampleRate;
-  const clock = fitClock(run.stamps);
-  const [start] = musicStarts(run, sampleRate);
-  if (!clock || !start) return { error: "no clock or no start" };
-  const startPerf = clock.perfAt(start.when);
-  const endPerf = run.frames.at(-1).ts;
-  // Steady state: from 300 ms after the first sample is heard to 300 ms before the stop.
-  const inside = (t) => t > startPerf + 300 && t < endPerf - 300;
-  const frames = run.frames.filter((f) => inside(f.ts));
-  const rows = drawnPlayhead(run, clock, start).filter((row) => inside(row.frame.ts));
-  const drawn = rows.filter((row) => row.drawn !== null);
-  const error = drawn.map((row) => row.drawn - idealAt(clock, start, row.frame.ts));
-  const errorAtDraw = drawn.map((row) => row.drawn - idealAt(clock, start, row.draw.at));
-  const centred = (values) => {
-    const m = quantile(values, 0.5);
-    return values.map((value) => Math.abs(value - m));
-  };
-  const steps = [];
-  for (let i = 1; i < drawn.length; i++) {
-    const a = drawn[i - 1];
-    const b = drawn[i];
-    if (b.frame.frame !== a.frame.frame + 1) continue;
-    steps.push(
-      b.drawn - a.drawn - (idealAt(clock, start, b.frame.ts) - idealAt(clock, start, a.frame.ts)),
+/** Robust line through points (x, y), rejecting residuals beyond 3 · 1.4826 · MAD twice. */
+function robustFit(xs, ys) {
+  let keep = xs.map((_, i) => i);
+  let fit = lineFit(xs, ys);
+  for (let pass = 0; pass < 3; pass++) {
+    const residuals = keep.map((i) => ys[i] - fit.a - fit.b * xs[i]);
+    const centre = median(residuals);
+    const mad = median(residuals.map((r) => Math.abs(r - centre)));
+    const bound = Math.max(1e-6, 3 * 1.4826 * mad);
+    const next = xs
+      .map((_, i) => i)
+      .filter((i) => Math.abs(ys[i] - fit.a - fit.b * xs[i]) <= bound);
+    if (next.length < 8) break;
+    keep = next;
+    fit = lineFit(
+      keep.map((i) => xs[i]),
+      keep.map((i) => ys[i]),
     );
   }
-  const intervals = frames.slice(1).map((f, i) => f.ts - frames[i].ts);
-  const out = {
-    clock: clock.summary,
-    frames: {
-      n: frames.length,
-      seconds: round((frames.at(-1).ts - frames[0].ts) / 1000, 2),
-      fps: round(frames.length / ((frames.at(-1).ts - frames[0].ts) / 1000), 1),
-      intervalMs: spread(intervals, 2),
-      over25ms: intervals.filter((value) => value > 25).length,
-      mainThreadMs: spread(
-        frames.map((f) => f.after - f.start),
-        2,
-      ),
-      callbackStartLagMs: spread(
-        frames.map((f) => f.start - f.ts),
-        2,
-      ),
-      over50msFromFrameStart: frames.filter((f) => f.after - f.ts > 50).length,
-    },
-    playhead: {
-      drawnFrames: drawn.length,
-      heldFrames: rows.length - drawn.length,
-      msPerDevicePx: round(drawn[0]?.msPerPx ?? null, 4),
-      quantisationSdMs: round(((drawn[0]?.msPerPx ?? 0) * 1) / Math.sqrt(12)),
-      errorAtFrameMs: spread(error),
-      errorAtFrameAbsDevMs: spread(centred(error)),
-      errorAtDrawMs: spread(errorAtDraw),
-      stepJitterMs: spread(steps),
-    },
-  };
-  const trace = run.trace;
-  if (trace && !trace.error) {
-    const presented = trace.frames.filter((f) => f.state?.startsWith("STATE_PRESENTED"));
-    const inWindow = trace.frames.filter((f) => inside(f.begin));
-    out.presentation = {
-      reporters: inWindow.length,
-      presented: inWindow.filter((f) => f.state?.startsWith("STATE_PRESENTED")).length,
-      dropped: inWindow.filter((f) => f.state === "STATE_DROPPED").length,
-    };
-    const latency = [];
-    const delay = [];
-    for (const row of drawn) {
-      const match = presented.find((f) => Math.abs(f.begin - row.frame.ts) < 1.5);
-      if (!match) continue;
-      delay.push(match.end - row.frame.ts);
-      latency.push(idealAt(clock, start, match.end) - row.drawn);
-    }
-    out.presentation.frameToPresentMs = spread(delay, 2);
-    out.presentation.heardMinusDrawnAtPresentMs = spread(latency);
-    out.presentation.heardMinusDrawnAbsDevMs = spread(centred(latency));
-    const phases = trace.phases.filter((p) => inside(p.start));
-    const sum = (name) => phases.filter((p) => p.name === name).reduce((a, p) => a + p.dur, 0);
-    const count = (name) => phases.filter((p) => p.name === name).length;
-    out.mainThread = {
-      beginMainFrameMs: spread(
-        phases.filter((p) => p.name === "ProxyMain::BeginMainFrame").map((p) => p.dur),
-        2,
-      ),
-      paintMsPerSecond: round(sum("Paint") / out.frames.seconds, 1),
-      layoutMsPerSecond: round(sum("Layout") / out.frames.seconds, 1),
-      layouts: count("Layout"),
-      minorGc: count("MinorGC"),
-      majorGc: count("MajorGC"),
-      gcMs: round(sum("MinorGC") + sum("MajorGC"), 1),
-    };
+  const residuals = xs.map((x, i) => ys[i] - fit.a - fit.b * x);
+  return { ...fit, residuals, kept: keep.length };
+}
+
+// --- Clock reference ----------------------------------------------------------------------------
+
+/** Distinct (performanceTime, contextTime) pairs of a run's stamps, in order. */
+function distinctStamps(stamps) {
+  const out = [];
+  let last = 0;
+  for (const [, contextTime, performanceTime] of stamps ?? []) {
+    if (!(contextTime > 0 && performanceTime > 0) || contextTime === last) continue;
+    last = contextTime;
+    out.push({ perfMs: performanceTime, ctxS: contextTime });
   }
   return out;
 }
 
-function tapStats(run) {
-  const sampleRate = run.contexts.at(-1)?.sampleRate;
-  const clock = fitClock(run.stamps);
-  const [start] = musicStarts(run, sampleRate);
-  const keys = run.keys.filter((k) => k.key === "b" && !k.repeat);
-  const marks = run.savedMarks.filter((m) => m.method === "key-playing").map((m) => m.time_ms);
-  marks.sort((a, b) => a - b);
-  if (!clock || !start || marks.length !== keys.length)
-    return { error: `keys ${keys.length}, key-playing marks ${marks.length}` };
-  const rows = keys.map((key, i) => ({
-    busy: i % 2 === 1,
-    error: marks[i] - idealAt(clock, start, key.timeStamp),
-    dispatch: key.at - key.timeStamp,
-  }));
-  const pick = (busy, field) => rows.filter((r) => r.busy === busy).map((r) => r[field]);
+/**
+ * The run's output clock as a robust line: offset (context ms − page ms) against page time.
+ * Returns ctxAt(perfMs) and perfAt(ctxS), and the stamps' residuals.
+ */
+function clockReference(stamps) {
+  const points = distinctStamps(stamps);
+  if (points.length < 8) return null;
+  const x0 = points[0].perfMs;
+  const fit = robustFit(
+    points.map((p) => p.perfMs - x0),
+    points.map((p) => p.ctxS * 1000 - p.perfMs),
+  );
+  const ratio = 1 + fit.b;
   return {
-    clock: clock.summary,
-    markMinusHeardMs: { calm: spread(pick(false, "error")), busy: spread(pick(true, "error")) },
-    dispatchDelayMs: { calm: spread(pick(false, "dispatch"), 2), busy: spread(pick(true, "dispatch"), 2) },
+    ctxAt: (perfMs) => (perfMs + fit.a + fit.b * (perfMs - x0)) / 1000,
+    perfAt: (ctxS) => (ctxS * 1000 - fit.a + fit.b * x0) / ratio,
+    ratio,
+    residualsMs: fit.residuals,
+    points,
   };
 }
 
-function startStats(run) {
-  const sampleRate = run.contexts.at(-1)?.sampleRate;
-  const clock = fitClock(run.stamps);
-  const starts = musicStarts(run, sampleRate);
-  const spaces = run.keys.filter((k) => k.key === " " && !k.repeat);
+/** The music start (the long buffer) closest before `at`, as an anchor in source ms. */
+function musicStarts(starts) {
+  return (starts ?? [])
+    .filter((s) => s.length > 20_000)
+    .map((s) => ({
+      at: s.at,
+      ctxNow: s.ctxNow,
+      whenS: s.when,
+      offsetMs: s.offset * 1000,
+      rate: s.rate,
+      loop: s.loop,
+    }));
+}
+
+/** Source ms heard at page time t for a non-looping start; the start position before it. */
+function heardAt(clock, start, t) {
+  const ctx = clock.ctxAt(t);
+  return start.offsetMs + Math.max(0, ctx - start.whenS) * 1000 * start.rate;
+}
+
+// --- Device x to source time --------------------------------------------------------------------
+
+/**
+ * Per base-canvas draw: device px per ms and the device x of some multiple of 250 ms, from the
+ * proposal bars (each drawn at floor(x), so its centre is within half a pixel).
+ */
+function barMappings(baseDraws) {
+  const out = [];
+  for (const draw of baseDraws ?? []) {
+    const bars = [...(draw.bars ?? [])].sort((a, b) => a - b);
+    if (bars.length < 2) continue;
+    const gaps = bars.slice(1).map((x, i) => x - bars[i]);
+    const pxPer250 = median(gaps);
+    if (!(pxPer250 > 0)) continue;
+    // Each bar's x minus its index times the spacing: their mean is the first bar's x.
+    const first = mean(bars.map((x) => x - Math.round((x - bars[0]) / pxPer250) * pxPer250));
+    out.push({ frame: draw.frame, pxPerMs: pxPer250 / 250, firstX: first });
+  }
+  return out;
+}
+
+/**
+ * Source time of device x under a mapping, choosing the multiple of 250 ms for the first bar that
+ * puts the result nearest `nearMs` (the audio clock's time, within ±125 ms by construction).
+ */
+function sourceOf(mapping, x, nearMs) {
+  const offsetMs = (x - mapping.firstX) / mapping.pxPerMs;
+  const k = Math.round((nearMs - offsetMs) / 250);
+  return k * 250 + offsetMs;
+}
+
+// --- Lab ------------------------------------------------------------------------------------------
+
+function labSummary(lab) {
+  const out = { browser: lab.browser, userAgent: lab.userAgent, machine: lab.machine };
+  const offline = lab.experiments?.offline;
+  out.offline = Array.isArray(offline)
+    ? offline.map((r) => ({
+        rate: r.rate,
+        name: r.name,
+        firstNonZero: r.firstNonZero,
+        ...(r.exact && {
+          exactMismatches: r.exact.mismatches,
+          exactMaxAbs: r.exact.maxAbs,
+          frames: r.exact.frames,
+        }),
+        ...(r.exactRounded && {
+          roundedMismatches: r.exactRounded.mismatches,
+          interpolatedMismatches: r.interpolated.mismatches,
+          interpolatedMaxAbs: r.interpolated.maxAbs,
+        }),
+        ...(r.linear && { linearMaxAbs: r.linear.maxAbs }),
+        ...(r.onsetErrorSamples !== undefined && {
+          onsetErrorSamples: round(r.onsetErrorSamples, 3),
+        }),
+        ...(r.passes && { passes: round(r.passes, 1) }),
+      }))
+    : offline;
+  const options = lab.experiments?.contextOptions;
+  out.contextOptions = Array.isArray(options)
+    ? options.map((o) => {
+        const points = distinctStamps(o.stamps);
+        const cadence = points.slice(1).map((p, i) => (p.ctxS - points[i].ctxS) * 1000);
+        const reference = clockReference(o.stamps);
+        // Online comparison at each stamp arrival + 5 ms: the newest stamp alone vs the model.
+        const clock = new OutputClock();
+        const latestErr = [];
+        const modelErr = [];
+        for (const p of points) {
+          clock.observe({ contextTime: p.ctxS, performanceTime: p.perfMs });
+          const t = p.perfMs + 5;
+          const truth = reference?.ctxAt(t);
+          const line = clock.line();
+          if (truth === undefined || !line) continue;
+          latestErr.push((p.ctxS + (t - p.perfMs) / 1000 - truth) * 1000);
+          modelErr.push((line.ctxS + ((t - line.perfMs) * line.ratio) / 1000 - truth) * 1000);
+        }
+        return {
+          latencyHint: o.latencyHint,
+          baseLatencyMs: round(o.baseLatency * 1000),
+          outputLatencyMs: round(o.outputLatency * 1000),
+          resumeRunningMs: spread(o.resumeRunningMs ?? []),
+          stampCadenceMs: spread(cadence),
+          stampResidualMs: reference ? spread(reference.residualsMs) : null,
+          ratioPpm: reference ? round((reference.ratio - 1) * 1e6, 1) : null,
+          latestStampErrorMs: spread(latestErr.slice(10)),
+          clockModelErrorMs: spread(modelErr.slice(10)),
+        };
+      })
+    : options;
+  const display = lab.experiments?.display;
+  out.display = Array.isArray(display) ? display.map(displaySummary) : display;
+  return out;
+}
+
+/** Presented positions against x(t) = speed · (t − t0 − D), with D fitted. */
+function displaySummary(run) {
+  const intervals = run.frames.slice(1).map((f, i) => f.ts - run.frames[i].ts);
+  const typical = median(intervals);
+  const presented = run.presented.filter((p) => p.x !== null && p.swapMs !== null);
+  const scale = presented[0] ? presented[0].imageWidth / 1470 : 2;
+  const moving = presented
+    .map((p) => ({ swapMs: p.swapMs, xCss: p.x / scale }))
+    .filter((p) => p.xCss > 5 && p.xCss < 1380);
+  const delays = moving.map((p) => p.swapMs - run.t0 - p.xCss / run.speedPxPerMs);
+  const D = median(delays);
+  let stale = 0;
+  for (let i = 1; i < moving.length; i++) {
+    const modelMoved = (moving[i].swapMs - moving[i - 1].swapMs) * run.speedPxPerMs;
+    if (modelMoved > 4 && Math.abs(moving[i].xCss - moving[i - 1].xCss) < 0.1) stale++;
+  }
+  return {
+    variant: run.variant,
+    load: run.load,
+    desynchronized: run.attributes?.desynchronized ?? null,
+    rafIntervalMs: spread(intervals),
+    longFrames: intervals.filter((i) => i > 1.5 * typical).length,
+    callbackDelayMs: spread(run.frames.map((f) => f.start - f.ts)),
+    presentedFrames: moving.length,
+    swapDelayMs: round(D),
+    presentedErrorMs: spread(delays.map((d) => d - D)),
+    staleFrames: stale,
+  };
+}
+
+// --- App ------------------------------------------------------------------------------------------
+
+function framesSummary(frames) {
+  const intervals = frames.slice(1).map((f, i) => f.ts - frames[i].ts);
+  const typical = median(intervals);
+  return {
+    frames: frames.length,
+    rafIntervalMs: spread(intervals),
+    longFrames: intervals.filter((i) => i > 1.5 * typical).length,
+    callbackMs: spread(frames.map((f) => f.cbMs)),
+    callbackDelayMs: spread(frames.map((f) => f.start - f.ts)),
+    mainThreadPerFrameMs: spread(frames.filter((f) => f.after).map((f) => f.after - f.start)),
+  };
+}
+
+function steadySummary(run) {
+  const trace = run.trace ?? {};
+  const gcMs = (trace.gc ?? []).reduce((a, g) => a + g.dur, 0);
+  return {
+    ...framesSummary(run.frames ?? []),
+    baseDraws: {
+      count: (run.baseDraws ?? []).length,
+      ms: spread((run.baseDraws ?? []).map((d) => d.end - d.start)),
+    },
+    loafs: run.loafs ? run.loafs.length : null,
+    loafMs: run.loafs ? spread(run.loafs.map((l) => l.duration)) : null,
+    gc: {
+      count: (trace.gc ?? []).length,
+      totalMs: round(gcMs),
+      maxMs: round(Math.max(0, ...(trace.gc ?? []).map((g) => g.dur))),
+    },
+    mainThreadBusy: trace.mainThread
+      ? round(trace.mainThread.taskMs / trace.mainThread.spanMs, 4)
+      : null,
+    frameStates: trace.frameStates ?? null,
+    animations: trace.animations ?? null,
+    contexts: run.contexts,
+    traceError: trace.error ?? null,
+  };
+}
+
+/**
+ * Per frame: the drawn playhead's source time against the audio clock at the frame time.
+ * Frames right before a base draw are skipped (a view jump moves the element before the bars).
+ */
+function positionsSummary(run) {
+  const clock = clockReference(run.stamps);
+  const start = musicStarts(run.starts)[0];
+  const mappings = barMappings(run.baseDraws);
+  if (!clock || !start || !mappings.length) return { error: "missing clock, start or bars" };
+  const drawFrames = new Set(mappings.map((m) => m.frame));
   const rows = [];
-  for (const start of starts) {
-    const key = spaces.filter((k) => k.at <= start.at).at(-1);
-    if (!key) continue;
-    const heard = clock.perfAt(start.when);
-    const lead = (start.when - start.ctxNow) * 1000;
+  for (const p of run.playhead ?? []) {
+    if (drawFrames.has(p.frame + 1)) continue;
+    const mapping = mappings.filter((m) => m.frame <= p.frame).at(-1);
+    if (!mapping) continue;
+    const audioMs = heardAt(clock, start, p.ts);
+    if (audioMs <= start.offsetMs + 1) continue;
+    rows.push({ ts: p.ts, shownMs: sourceOf(mapping, p.x, audioMs), audioMs, frame: p.frame });
+  }
+  // One sample per frame (the canvas may draw the playhead twice in a frame).
+  const byFrame = [...new Map(rows.map((r) => [r.frame, r])).values()];
+  const fit = lineFit(
+    byFrame.map((r) => r.ts),
+    byFrame.map((r) => r.shownMs),
+  );
+  return {
+    frames: byFrame.length,
+    mappings: mappings.length,
+    msPerDevicePx: round(1 / median(mappings.map((m) => m.pxPerMs)), 4),
+    shownMinusAudioMs: spread(byFrame.map((r) => r.shownMs - r.audioMs)),
+    straightLineResidualMs: spread(byFrame.map((r) => r.shownMs - fit.a - fit.b * r.ts)),
+    slope: round(fit.b, 6),
+  };
+}
+
+function tapsSummary(run) {
+  const clock = clockReference(run.stamps);
+  const start = musicStarts(run.starts)[0];
+  const keys = (run.keys ?? []).filter((k) => k.key === "b" && !k.repeat);
+  const marks = (run.savedMarks ?? [])
+    .filter((m) => m.method === "key-playing")
+    .map((m) => m.time_ms);
+  marks.sort((a, b) => a - b);
+  if (!clock || !start)
+    return { error: "missing clock or start", keys: keys.length, marks: marks.length };
+  const errors = keys.map((k, i) => (marks[i] ?? Number.NaN) - heardAt(clock, start, k.timeStamp));
+  const handlerDelay = keys.map((k) => k.at - k.timeStamp);
+  // Key to the base draw that first shows one more mark line.
+  const draws = run.baseDraws ?? [];
+  const visible = [];
+  let marksShown = draws.length ? Math.min(...draws.map((d) => d.marks)) : 0;
+  for (const k of keys) {
+    const draw = draws.find((d) => d.start >= k.at && d.marks > marksShown);
+    if (!draw) continue;
+    visible.push(draw.end - k.timeStamp);
+    marksShown = draw.marks;
+  }
+  return {
+    keys: keys.length,
+    marks: marks.length,
+    markMinusHeardMs: spread(errors),
+    markMinusHeardJankMs: spread(errors.filter((_, i) => i % 2)),
+    handlerDelayMs: spread(handlerDelay),
+    keyToMarkDrawnMs: spread(visible),
+  };
+}
+
+function clicksSummary(run) {
+  const start = musicStarts(run.starts)[0];
+  if (!start) return { error: "missing start" };
+  const clicks = (run.starts ?? []).filter((s) => s.length > 0 && s.length < 2000);
+  const lastCtx = Math.max(...(run.stamps ?? []).map((s) => s[3] ?? 0));
+  const expected = (run.beatsMs ?? [])
+    .filter((ms) => ms >= start.offsetMs)
+    .map((ms) => start.whenS + (ms - start.offsetMs) / start.rate / 1000)
+    .filter((ctx) => ctx < lastCtx - 0.05);
+  let onTime = 0;
+  let late = 0;
+  let missing = 0;
+  const errors = [];
+  const leads = [];
+  for (const ctx of expected) {
+    const match = clicks.filter((c) => Math.abs(c.when - ctx) < 1e-4 && c.length);
+    const last = match.at(-1);
+    if (!last) {
+      missing++;
+      continue;
+    }
+    errors.push((last.when - ctx) * 1e6);
+    leads.push((last.when - last.ctxNow) * 1000);
+    // A start under one render quantum ahead of the context's current time may already be late.
+    if (last.when - last.ctxNow < 128 / 48_000) late++;
+    else onTime++;
+  }
+  return {
+    expected: expected.length,
+    onTime,
+    late,
+    missing,
+    scheduled: clicks.length,
+    clickTimeErrorUs: spread(errors),
+    scheduledAheadMs: spread(leads),
+  };
+}
+
+function startSummary(run) {
+  const clock = clockReference(run.stamps);
+  const starts = musicStarts(run.starts);
+  const keys = (run.keys ?? []).filter((k) => k.key === " " && !k.repeat);
+  const rows = [];
+  for (const k of keys) {
+    const s = starts.find((s) => s.at >= k.at);
+    if (!s) continue;
     rows.push({
-      total: heard - key.timeStamp,
-      handling: start.at - key.timeStamp,
-      lead,
-      output: heard - start.at - lead,
+      handler: s.at - k.timeStamp,
+      lead: (s.whenS - s.ctxNow) * 1000,
+      heard: clock ? clock.perfAt(s.whenS) - k.timeStamp : null,
     });
   }
-  const pick = (field) => rows.map((r) => r[field]);
   return {
-    clock: clock?.summary,
-    keyToHeardMs: spread(pick("total"), 2),
-    keyToStartCallMs: spread(pick("handling"), 2),
-    scheduleLeadMs: spread(pick("lead"), 2),
-    startCallToOutputMs: spread(pick("output"), 2),
+    starts: rows.length,
+    keyToStartCallMs: spread(rows.map((r) => r.handler)),
+    scheduledLeadMs: spread(rows.map((r) => r.lead)),
+    keyToFirstSampleHeardMs: spread(rows.map((r) => r.heard)),
+    outputLatencyMs: run.contexts?.at(-1)?.outputLatency * 1000,
+    baseLatencyMs: run.contexts?.at(-1)?.baseLatency * 1000,
   };
 }
 
-/** The captured output as one array, in context-frame order. */
-function captured(part, sampleRate) {
-  const chunks = [...part.capture].sort((a, b) => a.playbackTime - b.playbackTime);
-  if (!chunks.length) return { samples: new Float32Array(0), gaps: 0, firstFrame: 0 };
-  const firstFrame = Math.round(chunks[0].playbackTime * sampleRate);
-  const lastFrame = Math.round(chunks.at(-1).playbackTime * sampleRate) + chunks.at(-1).left.length;
-  const samples = new Float32Array(lastFrame - firstFrame);
-  let gaps = 0;
-  let expected = firstFrame;
-  for (const chunk of chunks) {
-    const frame = Math.round(chunk.playbackTime * sampleRate);
-    if (frame !== expected) gaps++;
-    const left = Float32Array.from(Object.values(chunk.left));
-    samples.set(left, frame - firstFrame);
-    expected = frame + left.length;
+function presentedSummary(part) {
+  const clock = clockReference(part.stamps);
+  const start = musicStarts(part.starts)[0];
+  const mappings = barMappings(part.baseDraws);
+  if (!clock || !start || !mappings.length) return { error: "missing clock, start or bars" };
+  const mapping = mappings.at(-1);
+  const dpr = part.dpr ?? 2;
+  const rows = [];
+  for (const p of part.presented ?? []) {
+    if (p.x === null || p.swapMs === null) continue;
+    const scale = p.imageWidth / 1470;
+    const deviceX = (p.x / scale - part.stage.x) * dpr;
+    const audioMs = heardAt(clock, start, p.swapMs);
+    if (audioMs <= start.offsetMs + 20) continue;
+    rows.push({
+      swapMs: p.swapMs,
+      error: sourceOf(mapping, deviceX, audioMs) - audioMs,
+      x: deviceX,
+    });
   }
-  return { samples, gaps, firstFrame };
-}
-
-/** Left channel of a recording at the page's volume (0.5, exact in float32). */
-function leftAtVolume(name, volume) {
-  const data = recordings[name].make();
-  const left = new Float32Array(data.length / 2);
-  for (let i = 0; i < left.length; i++) left[i] = Math.fround(data[2 * i] * volume);
-  return left;
-}
-
-/**
- * Whether the captured music equals the buffer sample for sample: every non-zero captured sample
- * is looked up by value (almost all noise values are unique) and must continue the run of buffer
- * indexes; a loop wraps from its end frame to its start frame.
- */
-function exactness(part, sampleRate, volume) {
-  const { samples, gaps } = captured(part, sampleRate);
-  const left = leftAtVolume("noise48", volume);
-  const index = new Map();
-  left.forEach((value, i) => index.set(value, index.has(value) ? -1 : i));
-  const [start] = musicStarts(part, sampleRate);
-  let first = -1;
-  let inexact = 0;
-  let total = 0;
-  let wraps = 0;
-  let firstInexact = null;
-  let previous = null;
-  for (let n = 0; n < samples.length; n++) {
-    const value = samples[n];
-    if (value === 0) continue;
-    total++;
-    const i = index.get(value);
-    if (i === undefined) {
-      inexact++;
-      firstInexact ??= total;
-      previous = null;
-      continue;
-    }
-    if (i < 0) {
-      previous = previous === null ? null : previous + 1;
-      continue;
-    }
-    if (first < 0) first = i;
-    if (previous !== null && i !== previous + 1) wraps++;
-    previous = i;
-  }
+  const errors = rows.map((r) => r.error);
+  const m = median(errors);
+  let stale = 0;
+  for (let i = 1; i < rows.length; i++)
+    if (rows[i].swapMs - rows[i - 1].swapMs > 8 && Math.abs(rows[i].x - rows[i - 1].x) < 0.2)
+      stale++;
   return {
-    gaps,
-    captured: total,
-    inexact,
-    firstInexactAt: firstInexact,
-    wraps,
-    firstIndex: first,
-    expectedFirstIndex: start?.startIndex,
-    loopFrames: start?.loop
-      ? [round(start.loopStart * sampleRate, 4), round(start.loopEnd * sampleRate, 4)]
-      : null,
+    presentedFrames: rows.length,
+    msPerDevicePx: round(1 / mapping.pxPerMs, 4),
+    shownMinusHeardAtSwapMs: spread(errors),
+    deviationFromMedianMs: spread(errors.map((e) => e - m)),
+    staleFrames: stale,
   };
 }
 
-/** The click buffer the engine plays (must match clickSamples in audio-engine.ts), at a volume. */
-function clickTemplate(sampleRate, volume) {
-  return Float32Array.from({ length: Math.round(sampleRate * 0.012) }, (_, n) => {
-    const t = n / sampleRate;
-    return volume * 0.3 * Math.cos(2 * Math.PI * 2000 * t) * Math.exp(-t / 0.002);
-  });
+function appSummary(result) {
+  const s = result.scenarios ?? {};
+  const guard = (fn, value) => {
+    if (!value) return null;
+    if (value.error) return { error: value.error };
+    try {
+      return fn(value);
+    } catch (error) {
+      return { analysisError: String(error?.stack ?? error) };
+    }
+  };
+  return {
+    label: result.label,
+    browser: result.browser,
+    machine: result.machine,
+    smoke: s.smoke?.checks?.map((c) => ({ name: c.name, ok: c.ok })) ?? s.smoke,
+    steady: guard(steadySummary, s.steady),
+    positions: guard(positionsSummary, s.positions),
+    taps: guard(tapsSummary, s.taps),
+    clicks: guard(clicksSummary, s.clicks),
+    start: guard(startSummary, s.start),
+    presented: s.presented && {
+      none: guard(presentedSummary, s.presented.none),
+      burst: guard(presentedSummary, s.presented.burst),
+      error: s.presented.error,
+    },
+  };
 }
 
-/**
- * Each pulse in the captured output, and the click after it: the click's start is fitted to a
- * fraction of a sample (least squares over a linearly interpolated click template) and compared
- * with where the mark's source time is heard, offset/rate samples after the pulse.
- */
-function clickStats(part, sampleRate, volume) {
-  const { samples, gaps } = captured(part, sampleRate);
-  const [start] = musicStarts(part, sampleRate);
-  if (!start) return { error: "no music start" };
-  const rate = start.rate;
-  const template = clickTemplate(sampleRate, volume);
-  const at = (x) => {
-    if (x < 0 || x >= template.length - 1) return 0;
-    const i = Math.floor(x);
-    return template[i] + (template[i + 1] - template[i]) * (x - i);
-  };
-  const fit = (q, tau) => {
-    let sxy = 0;
-    let sxx = 0;
-    const from = q + Math.max(3, Math.floor(tau));
-    for (let n = from; n < from + 500 && n < samples.length; n++) {
-      const model = at(n - q - tau);
-      sxy += model * samples[n];
-      sxx += model * model;
-    }
-    const amplitude = sxx ? sxy / sxx : 0;
-    let sse = 0;
-    for (let n = from; n < from + 500 && n < samples.length; n++)
-      sse += (samples[n] - amplitude * at(n - q - tau)) ** 2;
-    return { sse, amplitude };
-  };
-  const errors = [];
-  const fractions = {};
-  let quietSince = 0;
-  for (let n = 0; n < samples.length; n++) {
-    if (Math.abs(samples[n]) < 0.02) continue;
-    if (n - quietSince < 20 || samples[n] < 0.1) {
-      quietSince = n;
-      continue;
-    }
-    // A pulse after quiet: its peak within two samples.
-    let q = n;
-    for (let m = n; m <= n + 2; m++) if (samples[m] > samples[q]) q = m;
-    let best = null;
-    for (const offset of clickOffsetSamples) {
-      const expected = offset / rate;
-      for (let tau = expected - 1.5; tau <= expected + 1.5; tau += 0.02) {
-        const { sse, amplitude } = fit(q, tau);
-        if (amplitude > 0 && (!best || sse < best.sse)) best = { sse, tau, expected, offset };
+// --- Report ---------------------------------------------------------------------------------------
+
+const files = readdirSync(dir).filter(
+  (name) => name.endsWith(".json") && !["summary.json", "environment.json"].includes(name),
+);
+const summary = { dir, apps: [] };
+for (const name of files.sort()) {
+  const result = JSON.parse(readFileSync(join(dir, name), "utf8"));
+  if (result.mode === "lab") summary.lab = labSummary(result);
+  else if (result.mode === "app") summary.apps.push(appSummary(result));
+}
+try {
+  summary.environment = JSON.parse(readFileSync(join(dir, "environment.json"), "utf8"));
+} catch {}
+if (values.json) writeFileSync(values.json, `${JSON.stringify(summary, null, 1)}\n`);
+
+const fmt = (s, key = "p50") => (s && s[key] !== undefined && s[key] !== null ? s[key] : "–");
+const lines = [`# Timing engine latency: ${dir}`, ""];
+if (summary.environment)
+  lines.push("```json", JSON.stringify(summary.environment, null, 1), "```", "");
+if (summary.apps.length) {
+  const header = ["metric", ...summary.apps.map((a) => a.label)];
+  const row = (name, pick) => [
+    name,
+    ...summary.apps.map((a) => {
+      try {
+        const value = pick(a);
+        return value === undefined || value === null
+          ? "–"
+          : typeof value === "object"
+            ? JSON.stringify(value)
+            : value;
+      } catch {
+        return "–";
       }
-    }
-    if (best) {
-      // Parabolic refinement around the best grid point.
-      const a = fit(q, best.tau - 0.02).sse;
-      const c = fit(q, best.tau + 0.02).sse;
-      const denominator = a - 2 * best.sse + c;
-      const tau = denominator > 0 ? best.tau + (0.02 * (a - c)) / (2 * denominator) : best.tau;
-      const error = tau - best.expected;
-      errors.push(error);
-      (fractions[best.offset] ??= []).push(error);
-    }
-    quietSince = n + 600;
-    n += 600;
-  }
-  return {
-    gaps,
-    rate,
-    clicks: errors.length,
-    errorSamples: spread(errors, 4),
-    errorMs: spread(
-      errors.map((e) => (e * 1000) / sampleRate),
-      5,
+    }),
+  ];
+  const rows = [
+    row("smoke failures", (a) =>
+      Array.isArray(a.smoke)
+        ? a.smoke
+            .filter((c) => !c.ok)
+            .map((c) => c.name)
+            .join("; ") || "none"
+        : "error",
     ),
-    byOffset: Object.fromEntries(
-      Object.entries(fractions).map(([offset, values]) => [offset, round(mean(values), 4)]),
+    row(
+      "steady: rAF interval p50/p95/max ms",
+      (a) =>
+        `${fmt(a.steady.rafIntervalMs)}/${fmt(a.steady.rafIntervalMs, "p95")}/${fmt(a.steady.rafIntervalMs, "max")}`,
     ),
-  };
+    row("steady: long frames (>1.5× median)", (a) => a.steady.longFrames),
+    row(
+      "steady: rAF callbacks per frame p50/p95/max ms",
+      (a) =>
+        `${fmt(a.steady.callbackMs)}/${fmt(a.steady.callbackMs, "p95")}/${fmt(a.steady.callbackMs, "max")}`,
+    ),
+    row(
+      "steady: main thread per frame p50/p95/max ms",
+      (a) =>
+        `${fmt(a.steady.mainThreadPerFrameMs)}/${fmt(a.steady.mainThreadPerFrameMs, "p95")}/${fmt(a.steady.mainThreadPerFrameMs, "max")}`,
+    ),
+    row("steady: main thread busy fraction", (a) => a.steady.mainThreadBusy),
+    row(
+      "steady: GC count / total ms / max ms",
+      (a) => `${a.steady.gc.count}/${a.steady.gc.totalMs}/${a.steady.gc.maxMs}`,
+    ),
+    row(
+      "steady: base draws / p50 / max ms",
+      (a) =>
+        `${a.steady.baseDraws.count}/${fmt(a.steady.baseDraws.ms)}/${fmt(a.steady.baseDraws.ms, "max")}`,
+    ),
+    row("steady: frame states", (a) => a.steady.frameStates),
+    row("steady: animations", (a) => a.steady.animations),
+    row(
+      "positions: shown − heard mean/sd ms",
+      (a) =>
+        `${fmt(a.positions.shownMinusAudioMs, "mean")}/${fmt(a.positions.shownMinusAudioMs, "sd")}`,
+    ),
+    row(
+      "positions: straight-line residual sd/p95abs/maxabs ms",
+      (a) =>
+        `${fmt(a.positions.straightLineResidualMs, "sd")}/${fmt(a.positions.straightLineResidualMs, "p95abs")}/${fmt(a.positions.straightLineResidualMs, "maxabs")}`,
+    ),
+    row(
+      "taps: mark − heard mean/sd/maxabs ms",
+      (a) =>
+        `${fmt(a.taps.markMinusHeardMs, "mean")}/${fmt(a.taps.markMinusHeardMs, "sd")}/${fmt(a.taps.markMinusHeardMs, "maxabs")}`,
+    ),
+    row(
+      "taps: key → mark drawn p50/max ms",
+      (a) => `${fmt(a.taps.keyToMarkDrawnMs)}/${fmt(a.taps.keyToMarkDrawnMs, "max")}`,
+    ),
+    row(
+      "clicks: expected / on time / late / missing",
+      (a) => `${a.clicks.expected}/${a.clicks.onTime}/${a.clicks.late}/${a.clicks.missing}`,
+    ),
+    row("clicks: time error max abs µs", (a) => fmt(a.clicks.clickTimeErrorUs, "maxabs")),
+    row("start: key → start() p50 ms", (a) => fmt(a.start.keyToStartCallMs)),
+    row(
+      "start: key → first sample heard p50/max ms",
+      (a) =>
+        `${fmt(a.start.keyToFirstSampleHeardMs)}/${fmt(a.start.keyToFirstSampleHeardMs, "max")}`,
+    ),
+    row(
+      "presented (no load): shown − heard at swap median, deviation sd/maxabs ms",
+      (a) =>
+        `${fmt(a.presented.none.shownMinusHeardAtSwapMs)}, ${fmt(a.presented.none.deviationFromMedianMs, "sd")}/${fmt(a.presented.none.deviationFromMedianMs, "maxabs")}`,
+    ),
+    row(
+      "presented (no load): frames / stale",
+      (a) => `${a.presented.none.presentedFrames}/${a.presented.none.staleFrames}`,
+    ),
+    row(
+      "presented (80 ms stalls): median, deviation sd/maxabs ms",
+      (a) =>
+        `${fmt(a.presented.burst.shownMinusHeardAtSwapMs)}, ${fmt(a.presented.burst.deviationFromMedianMs, "sd")}/${fmt(a.presented.burst.deviationFromMedianMs, "maxabs")}`,
+    ),
+    row(
+      "presented (80 ms stalls): frames / stale",
+      (a) => `${a.presented.burst.presentedFrames}/${a.presented.burst.staleFrames}`,
+    ),
+  ];
+  lines.push(`| ${header.join(" | ")} |`, `| ${header.map(() => "---").join(" | ")} |`);
+  for (const r of rows) lines.push(`| ${r.join(" | ")} |`);
+  lines.push("");
 }
-
-export function analyseRun(run) {
-  if (run.scenario === "taps") return tapStats(run);
-  if (run.scenario === "start") return startStats(run);
-  if (run.scenario === "capture") {
-    const sampleRate = run.seek.contexts.at(-1)?.sampleRate ?? 48_000;
-    const volume = 0.5;
-    return {
-      seek: exactness(run.seek, sampleRate, volume),
-      loop: exactness(run.loop, sampleRate, volume),
-      clicks: clickStats(run.clicks, sampleRate, volume),
-      clicksHalf: clickStats(run.clicksHalf, sampleRate, volume),
-      clicksLoop: clickStats(run.clicksLoop, sampleRate, volume),
-      errors: run.errors,
-    };
-  }
-  return { ...playbackStats(run), errors: run.errors };
+if (summary.lab) {
+  lines.push(
+    "## Lab",
+    "",
+    "Offline exactness:",
+    "",
+    "```json",
+    JSON.stringify(summary.lab.offline, null, 1),
+    "```",
+    "",
+  );
+  lines.push(
+    "AudioContext options:",
+    "",
+    "```json",
+    JSON.stringify(summary.lab.contextOptions, null, 1),
+    "```",
+    "",
+  );
+  if (Array.isArray(summary.lab.display)) {
+    lines.push(
+      "| variant | load | desync | rAF p95 ms | long frames | callback delay p50/p95 ms | presented | swap delay ms | presented error sd/p95abs/maxabs ms | stale |",
+      "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+    );
+    for (const d of summary.lab.display)
+      lines.push(
+        `| ${d.variant} | ${d.load} | ${d.desynchronized} | ${fmt(d.rafIntervalMs, "p95")} | ${d.longFrames} | ${fmt(d.callbackDelayMs)}/${fmt(d.callbackDelayMs, "p95")} | ${d.presentedFrames} | ${d.swapDelayMs} | ${fmt(d.presentedErrorMs, "sd")}/${fmt(d.presentedErrorMs, "p95abs")}/${fmt(d.presentedErrorMs, "maxabs")} | ${d.staleFrames} |`,
+      );
+  } else lines.push("Display:", "```json", JSON.stringify(summary.lab.display), "```");
 }
-
-/** The handful of numbers compared across builds. */
-function keyMetrics(scenario, s) {
-  if (scenario === "taps")
-    return {
-      tapErrSdCalm: s.markMinusHeardMs?.calm.sd,
-      tapErrSdBusy: s.markMinusHeardMs?.busy.sd,
-      tapErrMeanBusy: s.markMinusHeardMs?.busy.mean,
-    };
-  if (scenario === "start")
-    return { keyToHeardP50: s.keyToHeardMs?.p50, startLeadP50: s.scheduleLeadMs?.p50 };
-  if (scenario === "capture")
-    return {
-      seekInexact: s.seek?.inexact,
-      loopInexact: s.loop?.inexact,
-      clickErrSdSamples: s.clicks?.errorSamples.sd,
-      clickHalfErrSdSamples: s.clicksHalf?.errorSamples.sd,
-      clickLoopMaxSamples: s.clicksLoop?.errorSamples.max,
-    };
-  return {
-    fps: s.frames?.fps,
-    mainP50: s.frames?.mainThreadMs.p50,
-    mainP90: s.frames?.mainThreadMs.p90,
-    over25: s.frames?.over25ms,
-    held: s.playhead?.heldFrames,
-    errSd: s.playhead?.errorAtFrameMs.sd,
-    errDevP99: s.playhead?.errorAtFrameAbsDevMs.p99,
-    stepSd: s.playhead?.stepJitterMs.sd,
-    presentDelayP50: s.presentation?.frameToPresentMs.p50,
-    lagSd: s.presentation?.heardMinusDrawnAtPresentMs.sd,
-    lagDevP99: s.presentation?.heardMinusDrawnAbsDevMs.p99,
-    stampSd: s.clock?.residualSdMs,
-    stampOver1: s.clock?.over1ms,
-    gcMs: s.mainThread?.gcMs,
-  };
-}
-
-if (import.meta.url === `file://${process.argv[1]}`) {
-  const { positionals, values } = parseArgs({
-    allowPositionals: true,
-    options: { json: { type: "string" } },
-  });
-  const files = positionals.map((path) => ({ path, raw: JSON.parse(readFileSync(path, "utf8")) }));
-  const summaries = files.map(({ path, raw }) => ({
-    path,
-    label: raw.label,
-    runs: raw.runs.map((run) => ({ scenario: run.scenario, repeat: run.repeat, stats: analyseRun(run) })),
-  }));
-  if (values.json) writeFileSync(values.json, JSON.stringify(summaries, null, 1));
-  if (summaries.length === 1) {
-    for (const run of summaries[0].runs)
-      console.log(`## ${run.scenario} #${run.repeat + 1}\n${JSON.stringify(run.stats, null, 1)}`);
-  } else {
-    const scenarios = [...new Set(summaries.flatMap((s) => s.runs.map((r) => r.scenario)))];
-    for (const scenario of scenarios) {
-      console.log(`## ${scenario}`);
-      const table = {};
-      for (const summary of summaries) {
-        const runs = summary.runs.filter((r) => r.scenario === scenario);
-        const metrics = runs.map((r) => keyMetrics(scenario, r.stats));
-        const names = Object.keys(metrics[0] ?? {});
-        table[summary.label || summary.path] = Object.fromEntries(
-          names.map((name) => [name, round(quantile(metrics.map((m) => m[name]).filter((v) => v !== null && v !== undefined), 0.5))]),
-        );
-      }
-      console.table(table);
-    }
-  }
-}
+process.stdout.write(`${lines.join("\n")}\n`);

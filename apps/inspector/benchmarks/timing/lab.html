@@ -1,0 +1,343 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Timing lab</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        background: #101820;
+        overflow: hidden;
+      }
+      #stage {
+        position: relative;
+        width: 1470px;
+        height: 400px;
+        overflow: hidden;
+      }
+      #stage canvas {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+      }
+      .line {
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 1px;
+        height: 400px;
+        background: #ff4d4f;
+        will-change: transform;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="stage"></div>
+    <script>
+      // Isolated experiments for the Timing engine, driven by run.mjs. Nothing here imports the
+      // app: each experiment reproduces one browser behaviour the engine relies on.
+
+      /** A deterministic generator in [0, 1). */
+      function random(seed) {
+        let state = seed >>> 0 || 1;
+        return () => {
+          state ^= state << 13;
+          state >>>= 0;
+          state ^= state >>> 17;
+          state ^= state << 5;
+          state >>>= 0;
+          return state / 2 ** 32;
+        };
+      }
+
+      function noise(length, seed) {
+        const next = random(seed);
+        return Float32Array.from({ length }, () => (next() * 2 - 1) * 0.25);
+      }
+
+      /** The engine's whole-frame rule (src/timing/transport.ts frameTime), repeated here. */
+      function frameTime(frame, rate) {
+        let seconds = frame / rate;
+        while (seconds * rate > frame) seconds -= Number.EPSILON * Math.max(1, seconds);
+        return seconds;
+      }
+
+      function interp(data, position) {
+        const i = Math.floor(position);
+        const f = position - i;
+        const a = data[i] ?? 0;
+        const b = data[i + 1] ?? 0;
+        return a + (b - a) * f;
+      }
+
+      async function render(rate, seconds, setup) {
+        const context = new OfflineAudioContext(1, Math.round(rate * seconds), rate);
+        setup(context);
+        return (await context.startRendering()).getChannelData(0);
+      }
+
+      function bufferOf(context, data) {
+        const buffer = new AudioBuffer({ length: data.length, sampleRate: context.sampleRate });
+        buffer.copyToChannel(data, 0);
+        return buffer;
+      }
+
+      /** Bitwise comparison of out[first + k] with expected(k) over `count` frames. */
+      function compare(out, first, count, expected) {
+        let mismatches = 0;
+        let maxAbs = 0;
+        for (let k = 0; k < count; k++) {
+          const value = out[first + k];
+          const want = expected(k);
+          if (value !== Math.fround(want)) mismatches++;
+          maxAbs = Math.max(maxAbs, Math.abs(value - want));
+        }
+        return { mismatches, frames: count, maxAbs };
+      }
+
+      function firstNonZero(out) {
+        for (let i = 0; i < out.length; i++) if (out[i] !== 0) return i;
+        return -1;
+      }
+
+      /**
+       * L1. Offline exactness: does a start, an offset or a loop edge between frames change the
+       * samples, and does the whole-frame plan keep them exact? Plus where a click started
+       * between frames puts its onset.
+       */
+      async function offlineExactness() {
+        const results = [];
+        for (const rate of [44_100, 48_000]) {
+          const data = noise(rate * 2, rate);
+          const whenS = 0.0123456;
+          const offsetS = 0.3333333;
+          const whenFrame = Math.ceil(whenS * rate);
+          const offsetFrame = Math.round(offsetS * rate);
+          const run = async (name, setup, check) => {
+            const out = await render(rate, 1.2, (context) => setup(context, bufferOf(context, data)));
+            results.push({ rate, name, firstNonZero: firstNonZero(out), ...check(out) });
+          };
+          // A: start and offset as asked (fractional).
+          await run(
+            "start-fractional",
+            (context, buffer) => {
+              const source = new AudioBufferSourceNode(context, { buffer });
+              source.connect(context.destination);
+              source.start(whenS, offsetS);
+            },
+            (out) => {
+              const first = firstNonZero(out);
+              const exactRounded = compare(out, first, 20_000, (k) => data[offsetFrame + k]);
+              const interpolated = compare(out, first, 20_000, (k) =>
+                interp(data, offsetS * rate + (first + k - whenS * rate)),
+              );
+              return { exactRounded, interpolated };
+            },
+          );
+          // B: the plan's whole frames.
+          await run(
+            "start-planned",
+            (context, buffer) => {
+              const source = new AudioBufferSourceNode(context, { buffer });
+              source.connect(context.destination);
+              source.start(frameTime(whenFrame, rate), frameTime(offsetFrame, rate));
+            },
+            (out) => ({
+              expectedFirst: whenFrame,
+              exact: compare(out, whenFrame, 20_000, (k) => data[offsetFrame + k]),
+            }),
+          );
+          // C and D: a 50 ms loop with fractional edges, then with the plan's frames.
+          const loopStartS = 0.51234567;
+          const loopEndS = 0.56234567;
+          const loopStart = Math.round(loopStartS * rate);
+          const loopEnd = Math.round(loopEndS * rate);
+          const length = loopEnd - loopStart;
+          for (const planned of [false, true]) {
+            await run(
+              planned ? "loop-planned" : "loop-fractional",
+              (context, buffer) => {
+                const source = new AudioBufferSourceNode(context, {
+                  buffer,
+                  loop: true,
+                  loopStart: planned ? frameTime(loopStart, rate) : loopStartS,
+                  loopEnd: planned ? frameTime(loopEnd, rate) : loopEndS,
+                });
+                source.connect(context.destination);
+                source.start(frameTime(whenFrame, rate), frameTime(loopStart, rate));
+              },
+              (out) => {
+                const count = Math.floor(rate * 1.1) - whenFrame;
+                return {
+                  passes: count / length,
+                  exact: compare(out, whenFrame, count, (k) => data[loopStart + (k % length)]),
+                };
+              },
+            );
+          }
+          // E: clicks started between frames.
+          const template = Float32Array.from({ length: Math.round(rate * 0.012) }, (_, index) => {
+            const t = index / rate;
+            return 0.3 * Math.cos(2 * Math.PI * 2000 * t) * Math.exp(-t / 0.002);
+          });
+          for (const fraction of [0, 0.25, 0.5, 0.75]) {
+            const at = (1000 + fraction) / rate;
+            const out = await render(rate, 0.1, (context) => {
+              const source = new AudioBufferSourceNode(context, { buffer: bufferOf(context, template) });
+              source.connect(context.destination);
+              source.start(at);
+            });
+            // Least-squares onset over a 0.005-sample grid, against the template interpolated.
+            let best = { shift: 0, error: Number.POSITIVE_INFINITY };
+            for (let shift = 1000 + fraction - 2; shift <= 1000 + fraction + 2; shift += 0.005) {
+              let error = 0;
+              for (let n = 995; n < 995 + template.length + 10; n++) {
+                const position = n - shift;
+                const want = position < 0 ? 0 : interp(template, position);
+                error += (out[n] - want) ** 2;
+              }
+              if (error < best.error) best = { shift, error };
+            }
+            results.push({
+              rate,
+              name: `click-${fraction}`,
+              intendedFrame: 1000 + fraction,
+              firstNonZero: firstNonZero(out),
+              onsetErrorSamples: best.shift - (1000 + fraction),
+              residual: best.error,
+            });
+          }
+          // F: rate 0.5 keeps the time mapping (interpolated by design).
+          await run(
+            "rate-half",
+            (context, buffer) => {
+              const source = new AudioBufferSourceNode(context, { buffer, playbackRate: 0.5 });
+              source.connect(context.destination);
+              source.start(frameTime(whenFrame, rate), frameTime(offsetFrame, rate));
+            },
+            (out) => ({
+              linear: compare(out, whenFrame, 20_000, (k) => interp(data, offsetFrame + k * 0.5)),
+            }),
+          );
+        }
+        return results;
+      }
+
+      /**
+       * L2. AudioContext options: what each latency hint reports, how often the output stamp
+       * changes, and how long resume() takes on a running context. The page is muted by the
+       * harness, so the output device is Chromium's muted (fake) stream, not CoreAudio.
+       */
+      async function contextOptions(latencyHint, seconds) {
+        const context = new AudioContext({ sampleRate: 48_000, latencyHint });
+        await context.resume();
+        const stamps = [];
+        let last = 0;
+        const started = performance.now();
+        await new Promise((done) => {
+          const timer = setInterval(() => {
+            const stamp = context.getOutputTimestamp();
+            if (stamp.contextTime !== last) {
+              last = stamp.contextTime;
+              stamps.push([performance.now(), stamp.contextTime, stamp.performanceTime, context.currentTime]);
+            }
+            if (performance.now() - started > seconds * 1000) {
+              clearInterval(timer);
+              done();
+            }
+          }, 1);
+        });
+        const resumes = [];
+        for (let i = 0; i < 5; i++) {
+          const t0 = performance.now();
+          await context.resume();
+          resumes.push(performance.now() - t0);
+        }
+        const result = {
+          latencyHint,
+          sampleRate: context.sampleRate,
+          baseLatency: context.baseLatency,
+          outputLatency: context.outputLatency,
+          resumeRunningMs: resumes,
+          stamps,
+        };
+        await context.close();
+        return result;
+      }
+
+      /**
+       * L3. Display variants: one moving line, drawn five ways, with optional main-thread load.
+       * x(t) = speed · (t − t0) CSS px from the left edge; the harness reads the presented frames.
+       */
+      const speedPxPerMs = 0.5;
+      const loads = {
+        none: { steadyMs: 0, burstMs: 0 },
+        steady8: { steadyMs: 8, burstMs: 0 },
+        burst: { steadyMs: 0, burstMs: 80 },
+        both: { steadyMs: 8, burstMs: 80 },
+      };
+
+      function busy(ms) {
+        const until = performance.now() + ms;
+        while (performance.now() < until);
+      }
+
+      async function displayVariant(variant, loadName, seconds) {
+        const stage = document.getElementById("stage");
+        stage.replaceChildren();
+        const dpr = window.devicePixelRatio || 1;
+        const load = loads[loadName];
+        const t0 = performance.now() + 200;
+        const xAt = (t) => Math.max(0, (t - t0) * speedPxPerMs);
+        const frames = [];
+        let draw = () => {};
+        let attributes = null;
+        if (variant.startsWith("canvas")) {
+          const canvas = document.createElement("canvas");
+          canvas.width = 1470 * dpr;
+          canvas.height = 400 * dpr;
+          stage.append(canvas);
+          const context = canvas.getContext("2d", variant === "canvas-desync" ? { desynchronized: true } : {});
+          attributes = context.getContextAttributes?.() ?? null;
+          draw = (x) => {
+            context.clearRect(0, 0, canvas.width, canvas.height);
+            context.fillStyle = "#ff4d4f";
+            context.fillRect(Math.round(x * dpr), 0, Math.max(1, Math.round(dpr)), canvas.height);
+          };
+        } else {
+          const line = document.createElement("div");
+          line.className = "line";
+          stage.append(line);
+          if (variant === "waapi") {
+            const animation = line.animate(
+              [{ transform: "translateX(0px)" }, { transform: `translateX(${1400}px)` }],
+              { duration: 1400 / speedPxPerMs, iterations: 1, easing: "linear", fill: "both" },
+            );
+            animation.startTime = t0;
+          } else draw = (x) => (line.style.transform = `translateX(${x}px)`);
+        }
+        let running = true;
+        const frame = (ts) => {
+          if (!running) return;
+          const start = performance.now();
+          const at = variant === "canvas-now" ? start : ts;
+          const x = xAt(at);
+          draw(x);
+          if (load.steadyMs) busy(load.steadyMs);
+          frames.push({ ts, start, end: performance.now(), x: variant === "waapi" ? null : x });
+          requestAnimationFrame(frame);
+        };
+        requestAnimationFrame(frame);
+        const burst = load.burstMs ? setInterval(() => busy(load.burstMs), 500) : undefined;
+        await new Promise((done) => setTimeout(done, seconds * 1000));
+        running = false;
+        clearInterval(burst);
+        return { variant, load: loadName, t0, speedPxPerMs, dpr, attributes, frames, timeOrigin: performance.timeOrigin };
+      }
+
+      window.lab = { offlineExactness, contextOptions, displayVariant };
+    </script>
+  </body>
+</html>

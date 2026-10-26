@@ -2,14 +2,12 @@
  * Writes the synthetic timing session the latency harness plays: float32 PCM, the session file,
  * its identity key and, optionally, a marks file with one saved snapshot per passage.
  *
- * - `noise48`, `noise44`: 30 s of stereo white noise at 48 and 44.1 kHz, about −12 dBFS. Almost
- *   every sample value is distinct, so a captured output can be matched to the buffer sample by
- *   sample (the sample-exactness check). One proposal has a bar every 250 ms; the harness reads
- *   the drawn bars to learn the time axis, so it needs no access to the page's state.
+ * - `noise48`, `noise44`: 30 s of stereo white noise at 48 and 44.1 kHz, about −12 dBFS. Each
+ *   passage has one proposal with a bar every 250 ms; the harness reads the drawn bars to learn
+ *   the time axis, so it needs no access to the page's state.
  * - `pulses48`: 20 s of silence at 48 kHz with a one-sample pulse of 0.5 at every whole 500 ms.
  *   Each pulse from 1 s on has one saved beat mark after it, at an offset that cycles through
- *   `clickOffsetSamples`, so a click scheduled at a mark can be measured against the music's own
- *   samples in the captured output.
+ *   `clickOffsetSamples`, so clicks at marks sit at fractional sample positions.
  *
  * Usage: node session.mjs DIR [--marks N]
  */
@@ -68,11 +66,14 @@ export const recordings = {
   pulses48: { sampleRate: 48_000, seconds: 20, make: () => pulses(48_000, 20, 2) },
 };
 
-/** Passage id → recording and span; one proposal with a bar every 250 ms. */
+/**
+ * Passage id → recording and span; one proposal with a bar every 250 ms. Without saved marks the
+ * page opens the first passage, so the harness starts at 48 kHz.
+ */
 const passages = [
   { id: "p-noise48", recording: "noise48", startMs: 2000, endMs: 28_000 },
-  { id: "p-noise44", recording: "noise44", startMs: 2000, endMs: 28_000 },
   { id: "p-pulses48", recording: "pulses48", startMs: 1000, endMs: 19_000 },
+  { id: "p-noise44", recording: "noise44", startMs: 2000, endMs: 28_000 },
 ];
 
 /**
@@ -117,7 +118,9 @@ export function writeSession(dir, { marks = 0 } = {}) {
       flags: [],
       loudness_gain_db: 0,
       audio: audio[passage.recording],
-      proposals: [{ key: "p1", beats_ms: beats(0, recordings[passage.recording].seconds * 1000, 250) }],
+      proposals: [
+        { key: "p1", beats_ms: beats(0, recordings[passage.recording].seconds * 1000, 250) },
+      ],
     })),
   };
   const sessions = join(dir, "sessions");
