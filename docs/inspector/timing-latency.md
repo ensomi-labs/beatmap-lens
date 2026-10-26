@@ -34,12 +34,13 @@ clocks; the Vue components only wire them.
 | `audio-engine.ts` | Web Audio adapter: the context at the recording's rate, the music and click sources, feeding stamps to the clock model. A running context starts at once, without awaiting `resume()`. |
 | `playhead-layer.ts` | DOM adapter: the playhead element moved only by `transform`. Standing still, a transform placed like a mark of the same width; playing, the motion's pieces as Web Animations whose start times are page times, run by the compositor. |
 
-`TimingWorkspace.vue` runs no animation-frame loop while playing. A 25 ms timer step feeds the
-clock model, hands the stage a new motion only when `needsResync` says so, refreshes the HUD
-readout every 100 ms and follows the playhead; it also runs exactly when the playhead will leave
-the view or a loop wraps (`nextFollowCheckMs`), so follow jumps stay on time. `TimingStage.vue`
-places the playhead with the frame that redraws a new view, so the line never shows the new view
-over the old picture.
+`TimingWorkspace.vue` runs no animation-frame loop while playing: with one, a main-thread stall can
+hold even the compositor's playhead, by about a frame ([Measurements](#measurements)). A 25 ms timer
+step feeds the clock model, hands the stage a new motion only when `needsResync` says so, refreshes
+the HUD readout every 100 ms and follows the playhead; it also runs exactly when the playhead will
+leave the view or a loop wraps (`nextFollowCheckMs`), so follow jumps stay on time.
+`TimingStage.vue` places the playhead with the frame that redraws a new view, so the line never
+shows the new view over the old picture.
 
 Borrowed from ensomi-runtime (read only, commit `edf4066`), reimplemented and not depended on:
 the robust line fit of `drift` in `crates/generate/src/fitter/mel_phase.rs` (lines 101-120) for
@@ -51,7 +52,63 @@ code of its own (its core reads no clock), so nothing else transfers.
 
 ## Measurements
 
-MEASUREMENTS
+Three runs of the harness below on 2026-10-26, on a MacBook Air (Apple M5, macOS 27) in headless
+Google Chrome 155 with `--mute-audio`, each comparing builds in the same job against the version
+before the engine (`4954249`). The engine was measured with a frame loop (`f8f143b`, `73d5c7b`:
+five repeats in all) and as described above (`3a87776`, whose engine code is this branch's: two
+repeats; the engine column pools all seven). Ranges are the smallest and largest per-repeat
+values.
+
+| What | Before the engine | Engine | Kind |
+| --- | --- | --- | --- |
+| Drawn position minus the source heard at the frame's time stamp (0.5 ms per device pixel) | mean +1.9 to +2.3 ms, SD 0.64-1.41 ms | mean −0.17 to +0.05 ms, SD 0.07-0.20 ms | the mean is a constant the offset absorbs; the SD is jitter |
+| Presented playhead, 80 ms main-thread stalls every 500 ms | longest gap between frames 82-94 ms, error held up to 64-77 ms from its median | 31-35 ms, 21-25 ms | variable |
+| Presented playhead, idle | error within 8.4-9.7 ms of its median 95 % of the time (a 60 Hz frame holds each position) | the same | the display's |
+| Saved mark minus the source heard at the key's `timeStamp`, with and without 40 ms of work before the key | within 0.076 ms | within 0.026 ms | variable, negligible |
+| Clicks with 450 ms stalls every 1.3 s | 4 of 19 missing | none missing; every click on its sample | — |
+| Key to first sample heard, from a stop | 46.5-47.6 ms (p50) | 45.5-47.9 ms | constant (30 ms ahead plus the output) |
+| Main thread busy while playing at fine zoom (10 s) | 16-24 % | 10-13 % | — |
+| Garbage collections in those 10 s | 409-521 (98-129 ms) | 188-248 (51-71 ms) | — |
+
+In isolated lab pages (five repeats):
+
+- A start, an offset or a loop edge between sample frames is interpolated; on whole frames the
+  output is the source bit for bit. A click started between frames has its onset at its
+  fractional time. Hence `planPlay`.
+- Online, 5 ms after each output stamp, the clock model is within 0.010-0.030 ms (p95) of the
+  whole-run line, the newest stamp alone within 0.067-0.084 ms: better, and both far inside the
+  target on this timer-driven stream. CoreAudio's stamps may be noisier.
+- Latency hints change the reported base and output latency (16, 24, 32 ms) and the stamp
+  cadence, not the stamps' noise.
+- A Web Animation is presented about a frame sooner than a canvas drawn from the same frame time
+  while the main thread is idle (5.6-7.6 ms against 21.8-22.5 ms after the time it shows), and as
+  late as the canvas with main-thread work in its frames: its display delay changes by up to a
+  frame with load.
+- With 80 ms stalls, a canvas or a script-moved element freezes for the whole stall (gaps of
+  61-81 ms). A Web Animation in a page with no animation-frame loop is not held at all; with a
+  frame loop it is held about one extra frame per stall (gaps of 30-35 ms). With no frame loop
+  but a text readout changed every 100 ms from a timer, as the HUD does, it was not held in one
+  repeat and held like the frame loop in the other (two repeats).
+- A position computed from `performance.now()` in an animation-frame callback is 2-3 ms ahead of
+  one from the frame's time stamp (callbacks start that late), and noisier, except right after a
+  stall, when the late callback's frame time stamp is old. The compositor samples the playhead
+  at its own frame time, so stalls do not age it.
+
+What these runs did not show:
+
+- That the engine without a frame loop does better in the app than with one: in these runs the
+  harness sampled output stamps from a frame loop of its own in every scenario, so the page
+  always had one. It now runs only while positions are read.
+- Anything about CoreAudio, the real display, Arc, FineTune or the keyboard: a muted page plays
+  into Chromium's fake output stream, driven by a timer, and headless swap times are not light.
+  `owner-stamps.js` records the output stamps in Arc on the real device;
+  `calibration-session.mjs` writes ticks for setting the playhead offset by eye.
+
+Switching to this engine moves the drawn playhead by about 2 ms of source for the same offset (it
+draws the source heard at the frame's time stamp, where the old playhead drew it at its callback
+time, about 2 ms later), so the offset that matches comes out about 2 ms smaller in headless
+Chrome; the compositor's presentation can differ from the old canvas by up to a frame. Check the
+offset again after switching.
 
 ## FineTune in the output path
 
@@ -76,16 +133,18 @@ here, since the harness runs muted). What follows for the engine:
 
 ## Harness
 
-`apps/inspector/benchmarks/timing/` measures the engine and the baseline in the same job:
+`apps/inspector/benchmarks/timing/` measures several builds in the same job:
 
 ```sh
-apps/inspector/benchmarks/timing/mac-run.sh OUT [BASELINE_REF] [REPEATS]
+apps/inspector/benchmarks/timing/mac-run.sh OUT [REPEATS] [LABEL=REF ...]
 ```
 
-It builds both timing bundles, runs `run.mjs lab` and `run.mjs app` for each build in headless
-Chromium with `--mute-audio`, and writes raw JSON and `summary.md` (`analyze.mjs`). It needs
-Node 22.18+ and downloads `playwright-core` into a temporary directory; the repository does not
-depend on Playwright. Ports 4190-4199.
+The default builds are `baseline=4954249` and `engine=HEAD`. It builds one timing bundle per
+build from a temporary worktree, runs `run.mjs lab` (skipped with `LAB=0`) and then `run.mjs app`
+for each build in turn within each repeat, in headless Chromium with `--mute-audio`, and writes
+raw JSON and `summary.md` (`analyze.mjs DIR --json summary.json`). It needs Node 22.18+ and
+downloads `playwright-core` into a temporary directory; the repository does not depend on
+Playwright. Ports 4190-4199.
 
 Limits of the harness, which the owner's measurements cover:
 

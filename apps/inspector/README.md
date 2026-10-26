@@ -132,13 +132,12 @@ Open the printed address; it opens the session directly. Marks append to
 
 The moving playhead follows the audio output clock and the playhead offset,
 which corrects delay the browser cannot see. It runs on its own compositor
-layer from each frame's time stamp, so it keeps moving while the page is busy;
-the engine and its measurements are described in
-[Timing engine latency](../../docs/inspector/timing-latency.md). It shows which
-beat is sounding to about one display frame; place and check marks on the still
-waveform. After an
-output device or rate change, choose **Reopen audio after a device change** (or
-the current passage again) and check the offset. The offset can be typed while
+layer from each frame's time stamp, so a busy page holds it for about a frame
+at most instead of freezing it; the engine and its measurements are described
+in [Timing engine latency](../../docs/inspector/timing-latency.md). It shows
+which beat is sounding to about one display frame; place and check marks on the
+still waveform. After an output device or rate change, choose **Reopen audio
+after a device change** (or the current passage again) and check the offset. The offset can be typed while
 the audio plays; <kbd>Enter</kbd>, <kbd>Tab</kbd> or leaving the field applies
 it, and −1/+1 step it (<kbd>Shift</kbd>: 10 ms). The stage header warns when the
 stated output device rate differs from the recording's, when the recording rate
