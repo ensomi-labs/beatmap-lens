@@ -1,7 +1,7 @@
 # Beatmap Lens Inspector design language
 
 - Version: v2.0
-- Status: proposed; replaces the theme and layout of v1.4 (approved 2026-08-05). The interaction
+- Status: approved 2026-10-26; replaces the theme and layout of v1.4 (approved 2026-08-05). The interaction
   rules of v1.4 that this version keeps are marked as kept.
 - Research behind it: the commons research note `inspector-daw-ui-20261026` (professional audio
   tools' conventions, the Inspector before the change, and the reasons for each decision).
