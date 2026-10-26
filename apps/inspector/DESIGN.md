@@ -145,6 +145,10 @@ Every open workspace is a `WorkspaceFrame` (`src/layout/`):
 - Timing keeps all of its behaviour: proposals are anonymous and never audible; names only after
   a save and a reveal; Beat and Unbeat buttons are timed by their press; the marks list shows
   0.001 ms and the sample index; the README's shortcuts and gestures are the contract.
+- Text fields keep the keys typed into them, so a workspace's window-wide shortcuts never fire
+  from a field; Esc gives the keys back, and an IME's Enter and Esc stay with the composition.
+  Timing's inspector puts Notes (this passage, the whole session) after Marks; notes are optional
+  and no key opens them.
 - On Timing's stage the middle button and Option+click locate the playhead (the listener's own
   binding: left, right, Shift and Cmd already belong to marks). While playing, the target is the
   hover line drawn dashed in the playhead red, and the release restarts playback once.

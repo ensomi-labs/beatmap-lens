@@ -100,7 +100,8 @@ The server checks the session, its PCM files and its identity key file before
 it listens, and stops with one line naming a missing file.
 
 Open the printed address; it opens the session directly. Marks append to
-`<session>.timing.marks.jsonl` beside the session.
+`<session>.timing.marks.jsonl` beside the session, and the session note to
+`<session>.timing.notes.jsonl`.
 
 - On the spectrogram and waveform, a click selects the mark under it (or clears
   the selection) and a drag selects every mark in its range; with
@@ -145,6 +146,16 @@ Open the printed address; it opens the session directly. Marks append to
   toggles follow. **Hide passages** at the right end of the toolbar (or
   <kbd>Enter</kbd> on the boundary beside the list) gives the stage the passage
   list's width; the boundaries beside both side panes resize them.
+- **Notes**, in their own section, are optional: one field for the passage and one
+  for the whole session. A passage is one listening in Timing, so "this passage"
+  is the note about that listening. No key opens a note, and a note is never tied
+  to a mark or a time. Keys typed in a note stay there, an IME's Enter and Esc
+  included; <kbd>Esc</kbd> gives the keys back to marking. The passage note is
+  saved with the marks, inside that passage's save: changing it makes the passage
+  unsaved, as a mark does, and a reveal waits for the save. A passage note changed
+  after the reveal is recorded as not blind. The session note is saved by **Save
+  session note** or with any save, to its own file; it is never written to the
+  marks file.
 - <kbd>1</kbd>–<kbd>9</kbd> switch proposals, <kbd>P</kbd> hides all of them and
   brings them back. <kbd>Cmd/Ctrl+S</kbd> or <kbd>Enter</kbd> saves, and nothing has
   to be filled in first. The playback setup line (headphones, EQ app state,

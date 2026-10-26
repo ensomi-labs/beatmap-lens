@@ -16,11 +16,15 @@ import {
   type Mark,
   type MarkKind,
   type MarkMethod,
+  noteMaxLength,
   type OpenTiming,
   type PageProvenance,
+  type PassageNote,
   type PlaybackSetup,
   type RevealedName,
   type SaveResponse,
+  type SessionNote,
+  type SessionNoteResponse,
   staleSessionError,
 } from "./timing/contracts";
 import {
@@ -152,6 +156,12 @@ interface Draft {
   saveId: string | null;
   /** Some playback of this passage in this page ran with clicks on the listener's beats. */
   clicksHeard: boolean;
+  /** The passage note as typed, and as last saved (trimmed; "" for none). */
+  note: string;
+  savedNote: string;
+  /** When the note's text last changed, and whether every change came before the reveal. */
+  noteEdited: string | null;
+  noteBlind: boolean;
 }
 
 const preferences = ref<TimingPreferences>({
@@ -313,6 +323,67 @@ const beatTimes = computed(() =>
 );
 const dirty = computed(() => (draft.value ? isDirty(draft.value) : false));
 const unsavedPassages = computed(() => [...drafts.value.values()].filter(isDirty).length);
+
+// Notes: optional text about one passage (one listening) or the whole session; no key opens one.
+/** The session note as typed; saved to its own file, never with a passage's marks. */
+const sessionNote = ref("");
+const sessionNoteSaved = shallowRef<SessionNote | null>(null);
+/** When the session note last changed, and the passages revealed by then. */
+let sessionNoteEdited: string | null = null;
+let sessionNoteRevealed: string[] = [];
+const savingSessionNote = ref(false);
+const sessionNoteDirty = computed(
+  () => sessionNote.value.trim() !== (sessionNoteSaved.value?.text ?? ""),
+);
+const passageNote = computed({
+  get: () => draft.value?.note ?? "",
+  set: (text: string) => {
+    const row = passage.value;
+    const current = draft.value;
+    if (!row || !current) return;
+    drafts.value.set(row.id, {
+      ...current,
+      note: text,
+      noteEdited: new Date().toISOString(),
+      noteBlind: current.noteBlind && !revealed.value,
+    });
+    triggerRef(drafts);
+  },
+});
+const sessionNoteText = computed({
+  get: () => sessionNote.value,
+  set: (text: string) => {
+    sessionNote.value = text;
+    sessionNoteEdited = new Date().toISOString();
+    const revealedNow = opened.value?.passages.filter((row) => row.revealed).map((row) => row.id);
+    sessionNoteRevealed = [...new Set([...sessionNoteRevealed, ...(revealedNow ?? [])])];
+  },
+});
+const passageNoteState = computed(() => {
+  const current = draft.value;
+  if (!current) return "";
+  if (current.note.trim() !== current.savedNote) return "Unsaved: saved with the marks";
+  if (!current.savedNote) return "";
+  return current.noteBlind ? "Saved with the marks" : "Saved with the marks · written after the reveal";
+});
+const sessionNoteState = computed(() => {
+  if (savingSessionNote.value) return "Saving";
+  if (sessionNoteDirty.value) return "Unsaved";
+  const saved = sessionNoteSaved.value;
+  if (!saved?.text) return "";
+  return `Saved ${savedAt(saved.time)}`;
+});
+/** What would be lost by leaving: passages with unsaved marks or notes, and the session note. */
+const unsavedSummary = computed(() => {
+  const parts = [
+    ...(unsavedPassages.value
+      ? [`${unsavedPassages.value} passage(s) have unsaved marks or notes`]
+      : []),
+    ...(sessionNoteDirty.value ? ["the session note is unsaved"] : []),
+  ];
+  const text = parts.join(", and ");
+  return text ? `${text[0]?.toUpperCase()}${text.slice(1)}.` : "";
+});
 const revealed = computed(() => Boolean(passage.value?.revealed));
 const canReveal = computed(
   () => Boolean(draft.value?.saveId) && !dirty.value && !revealed.value && !saving.value,
@@ -342,6 +413,7 @@ const status = computed(() => {
   return { tone: "idle", text: "No marks saved" };
 });
 const marksFile = computed(() => opened.value?.marks_path.split(/[\\/]/).at(-1));
+const notesFile = computed(() => opened.value?.notes_path.split(/[\\/]/).at(-1));
 /** The view bar's identity in full, for when a narrow stage truncates it. */
 const passageSummary = computed(() => {
   const row = passage.value;
@@ -431,7 +503,7 @@ function syncClicks() {
 }
 
 function isDirty(entry: Draft): boolean {
-  return differsFrom(entry.state, entry.saved);
+  return differsFrom(entry.state, entry.saved) || entry.note.trim() !== entry.savedNote;
 }
 
 function readPreferences(): Partial<TimingPreferences> {
@@ -483,17 +555,13 @@ function markDeviceChanged() {
 }
 
 function guardUnload(event: BeforeUnloadEvent) {
-  if (!unsavedPassages.value) return;
+  if (!unsavedSummary.value) return;
   event.preventDefault();
   event.returnValue = "";
 }
 
 function changeMode(mode: WorkspaceMode) {
-  if (
-    unsavedPassages.value &&
-    !window.confirm(`${unsavedPassages.value} passage(s) have unsaved marks. Leave timing mode?`)
-  )
-    return;
+  if (unsavedSummary.value && !window.confirm(`${unsavedSummary.value} Leave timing mode?`)) return;
   emit("change-mode", mode);
 }
 
@@ -512,6 +580,8 @@ async function open() {
       localStorage.setItem(rememberedSession, sessionPath.value);
     } catch {}
     const owner = JSON.stringify([result.marks_path, result.id]);
+    // The session note typed for this session stays, unsaved, like its passages' drafts.
+    if (owner !== draftsOwner || !sessionNoteDirty.value) loadSessionNote(result.session_note);
     if (owner !== draftsOwner) drafts.value = new Map();
     draftsOwner = owner;
     openedPath = sessionPath.value;
@@ -627,11 +697,16 @@ async function select(index: number) {
     if (disposed) return;
     if (!drafts.value.has(row.id)) {
       const saved = result.saved?.marks ?? [];
+      const note = result.saved?.note;
       drafts.value.set(row.id, {
         state: marksState(saved),
         saved,
         saveId: result.saved?.save_id ?? null,
         clicksHeard: false,
+        note: note?.text ?? "",
+        savedNote: note?.text ?? "",
+        noteEdited: note?.edited ?? null,
+        noteBlind: note?.blind ?? true,
       });
       triggerRef(drafts);
     }
@@ -719,9 +794,9 @@ async function closeAudio() {
 /** Drafts stay in the page, so reopening the same session brings them back. */
 function close() {
   if (
-    unsavedPassages.value &&
+    unsavedSummary.value &&
     !window.confirm(
-      `${unsavedPassages.value} passage(s) have unsaved marks. They stay in this page only for reopening this session. Close it?`,
+      `${unsavedSummary.value} They stay in this page only for reopening this session. Close it?`,
     )
   )
     return;
@@ -1208,6 +1283,10 @@ async function save() {
   const index = passageIndex.value;
   const shown = legend(blind.value);
   const snapshot = current.state.marks;
+  const noteText = current.note.trim();
+  const note: PassageNote | null = noteText
+    ? { text: current.note, edited: current.noteEdited, blind: current.noteBlind }
+    : null;
   const setup = recordedSetup(setupLine.value);
   const body = {
     passage_index: index,
@@ -1215,6 +1294,7 @@ async function save() {
     setup: setup.text,
     setup_source: setup.source,
     setup_from: setup.from,
+    note,
     playback: playbackSetup(),
     page: pageProvenance(),
     visible_keys: stageProposals.value.filter((p) => p.visible).map((p) => p.key),
@@ -1238,10 +1318,18 @@ async function save() {
     }
     if (disposed) return;
     const latest = drafts.value.get(row.id);
-    if (latest) drafts.value.set(row.id, { ...latest, saved: snapshot, saveId: response.save_id });
+    if (latest)
+      drafts.value.set(row.id, {
+        ...latest,
+        saved: snapshot,
+        saveId: response.save_id,
+        savedNote: noteText,
+      });
     triggerRef(drafts);
     const savedRow = opened.value?.passages.find((entry) => entry.id === row.id);
     if (savedRow) savedRow.saved = true;
+    // One save keeps everything typed: the session note goes to its own file.
+    if (sessionNoteDirty.value) void saveSessionNote();
   } catch (cause) {
     // fetch rejects with a TypeError when nothing answers.
     if (cause instanceof TypeError)
@@ -1251,6 +1339,61 @@ async function save() {
   } finally {
     saving.value = false;
   }
+}
+
+function loadSessionNote(note: SessionNote | null) {
+  sessionNoteSaved.value = note;
+  sessionNote.value = note?.text ?? "";
+  sessionNoteEdited = note?.edited ?? null;
+  sessionNoteRevealed = note?.revealed_passages ?? [];
+}
+
+/** Saves the session note on its own; Save marks also calls it when the note changed. */
+async function saveSessionNote() {
+  if (!opened.value || savingSessionNote.value || !sessionNoteDirty.value) return;
+  const body = {
+    text: sessionNote.value,
+    edited: sessionNoteEdited,
+    revealed_passages: sessionNoteRevealed,
+  };
+  savingSessionNote.value = true;
+  error.value = "";
+  const request = () =>
+    timingJson<SessionNoteResponse>("session-note", {
+      session_id: opened.value?.session_id,
+      ...body,
+    });
+  try {
+    let response: SessionNoteResponse;
+    try {
+      response = await request();
+    } catch (cause) {
+      if (!isStale(cause)) throw cause;
+      await reconnect();
+      response = await request();
+    }
+    if (disposed) return;
+    sessionNoteSaved.value = {
+      id: response.note_id,
+      time: response.time,
+      text: body.text.trim(),
+      edited: body.edited,
+      revealed_passages: body.revealed_passages,
+    };
+  } catch (cause) {
+    if (cause instanceof TypeError)
+      error.value =
+        "The local timing service is not answering. Start it again, then save; the note stays in this page.";
+    else report(cause);
+  } finally {
+    savingSessionNote.value = false;
+  }
+}
+
+/** Esc in a note or the setup line gives the keys back to marking, unless an IME is composing. */
+function leaveField(event: KeyboardEvent) {
+  if (event.isComposing) return;
+  (event.target as HTMLElement | null)?.blur();
 }
 
 async function revealNames() {
@@ -1324,7 +1467,8 @@ function passageStep(event: KeyboardEvent): number {
 }
 
 function handleKeydown(event: KeyboardEvent) {
-  if (event.defaultPrevented || event.altKey) return;
+  // A key that confirms or edits an IME composition belongs to the field.
+  if (event.defaultPrevented || event.altKey || event.isComposing) return;
   if (!blind.value) {
     // While a passage loads, passage keys are kept for when it has loaded.
     const step = passageStep(event);
@@ -1478,7 +1622,7 @@ function handleKeydown(event: KeyboardEvent) {
         </label>
         <p class="setup-note">
           Paths starting with ~/ work. Marks are appended to &lt;session&gt;.timing.marks.jsonl
-          beside the session file.
+          and the session note to &lt;session&gt;.timing.notes.jsonl, beside the session file.
         </p>
         <p v-if="unsavedPassages" class="inline-message">
           Unsaved marks in {{ unsavedPassages }} passage(s) are kept in this page. Reopen the same
@@ -1897,6 +2041,52 @@ function handleKeydown(event: KeyboardEvent) {
               </details>
             </PanelSection>
 
+            <PanelSection id="timing-notes" title="Notes">
+              <template #meta>
+                <span v-if="dirty || sessionNoteDirty" class="rail-count timing-warning">unsaved</span>
+              </template>
+              <label class="field-stack" for="timing-passage-note">
+                <span>This passage</span>
+                <textarea
+                  id="timing-passage-note"
+                  v-model="passageNote"
+                  rows="3"
+                  :maxlength="noteMaxLength"
+                  placeholder="Optional: about this listening of the passage"
+                  @keydown.esc="leaveField"
+                ></textarea>
+              </label>
+              <p v-if="passageNoteState" class="setup-note timing-note-state">{{ passageNoteState }}</p>
+              <label class="field-stack" for="timing-session-note">
+                <span>Whole session</span>
+                <textarea
+                  id="timing-session-note"
+                  v-model="sessionNoteText"
+                  rows="3"
+                  :maxlength="noteMaxLength"
+                  placeholder="Optional: about the whole session"
+                  @keydown.esc="leaveField"
+                ></textarea>
+              </label>
+              <div class="timing-note-actions">
+                <span class="setup-note timing-note-state">{{ sessionNoteState }}</span>
+                <button
+                  class="tool-button"
+                  type="button"
+                  :disabled="!sessionNoteDirty || savingSessionNote"
+                  title="Save the session note on its own; Save marks saves it too"
+                  @click="saveSessionNote"
+                >
+                  Save session note
+                </button>
+              </div>
+              <p class="setup-note">
+                Optional. Keys typed here stay in the note; Esc gives them back to marking.
+                Cmd/Ctrl+S saves the marks with both notes. The session note is kept in
+                <span class="data">{{ notesFile }}</span>.
+              </p>
+            </PanelSection>
+
             <PanelSection id="timing-proposals" :title="revealed ? 'Proposals' : 'Proposals (blind)'">
               <!-- Always given, so the section's slots stay stable while the playhead redraws. -->
               <template #actions>
@@ -1951,6 +2141,7 @@ function handleKeydown(event: KeyboardEvent) {
                   placeholder="Headphones · FineTune state · volume"
                   autocomplete="off"
                   spellcheck="false"
+                  @keydown.esc="leaveField"
                 />
               </label>
               <p
@@ -2438,6 +2629,18 @@ function handleKeydown(event: KeyboardEvent) {
 }
 
 .timing-output {
+  font-size: var(--text-2xs);
+}
+
+.timing-note-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.timing-note-state {
+  margin-top: -2px;
   font-size: var(--text-2xs);
 }
 

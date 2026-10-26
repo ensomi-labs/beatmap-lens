@@ -118,6 +118,9 @@ const server = vi.hoisted(() => ({
   saves: [] as Record<string, unknown>[],
   /** What the folder held before this test's saves. */
   lastSetup: { setup: null, device_rate: null } as LastSetup,
+  notes: [] as Record<string, unknown>[],
+  /** Serve saved snapshots to a page opened later, as the service replays the marks file. */
+  replaySaves: false,
 }));
 
 /** As the service finds it at open: the latest save's setup and rate, else what was there. */
@@ -134,6 +137,39 @@ function lastSetup(): LastSetup {
 }
 
 const saveTime = "2026-10-25T01:00:00.000Z";
+
+/** The latest session note sent, as the service serves it at open. */
+function sessionNote() {
+  const note = server.notes.at(-1);
+  if (!note) return null;
+  const { text, edited, revealed_passages } = note as {
+    text: string;
+    edited: string | null;
+    revealed_passages: string[];
+  };
+  return {
+    id: `note-${server.notes.length}`,
+    time: saveTime,
+    text: text.trim(),
+    edited,
+    revealed_passages,
+  };
+}
+
+/** A passage's latest save, as the service serves it to the page. */
+function savedSnapshot(passageIndex: number) {
+  const index = server.saves.map((save) => save.passage_index).lastIndexOf(passageIndex);
+  const save = server.saves[index];
+  if (!save) return null;
+  const note = save.note as { text: string } | null;
+  return {
+    save_id: `save-${index + 1}`,
+    time: saveTime,
+    setup: save.setup,
+    marks: save.marks,
+    note: note ? { ...note, text: note.text.trim() } : null,
+  };
+}
 
 /** A default AudioContext that reports `hz`, counting the contexts made and closed. */
 function stubAudioContext(hz: number) {
@@ -188,6 +224,8 @@ beforeEach(() => {
     rates: [44_100, 44_100],
     saves: [],
     lastSetup: { setup: null, device_rate: null },
+    notes: [],
+    replaySaves: false,
   });
   Object.assign(engine, {
     plays: 0,
@@ -218,7 +256,7 @@ beforeEach(() => {
         marks_path: "/s/session-01.timing.marks.jsonl",
         last_setup: lastSetup(),
         notes_path: "/s/session-01.timing.notes.jsonl",
-        session_note: null,
+        session_note: sessionNote(),
         passages: [
           row("passage-01", true, server.rates[0] as number, -4.2),
           row("passage-02", false, server.rates[1] as number, -12.9),
@@ -237,8 +275,12 @@ beforeEach(() => {
           colour_index,
           beats_ms: [],
         })),
-        saved: null,
+        saved: server.replaySaves ? savedSnapshot(request.passage_index as number) : null,
       };
+    if (operation === "session-note") {
+      server.notes.push(request);
+      return { note_id: `note-${server.notes.length}`, time: saveTime };
+    }
     if (operation === "save") {
       server.saves.push(request);
       return { save_id: `save-${server.saves.length}`, time: saveTime };
@@ -1206,5 +1248,166 @@ describe("locate with the middle button or Option+click", () => {
     resume();
     await vi.waitFor(() => expect(button("Pause")).toBeDefined());
     expect(engine.starts).toEqual([0, 500 - 120]);
+  });
+});
+
+describe("notes", () => {
+  const field = (id: string) => {
+    const element = container.querySelector<HTMLTextAreaElement | HTMLInputElement>(`#${id}`);
+    if (!element) throw new Error(`No ${id}`);
+    return element;
+  };
+  const type = async (id: string, text: string) => {
+    const element = field(id);
+    element.focus();
+    element.value = text;
+    element.dispatchEvent(new Event("input", { bubbles: true }));
+    await nextTick();
+    return element;
+  };
+  const noteStates = () =>
+    [...container.querySelectorAll(".timing-note-state")].map((p) => p.textContent?.trim());
+  const freshPage = async () => {
+    server.replaySaves = true;
+    app.unmount();
+    app = createApp(TimingWorkspace);
+    app.mount(container);
+    await opened();
+  };
+
+  it("a passage note makes the passage unsaved, a save writes it, a reopen restores it, and a reveal waits for the save", async () => {
+    await opened();
+    key("b");
+    key("Enter");
+    await vi.waitFor(() => expect(status()).toBe("Saved"));
+    expect(server.saves[0]).toMatchObject({ note: null });
+    expect(button("Reveal names").disabled).toBe(false);
+
+    const note = await type("timing-passage-note", "pulse unclear after the break");
+    expect(status()).toBe("Unsaved · 1 marks");
+    expect(noteStates()).toContain("Unsaved: saved with the marks");
+    expect(button("Reveal names").disabled).toBe(true);
+    // Cmd/Ctrl+S saves from inside the note.
+    note.dispatchEvent(new KeyboardEvent("keydown", { key: "s", metaKey: true, bubbles: true }));
+    await vi.waitFor(() => expect(server.saves).toHaveLength(2));
+    await vi.waitFor(() => expect(status()).toBe("Saved"));
+    expect(server.saves[1]).toMatchObject({
+      marks: [{ kind: "beat" }],
+      note: {
+        text: "pulse unclear after the break",
+        edited: expect.stringMatching(/^\d{4}-/),
+        blind: true,
+      },
+    });
+    expect(button("Reveal names").disabled).toBe(false);
+    expect(server.notes).toHaveLength(0);
+
+    await freshPage();
+    expect(hud()).toContain("Passage 02 of 2");
+    expect(field("timing-passage-note").value).toBe("pulse unclear after the break");
+    expect(status()).toBe("Saved");
+    expect(noteStates()).toContain("Saved with the marks");
+  });
+
+  it("a passage note changed after the reveal is not blind", async () => {
+    await opened();
+    key("b");
+    key("Enter");
+    await vi.waitFor(() => expect(status()).toBe("Saved"));
+    button("Reveal names").click();
+    await vi.waitFor(() =>
+      expect(container.querySelector(".timing-blind")?.textContent?.trim()).toBe("Revealed"),
+    );
+    await type("timing-passage-note", "the names did not change my mind");
+    key("Enter", document.body);
+    await vi.waitFor(() => expect(server.saves).toHaveLength(2));
+    expect(server.saves[1]).toMatchObject({ note: { blind: false } });
+    await vi.waitFor(() =>
+      expect(noteStates()).toContain("Saved with the marks · written after the reveal"),
+    );
+  });
+
+  it("the session note saves on its own or with the marks, to its own operation, and reopens", async () => {
+    await opened();
+    await type("timing-session-note", "Tired by the end. ");
+    expect(noteStates()).toContain("Unsaved");
+    expect(status()).toBe("No marks saved");
+    button("Save session note").click();
+    await vi.waitFor(() => expect(server.notes).toHaveLength(1));
+    expect(server.notes[0]).toMatchObject({ text: "Tired by the end. ", revealed_passages: [] });
+    expect(server.saves).toHaveLength(0);
+    await vi.waitFor(() =>
+      expect(noteStates().some((text) => text?.startsWith("Saved"))).toBe(true),
+    );
+
+    await freshPage();
+    expect(field("timing-session-note").value).toBe("Tired by the end.");
+    await type("timing-session-note", "Tired by the end; headphones slipped once.");
+    key("b", document.body);
+    key("Enter", document.body);
+    await vi.waitFor(() => expect(server.notes).toHaveLength(2));
+    expect(server.saves).toHaveLength(1);
+    expect(server.notes[1]).toMatchObject({ text: "Tired by the end; headphones slipped once." });
+  });
+
+  it("keeps keys typed into a note or the setup line from the shortcuts, through an IME too", async () => {
+    await opened();
+    const note = await type("timing-passage-note", "");
+    for (const name of ["b", "n", " ", "Enter", "f", "Delete", "1"]) key(name, note);
+    note.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "{",
+        code: "BracketLeft",
+        shiftKey: true,
+        bubbles: true,
+      }),
+    );
+    await nextTick();
+    expect(markIds()).toHaveLength(0);
+    expect(engine.plays).toBe(0);
+    expect(server.saves).toHaveLength(0);
+    expect(hud()).toContain("Passage 02 of 2");
+    expect(document.activeElement).toBe(note);
+
+    // An IME composition in the setup line: its Enter and Esc confirm or cancel the composition.
+    const setup = field("timing-setup");
+    setup.focus();
+    setup.dispatchEvent(new Event("compositionstart", { bubbles: true }));
+    setup.value = "ヘッドホン";
+    setup.dispatchEvent(new Event("input", { bubbles: true }));
+    await nextTick();
+    expect(container.querySelector(".timing-setup-status")?.textContent).not.toContain(
+      "ヘッドホン",
+    );
+    for (const name of ["Enter", "Escape", "b"])
+      setup.dispatchEvent(
+        new KeyboardEvent("keydown", { key: name, isComposing: true, bubbles: true }),
+      );
+    expect(document.activeElement).toBe(setup);
+    setup.dispatchEvent(new Event("compositionend", { bubbles: true }));
+    await nextTick();
+    expect(container.querySelector(".timing-setup-status")?.textContent).toContain(
+      "ヘッドホン · typed",
+    );
+    expect(server.saves).toHaveLength(0);
+    expect(markIds()).toHaveLength(0);
+
+    // Esc gives the keys back to marking, without stopping or saving anything.
+    key("Escape", setup);
+    expect(document.activeElement).not.toBe(setup);
+    key("b");
+    await nextTick();
+    expect(markIds()).toHaveLength(1);
+    // Keys pressed while no field has the focus never reach a field.
+    expect(field("timing-passage-note").value).toBe("");
+    expect(field("timing-session-note").value).toBe("");
+  });
+
+  it("asks before leaving with an unsaved session note", async () => {
+    await opened();
+    await type("timing-session-note", "headphones slipped");
+    const event = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(event);
+    expect(event.defaultPrevented).toBe(true);
   });
 });
