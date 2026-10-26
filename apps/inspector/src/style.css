@@ -2673,6 +2673,11 @@ button:disabled {
   }
 }
 
+.data {
+  font-family: var(--font-data);
+  font-variant-numeric: tabular-nums;
+}
+
 /* Workspace frame: toolbar, side panes with resizable boundaries, main view, status bar. */
 
 .workspace-frame {
@@ -2724,9 +2729,16 @@ fieldset.toolbar-group,
 }
 
 .frame-toolbar-end {
-  flex: 0 0 auto;
+  flex: 0 1 auto;
   gap: 8px;
   margin-left: auto;
+}
+
+.frame-toolbar-end .health-status {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .toolbar-divider {
@@ -2967,6 +2979,13 @@ fieldset.toolbar-group,
   font-size: var(--text-2xs);
 }
 
+.frame-toolbar .tool-button,
+.frame-toolbar .segmented,
+.frame-toolbar .time-counter,
+.pane-toggles {
+  flex-shrink: 0;
+}
+
 .frame-toolbar {
   grid-row: 1;
 }
@@ -3109,6 +3128,7 @@ fieldset.toolbar-group,
 @media (max-width: 1240px) {
   .status-optional,
   .stage-toolbar .toolbar-label,
+  .stage-identity .data,
   .stage-hint {
     display: none;
   }
@@ -3221,11 +3241,6 @@ fieldset.toolbar-group,
   display: grid;
   gap: 8px;
   padding: 8px;
-}
-
-.data {
-  font-family: var(--font-data);
-  font-variant-numeric: tabular-nums;
 }
 
 .field-error {

@@ -94,6 +94,9 @@ async function newPage(width, height, dpr = 1) {
   page.on("console", (message) => {
     if (message.type() === "error") errors.push(message.text());
   });
+  page.on("response", (response) => {
+    if (response.status() >= 400) errors.push(`${response.status()} ${response.url()}`);
+  });
   return { context, page, errors };
 }
 
@@ -494,6 +497,7 @@ const modes = {
     await page.getByLabel("Catalog manifest path").fill(join(fixtures, "catalog.json"));
     await page.getByLabel("Mapped corpus directory path").fill(join(fixtures, "corpus"));
     await page.getByRole("button", { name: /Open workspace/ }).click();
+    await page.waitForSelector(".workspace-frame", { timeout: 15000 });
     // Narrow windows show one view at a time; the task queue is under Source.
     const source = page.getByRole("button", { name: "Source", exact: true });
     if (await source.count()) await source.click();

@@ -1513,7 +1513,7 @@ onBeforeUnmount(() => { window.removeEventListener("keydown", workspaceKeydown);
 .review-transport kbd { margin-left: 2px; }
 .review-rate { display: flex; align-items: center; gap: 5px; }
 .review-rate select { width: auto; min-height: var(--control-h-sm); padding: 0 4px; font-family: var(--font-data); }
-.review-status { max-width: 360px; overflow: hidden; color: var(--ink-secondary); font-size: var(--text-xs); text-overflow: ellipsis; white-space: nowrap; }
+.review-status { min-width: 0; max-width: 360px; overflow: hidden; color: var(--ink-secondary); font-size: var(--text-xs); text-overflow: ellipsis; white-space: nowrap; }
 .review-status::before { display: inline-block; width: 6px; height: 6px; margin-right: 6px; border-radius: 50%; background: var(--signal); content: ""; }
 .review-rate-comparison { display: grid; gap: 6px; padding: 6px 8px; border-radius: var(--radius-control); background: var(--warning-soft); color: var(--warning); font-size: var(--text-xs); }
 .review-playback-settings { display: grid; gap: 8px; }
