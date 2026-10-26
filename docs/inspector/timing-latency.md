@@ -53,45 +53,47 @@ code of its own (its core reads no clock), so nothing else transfers.
 
 ## Measurements
 
-Three runs of the harness below on 2026-10-26, on a MacBook Air (Apple M5, macOS 27) in headless
+Four runs of the harness below on 2026-10-26, on a MacBook Air (Apple M5, macOS 27) in headless
 Google Chrome 155 with `--mute-audio`, each comparing builds in the same job against the version
 before the engine (`4954249`). The engine was measured with a frame loop (`f8f143b`, `73d5c7b`:
-five repeats in all) and as described above (`3a87776`, whose engine code is this branch's: two
-repeats; the engine column pools all seven). Ranges are the smallest and largest per-repeat
-values.
+nine repeats in all) and as described above (`3a87776` in run 3, two repeats, with the harness's
+own frame loop running; `9b59fbd`, this branch's engine, in run 4, four repeats, without it); the
+engine column pools all fifteen unless it says otherwise. Ranges are the smallest and largest
+per-repeat values.
 
 | What | Before the engine | Engine | Kind |
 | --- | --- | --- | --- |
-| Drawn position minus the source heard at the frame's time stamp (0.5 ms per device pixel) | mean +1.9 to +2.3 ms, SD 0.64-1.41 ms | mean −0.17 to +0.05 ms, SD 0.07-0.20 ms | the mean is a constant the offset absorbs; the SD is jitter |
-| Presented playhead, 80 ms main-thread stalls every 500 ms | longest gap between frames 82-94 ms, error held up to 64-77 ms from its median | 31-35 ms, 21-25 ms | variable |
-| Presented playhead, idle | error within 8.4-9.7 ms of its median 95 % of the time (a 60 Hz frame holds each position) | the same | the display's |
-| Saved mark minus the source heard at the key's `timeStamp`, with and without 40 ms of work before the key | within 0.076 ms | within 0.026 ms | variable, negligible |
+| Drawn position minus the source heard at the frame's time stamp (0.5 ms per device pixel) | mean +1.9 to +3.4 ms, SD 0.38-1.41 ms | mean −0.18 to +0.05 ms, SD 0.04-0.22 ms | the mean is a constant the offset absorbs; the SD is jitter |
+| Presented playhead, 80 ms main-thread stalls every 500 ms | each stall freezes the picture (gaps between frames of 65-94 ms) | at most one frame lost at a stall (gaps of 29-35 ms), at 7 of 16 stalls with a frame loop and 5 of 16 without (run 4) | variable |
+| Presented playhead after a stall that costs a frame | shown minus heard moves from about −7 to about −23 ms | from about −9 to about −25 ms | variable: a frame, for the rest of the play observed |
+| Presented playhead, idle | error within 8.3-9.7 ms of its median 95 % of the time (a 60 Hz frame holds each position) | the same | the display's |
+| Saved mark minus the source heard at the key's `timeStamp`, with and without 40 ms of work before the key | within 0.100 ms | within 0.029 ms | variable, negligible |
 | Clicks with 450 ms stalls every 1.3 s | 4 of 19 missing | none missing; every click on its sample | — |
-| Key to first sample heard, from a stop | 46.5-47.6 ms (p50) | 45.5-47.9 ms | constant (30 ms ahead plus the output) |
-| Main thread busy while playing at fine zoom (10 s) | 16-24 % | 10-13 % | — |
-| Garbage collections in those 10 s | 409-521 (98-129 ms) | 188-248 (51-71 ms) | — |
+| Key to first sample heard, from a stop | 45.2-47.7 ms (p50) | 45.5-47.9 ms | constant (30 ms ahead plus the output) |
+| Main thread busy while playing at fine zoom (10 s) | 16-26 % | 11-13 % with a frame loop, 8 % without (run 4) | — |
+| Garbage collections in those 10 s | 339-521 (98-132 ms) | 188-248 (51-73 ms) | — |
 
-In isolated lab pages (five repeats):
+In isolated lab pages (five to nine repeats):
 
 - A start, an offset or a loop edge between sample frames is interpolated; on whole frames the
   output is the source bit for bit. A click started between frames has its onset at its
   fractional time. Hence `planPlay`.
 - Online, 5 ms after each output stamp, the clock model as the workspace feeds it (the newest
-  stamp read every 25 ms) is within 0.016-0.040 ms (p95) of the whole-run line, and within
-  0.010-0.030 ms if fed every stamp; the newest stamp alone is within 0.067-0.084 ms. The model is
-  1.9-4.8 times better at every hint and repeat, and all are far inside the target on this
+  stamp read every 25 ms) is within 0.016-0.042 ms (p95) of the whole-run line, and within
+  0.010-0.030 ms if fed every stamp; the newest stamp alone is within 0.066-0.084 ms. The model is
+  1.7-4.8 times better at every hint and repeat, and all are far inside the target on this
   timer-driven stream. CoreAudio's stamps may be noisier.
 - Latency hints change the reported base and output latency (16, 24, 32 ms) and the stamp
   cadence, not the stamps' noise.
 - A Web Animation is presented about a frame sooner than a canvas drawn from the same frame time
-  while the main thread is idle (5.6-7.6 ms against 21.8-22.5 ms after the time it shows), and as
-  late as the canvas with main-thread work in its frames: its display delay changes by up to a
-  frame with load.
+  while the main thread is idle (4.6-7.6 ms against 21.5-22.5 ms after the time it shows), and
+  later with main-thread work in its frames: its display delay changes by up to a frame with load.
 - With 80 ms stalls, a canvas or a script-moved element freezes for the whole stall (gaps of
-  61-81 ms). A Web Animation in a page with no animation-frame loop is not held at all; with a
-  frame loop it is held about one extra frame per stall (gaps of 30-35 ms). With no frame loop
-  but a text readout changed every 100 ms from a timer, as the HUD does, it was not held in one
-  repeat and held like the frame loop in the other (two repeats).
+  47-81 ms). A Web Animation loses at most one frame at a stall. In a page that changes nothing
+  on the main thread it loses none. With a frame loop it loses one at a run's first stall and is
+  then presented a frame later (20-23 ms after its time) and loses no more. With no frame loop
+  but a text readout changed every 100 ms from a timer, as the HUD does, it loses one only at a
+  stall that begins right after a readout.
 - A position computed from `performance.now()` in an animation-frame callback is 2-3 ms ahead of
   one from the frame's time stamp (callbacks start that late), and noisier, except right after a
   stall, when the late callback's frame time stamp is old. The compositor samples the playhead
@@ -99,9 +101,12 @@ In isolated lab pages (five repeats):
 
 What these runs did not show:
 
-- That the engine without a frame loop does better in the app than with one: in these runs the
-  harness sampled output stamps from a frame loop of its own in every scenario, so the page
-  always had one. It now runs only while positions are read.
+- That the engine without a frame loop loses fewer frames in the app than with one. In run 4 (the
+  harness's own frame loop off outside the positions scenario) both lost at most one frame at a
+  stall: with a frame loop at a play's first stall, without one only at stalls that began 0-6 ms
+  after a HUD readout (7 and 5 of 16 stalls). How often a stall meets a readout at random phases
+  was not measured, nor whether ordinary hitches (a stage redraw, garbage collection) move the
+  presentation a frame later, nor when it returns.
 - Anything about CoreAudio, the real display, Arc, FineTune or the keyboard: a muted page plays
   into Chromium's fake output stream, driven by a timer, and headless swap times are not light.
   `owner-stamps.js` records the output stamps in Arc on the real device;
@@ -111,7 +116,9 @@ Switching to this engine moves the drawn playhead by about 2 ms of source for th
 draws the source heard at the frame's time stamp, where the old playhead drew it at its callback
 time, about 2 ms later), so the offset that matches comes out about 2 ms smaller in headless
 Chrome; the compositor's presentation can differ from the old canvas by up to a frame. Check the
-offset again after switching.
+offset again after switching, on plays without a hitch: in headless Chrome, in every build, a
+main-thread stall that costs the playhead a frame leaves it presented a frame (about 17 ms) later
+for the rest of the play.
 
 ## FineTune in the output path
 
