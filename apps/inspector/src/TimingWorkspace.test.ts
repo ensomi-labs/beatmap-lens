@@ -662,6 +662,39 @@ it("does not repeat a held B or C", async () => {
   expect(engine.clicks.at(-1)).toBeNull();
 });
 
+it("gives the keyboard back after the help disclosure is clicked", async () => {
+  await opened();
+  const summary = container.querySelector<HTMLElement>(".timing-help summary");
+  if (!summary) throw new Error("No help disclosure");
+  summary.focus();
+  expect(document.activeElement).toBe(summary);
+  summary.dispatchEvent(new Event("pointerdown", { bubbles: true }));
+  summary.click();
+  expect(document.activeElement).not.toBe(summary);
+  key(" ");
+  await vi.waitFor(() => expect(engine.plays).toBe(1));
+  key("Escape");
+  key("b");
+  await nextTick();
+  key("Enter");
+  await vi.waitFor(() => expect(server.saves).toHaveLength(1));
+});
+
+it("shows the hidden details pane to ask for the playback setup before a save", async () => {
+  await mount({ setup: "", deviceRateHz: 44_100 });
+  const pane = () => container.querySelector<HTMLElement>("#timing-inspector");
+  button("Hide marks and settings").click();
+  await nextTick();
+  expect(pane()?.style.display).toBe("none");
+  key("b");
+  key("Enter");
+  await vi.waitFor(() => expect(pane()?.style.display).toBe(""));
+  await nextTick();
+  expect(hud()).toContain("Describe the playback setup before saving.");
+  expect(document.activeElement?.id).toBe("timing-setup");
+  expect(server.saves).toHaveLength(0);
+});
+
 describe("a change of output", () => {
   const devices = new EventTarget();
   beforeEach(() => {
