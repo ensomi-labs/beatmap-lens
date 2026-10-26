@@ -54,11 +54,22 @@ const emit = defineEmits<{
   "loop-region": [region: TimeRange];
 }>();
 
+// Lane colours follow the Inspector's strata (DESIGN.md): the data lanes are the well, the ruler
+// and overview are raised a step like the chrome, and selection uses the interface accent only
+// where no proposal is drawn.
 const stageBackground = "#101820";
-const rulerHeight = 20;
+const rulerBackground = "#21262c";
+const overviewBackground = "#1a1e24";
+const loopRegionColour = "rgba(101, 167, 250, 0.42)";
+const loopRegionIdleColour = "rgba(255, 255, 255, 0.09)";
+const markColour = "#ffffff";
+/** Either side of a selected mark, so it differs from a proposal bar of any colour. */
+const markCasingColour = "#06090e";
+const markSelectedPlate = "#2466c3";
+const rulerHeight = 22;
 const stripRowHeight = 6;
-const marksHeight = 16;
-const overviewHeight = 28;
+const marksHeight = 18;
+const overviewHeight = 30;
 /** A pointer that moves less than this many CSS pixels clicks; more drags. */
 const dragThresholdPx = 4;
 /** With Shift a press places a beat unless it clearly drags a loop region. */
@@ -413,12 +424,12 @@ function drawWaveform(context: CanvasRenderingContext2D) {
 function drawRuler(context: CanvasRenderingContext2D) {
   const lane = lanes.value.ruler;
   const { dpr, width } = size.value;
-  context.fillStyle = "#0b1117";
+  context.fillStyle = rulerBackground;
   context.fillRect(0, lane.top * dpr, width * dpr, lane.height * dpr);
   // The loop region, brighter while looping.
   const loopLeft = deviceX(props.loopRegion.startMs);
   const loopRight = deviceX(props.loopRegion.endMs);
-  context.fillStyle = props.looping ? "rgba(255, 255, 255, 0.24)" : "rgba(255, 255, 255, 0.08)";
+  context.fillStyle = props.looping ? loopRegionColour : loopRegionIdleColour;
   context.fillRect(loopLeft, lane.top * dpr, loopRight - loopLeft, lane.height * dpr);
   const step = tickStepMs(props.view.msPerPx, 96);
   const minor = step / 5;
@@ -507,7 +518,14 @@ function drawMarks(context: CanvasRenderingContext2D) {
     const selected = selectedIds.has(mark.id);
     const x = deviceX(mark.time_ms);
     const lineWidth = Math.max(1, Math.round(dpr)) * (selected ? 2 : 1);
-    context.fillStyle = selected ? "#8fb3ff" : "#ffffff";
+    if (selected) {
+      const casing = lineWidth + 2 * Math.max(1, Math.round(dpr));
+      context.fillStyle = markCasingColour;
+      if (mark.kind === "unbeat")
+        dashedVline(context, x, lineTop, lineHeight, casing, 4 * dpr, 3 * dpr);
+      else vline(context, x, lineTop, lineHeight, casing);
+    }
+    context.fillStyle = markColour;
     if (mark.kind === "unbeat")
       dashedVline(context, x, lineTop, lineHeight, lineWidth, 4 * dpr, 3 * dpr);
     else vline(context, x, lineTop, lineHeight, lineWidth);
@@ -519,8 +537,12 @@ function drawMarks(context: CanvasRenderingContext2D) {
     groupX = x;
     groupCount = 1;
     const r = 5 * dpr;
-    context.fillStyle = selected ? "#8fb3ff" : "#ffffff";
-    context.strokeStyle = context.fillStyle;
+    if (selected) {
+      context.fillStyle = markSelectedPlate;
+      context.fillRect(x - r * 1.5, glyphY - r * 1.5, r * 3, r * 3);
+    }
+    context.fillStyle = markColour;
+    context.strokeStyle = markColour;
     context.lineWidth = 1.5 * dpr;
     if (mark.kind === "beat") {
       context.beginPath();
@@ -546,7 +568,7 @@ function drawOverview(context: CanvasRenderingContext2D) {
   const { dpr, width } = size.value;
   const top = lane.top * dpr;
   const height = lane.height * dpr;
-  context.fillStyle = "#0b1117";
+  context.fillStyle = overviewBackground;
   context.fillRect(0, top, width * dpr, height);
   const view = overviewView.value;
   const columns = Math.round(width * dpr);
@@ -817,7 +839,7 @@ defineExpose({ cancelDrag });
   flex: 1 1 auto;
   min-height: 0;
   overflow: hidden;
-  background: #101820;
+  background: var(--well, #101820);
 }
 
 .timing-stage-canvas {
@@ -837,9 +859,9 @@ defineExpose({ cancelDrag });
   top: 28px;
   right: 12px;
   margin: 0;
-  color: oklch(80% 0.01 255);
+  color: var(--ink-secondary, oklch(80% 0.01 255));
   font-family: var(--font-data);
-  font-size: 0.55rem;
+  font-size: var(--text-xs, 11px);
   pointer-events: none;
 }
 </style>

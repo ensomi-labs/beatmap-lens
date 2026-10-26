@@ -40,12 +40,25 @@ function apply(input: HTMLInputElement) {
 }
 
 .long-note-tail-control > span {
-  font-size: 12px;
+  color: var(--ink-secondary);
+  font-size: var(--text-xs);
+}
+
+.long-note-tail-control small {
+  color: var(--ink-muted);
 }
 
 .long-note-tail-control input {
   width: 100%;
-  min-height: 40px;
+  min-height: var(--control-h);
   margin: 0;
+  padding: 0 6px;
+  color: var(--ink);
+  border: 0;
+  border-radius: var(--radius-control);
+  background: var(--field);
+  box-shadow: inset 0 0 0 1px var(--field-edge);
+  font-family: var(--font-data);
+  font-size: var(--text-xs);
 }
 </style>

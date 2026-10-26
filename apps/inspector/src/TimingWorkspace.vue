@@ -1,8 +1,11 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, shallowRef, triggerRef, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, triggerRef, watch } from "vue";
 import AudioVolumeControl from "./AudioVolumeControl.vue";
 import { isNativeActivationTarget, isTypingTarget } from "./annotation/keyboard-targets";
 import DraftNumberInput from "./DraftNumberInput.vue";
+import PanelSection from "./layout/PanelSection.vue";
+import type { PaneSpec } from "./layout/pane-layout";
+import WorkspaceFrame from "./layout/WorkspaceFrame.vue";
 import TimingStage, { type StageProposal } from "./TimingStage.vue";
 import { TimingAudioEngine } from "./timing/audio-engine";
 import { timingJson, timingRequest } from "./timing/client";
@@ -90,6 +93,20 @@ const singleShotKeys = new Set([
 ]);
 /** Milliseconds the nudge buttons move the selected marks. */
 const nudgeStepsMs = [-15, -5, -2, 2, 5, 15] as const;
+const passagesPane: PaneSpec = {
+  id: "timing-passages",
+  label: "Passages",
+  defaultSize: 232,
+  min: 168,
+  max: 420,
+};
+const detailsPane: PaneSpec = {
+  id: "timing-inspector",
+  label: "Marks and settings",
+  defaultSize: 320,
+  min: 268,
+  max: 520,
+};
 
 interface TimingPreferences {
   volume: number;
@@ -170,6 +187,7 @@ const rateChanged = ref(false);
 const reopenNeeded = ref(false);
 
 // Stage
+const workspaceFrame = ref<InstanceType<typeof WorkspaceFrame>>();
 const stage = ref<InstanceType<typeof TimingStage>>();
 const stageWidth = ref(0);
 const devicePixelRatio = ref(1);
@@ -197,6 +215,7 @@ const bounds = computed<TimeRange>(() => {
     endMs: Math.min(durationMs, row.end_ms + row.context_after_ms),
   };
 });
+const sampleRate = computed(() => passage.value?.audio.sample_rate ?? 44_100);
 const draft = computed(() => drafts.value.get(passage.value?.id ?? ""));
 const marks = computed(() => draft.value?.state.marks ?? []);
 const selected = computed(() => (draft.value ? selectedMark(draft.value.state) : undefined));
@@ -951,18 +970,25 @@ function pageProvenance(): PageProvenance {
   };
 }
 
+/** Focuses a field of the details pane, showing the pane first if it is hidden. */
+function focusDetailsField(id: string) {
+  const focus = () => document.getElementById(id)?.focus();
+  if (workspaceFrame.value?.showPane("right")) void nextTick(focus);
+  else focus();
+}
+
 async function save() {
   const row = passage.value;
   const current = draft.value;
   if (!row || !current || saving.value || !blind.value) return;
   if (!preferences.value.setup.trim()) {
     error.value = "Describe the playback setup before saving.";
-    document.getElementById("timing-setup")?.focus();
+    focusDetailsField("timing-setup");
     return;
   }
   if (!preferences.value.deviceRateHz) {
     error.value = "Choose the output device rate before saving.";
-    document.getElementById("timing-device-rate")?.focus();
+    focusDetailsField("timing-device-rate");
     return;
   }
   // The passage, marks, legend and playback are taken as they are now, since the listener can move
@@ -1257,46 +1283,116 @@ function handleKeydown(event: KeyboardEvent) {
     <template v-else>
       <p class="timing-desktop-note">Timing mode needs a desktop window wider than 920 px.</p>
 
-      <div
-        class="annotation-workspace timing-workspace"
+      <WorkspaceFrame
+        ref="workspaceFrame"
+        class="timing-workspace"
         :class="{ 'is-passages-hidden': preferences.passagesHidden }"
+        layout-key="timing"
+        mode="timing"
+        :mode-disabled="busy || saving"
+        :left="passagesPane"
+        :right="detailsPane"
+        :left-collapsed="preferences.passagesHidden"
+        @update:left-collapsed="setPreference('passagesHidden', $event)"
+        @change-mode="changeMode"
       >
-        <aside
-          v-show="!preferences.passagesHidden"
-          id="timing-passages"
-          class="annotation-rail annotation-source-rail"
-          aria-labelledby="passages-heading"
-        >
-          <div class="active-workspace-identity">
-            <div class="brand-lockup">
-              <span class="brand-mark" aria-hidden="true"></span>
-              <div>
-                <p class="brand-name">Beatmap Lens</p>
-                <p class="brand-edition">Beat timing</p>
-              </div>
-            </div>
-            <WorkspaceModeSwitch
-              model-value="timing"
-              :disabled="busy || saving"
-              @update:model-value="changeMode"
-            />
-            <div class="active-dataset-identity">
-              <span>{{ marksFile }}</span>
-              <strong>{{ opened.id }}</strong>
-            </div>
+        <template #toolbar>
+          <div class="toolbar-identity toolbar-optional timing-identity" :title="opened.marks_path">
+            <strong>{{ opened.id }}</strong>
+            <span>{{ marksFile }}</span>
           </div>
+          <span class="toolbar-divider" aria-hidden="true"></span>
+          <fieldset class="toolbar-group timing-transport" aria-label="Playback controls">
+            <button
+              class="tool-button tool-button--play"
+              type="button"
+              :disabled="audioState !== 'ready'"
+              :aria-pressed="playing"
+              aria-keyshortcuts="Space"
+              title="Play or pause (Space); Shift+Space plays the loop region once"
+              @click="togglePlayback"
+            >
+              <svg viewBox="0 0 16 16" aria-hidden="true">
+                <path v-if="playing" d="M5.5 3.5v9M10.5 3.5v9" />
+                <path v-else class="tool-icon-fill" d="M5 3.3v9.4L12.6 8z" />
+              </svg>
+              {{ playing ? "Pause" : "Play" }}
+            </button>
+            <button
+              class="tool-button"
+              type="button"
+              :disabled="audioState !== 'ready'"
+              aria-keyshortcuts="Escape"
+              title="Stop at once (Esc)"
+              @click="stop"
+            >
+              <svg viewBox="0 0 16 16" aria-hidden="true">
+                <rect class="tool-icon-fill" x="4" y="4" width="8" height="8" rx="1" />
+              </svg>
+              Stop
+            </button>
+            <button
+              class="tool-button"
+              type="button"
+              :disabled="audioState !== 'ready'"
+              :aria-pressed="looping"
+              aria-keyshortcuts="L"
+              title="Loop the loop region (L)"
+              @click="toggleLoop"
+            >
+              <svg viewBox="0 0 16 16" aria-hidden="true">
+                <path d="M3 8a4 4 0 0 1 4-4h5M10.5 2.2 12.5 4l-2 1.8M13 8a4 4 0 0 1-4 4H4M5.5 13.8 3.5 12l2-1.8" />
+              </svg>
+              Loop
+            </button>
+            <button
+              class="tool-button toolbar-optional"
+              type="button"
+              :disabled="audioState !== 'ready'"
+              aria-keyshortcuts="B"
+              title="Place a beat at the playhead, or where it is heard while playing (B)"
+              @pointerdown="onMarkButton('beat', $event)"
+              @click="onMarkButton('beat', $event)"
+            >
+              Beat <kbd>B</kbd>
+            </button>
+          </fieldset>
+          <div class="time-counter timing-counter" title="Playhead time and sample">
+            <span class="sr-only">Playhead</span>
+            <span class="time-counter-main">{{ formatSourceTime(playheadMs, devicePxMs < 1 ? 1 : 0) }}</span>
+            <span class="time-counter-sub">n {{ nearestSample(playheadMs, sampleRate) }}</span>
+          </div>
+        </template>
 
-          <header class="annotation-rail-header">
-            <div>
-              <p class="section-kicker"><span class="section-number">01</span> Session</p>
-              <h2 id="passages-heading">Passages</h2>
-            </div>
-            <span class="rail-count">
-              {{ opened.passages.filter((row) => row.saved).length }} / {{ opened.passages.length }}
+        <template #toolbar-end>
+          <span class="health-status timing-blind" :class="`health-status--${revealed ? 'ready' : 'idle'}`">
+            <span class="health-dot" aria-hidden="true"></span>
+            {{ revealed ? "Revealed" : "Blind" }}
+          </span>
+          <span class="health-status timing-status" :class="`health-status--${status.tone}`" aria-live="polite">
+            <span class="health-dot" aria-hidden="true"></span>
+            {{ status.text }}
+          </span>
+          <button
+            class="tool-button tool-button--primary timing-save"
+            type="button"
+            :disabled="saving || !blind"
+            aria-keyshortcuts="Meta+S Control+S Enter"
+            title="Save this passage's marks (Cmd/Ctrl+S or Enter)"
+            @click="save"
+          >
+            {{ saving ? "Saving" : "Save marks" }}
+          </button>
+        </template>
+
+        <template #left>
+          <header class="pane-header">
+            <h2 id="passages-heading">Passages</h2>
+            <span class="pane-count">
+              {{ opened.passages.filter((row) => row.saved).length }} / {{ opened.passages.length }} saved
             </span>
           </header>
-
-          <nav class="task-list" aria-label="Passages">
+          <nav class="task-list timing-passage-list" aria-labelledby="passages-heading">
             <button
               v-for="(row, index) in opened.passages"
               :key="row.id"
@@ -1309,7 +1405,10 @@ function handleKeydown(event: KeyboardEvent) {
             >
               <span
                 class="task-status-mark"
-                :class="{ 'task-status-mark--complete': row.saved }"
+                :class="{
+                  'task-status-mark--complete': row.saved,
+                  'task-status-mark--draft': drafts.get(row.id) && isDirty(drafts.get(row.id) as Draft),
+                }"
                 aria-hidden="true"
               ></span>
               <span class="task-copy">
@@ -1327,308 +1426,291 @@ function handleKeydown(event: KeyboardEvent) {
               </span>
             </button>
           </nav>
-
-          <section v-if="passage" class="rail-section" aria-labelledby="passage-heading">
-            <h3 id="passage-heading">Passage</h3>
-            <dl class="compact-facts">
-              <div v-if="passage.flags.length">
-                <dt>Flags</dt>
-                <dd>{{ passage.flags.join(", ") }}</dd>
-              </div>
-              <div>
-                <dt>Hint</dt>
-                <dd>{{ passage.hint || "—" }}</dd>
-              </div>
-            </dl>
-          </section>
-
-          <section class="rail-section">
-            <button class="button button--quiet" type="button" :disabled="busy" @click="close">
+          <footer class="pane-footer">
+            <button class="tool-button" type="button" :disabled="busy" @click="close">
               Open another session
             </button>
-          </section>
-        </aside>
+          </footer>
+        </template>
 
-        <section class="annotation-stage timing-stage-column" aria-label="Timing stage">
-          <header v-if="passage" class="timing-hud">
-            <div class="timing-hud-line">
-              <button
-                type="button"
-                class="timing-hud-toggle"
-                aria-controls="timing-passages"
-                :aria-expanded="!preferences.passagesHidden"
-                @click="setPreference('passagesHidden', !preferences.passagesHidden)"
-              >
-                {{ preferences.passagesHidden ? "Show passages" : "Hide passages" }}
-              </button>
-              <strong>
-                Passage {{ String(passageIndex + 1).padStart(2, "0") }} of
-                {{ opened.passages.length }} · {{ formatSourceTime(passage.start_ms) }}–{{
-                  formatSourceTime(passage.end_ms)
-                }}
-              </strong>
-              <span class="health-status" :class="`health-status--${revealed ? 'ready' : 'idle'}`">
+        <template #main>
+          <section class="timing-stage-column" aria-label="Timing stage">
+            <header v-if="passage" class="timing-hud">
+              <div class="stage-toolbar">
+                <div class="stage-identity">
+                  <strong>
+                    Passage {{ String(passageIndex + 1).padStart(2, "0") }} of
+                    {{ opened.passages.length }}
+                  </strong>
+                  <span class="data">
+                    {{ formatSourceTime(passage.start_ms) }}–{{ formatSourceTime(passage.end_ms) }}
+                  </span>
+                  <span v-for="flag in passage.flags" :key="flag" class="stage-flag">{{ flag }}</span>
+                  <span v-if="passage.hint" class="timing-hud-hint" :title="passage.hint">
+                    {{ passage.hint }}
+                  </span>
+                </div>
+                <div class="toolbar-group" role="group" aria-label="Playback rate">
+                  <span class="toolbar-label">Rate</span>
+                  <div class="segmented">
+                    <button
+                      v-for="value in playbackRates"
+                      :key="value"
+                      type="button"
+                      :aria-pressed="rate === value"
+                      @click="setRate(value)"
+                    >
+                      {{ value }}×
+                    </button>
+                  </div>
+                </div>
+                <div class="toolbar-group" role="group" aria-label="Zoom">
+                  <span class="toolbar-label">Zoom</span>
+                  <div class="segmented">
+                    <button type="button" aria-label="Zoom out" aria-keyshortcuts="-" title="Zoom out (−)" @click="zoom(2)">−</button>
+                    <button type="button" aria-label="Zoom in" aria-keyshortcuts="+" title="Zoom in (+)" @click="zoom(0.5)">+</button>
+                    <button type="button" aria-keyshortcuts="0" title="Fit the passage (0)" @click="fitPassage">Fit</button>
+                    <button type="button" aria-keyshortcuts="Z" title="0.5 ms per pixel, or back to fit (Z)" @click="toggleFineZoom">Fine</button>
+                  </div>
+                </div>
+                <button
+                  class="tool-button"
+                  type="button"
+                  :aria-pressed="follow"
+                  aria-keyshortcuts="F"
+                  title="Keep the playhead in view while playing (F)"
+                  @click="follow = !follow"
+                >
+                  Follow
+                </button>
+                <div class="toolbar-group" role="group" aria-label="Loop region">
+                  <span class="toolbar-label">Loop</span>
+                  <div class="segmented">
+                    <button type="button" aria-keyshortcuts="I" title="Loop starts at the playhead (I)" @click="setLoopEdge('startMs')">In</button>
+                    <button type="button" aria-keyshortcuts="O" title="Loop ends at the playhead (O)" @click="setLoopEdge('endMs')">Out</button>
+                  </div>
+                </div>
+              </div>
+              <p v-if="rateWarning" class="notice-bar timing-hud-warning" role="status">
                 <span class="health-dot" aria-hidden="true"></span>
-                {{ revealed ? "Revealed" : "Blind" }}
-              </span>
-              <span class="health-status" :class="`health-status--${status.tone}`" aria-live="polite">
-                <span class="health-dot" aria-hidden="true"></span>
-                {{ status.text }}
-              </span>
-            </div>
-            <div class="timing-hud-line timing-hud-data">
-              <span>{{ formatSourceTime(playheadMs, devicePxMs < 1 ? 1 : 0) }}</span>
-              <span>zoom {{ zoomLabel }}</span>
-              <span>follow {{ follow ? "on" : "off" }}</span>
-              <span>
-                loop {{ looping ? "on" : "off" }} {{ formatSourceTime(loopRegion.startMs) }}–{{
-                  formatSourceTime(loopRegion.endMs)
-                }}
-              </span>
-              <span>{{ rate }}×</span>
-              <span v-if="preferences.passagesHidden && passage.hint" class="timing-hud-hint">
-                hint: {{ passage.hint }}
-              </span>
-              <span v-if="silenceMs !== undefined" class="timing-warning">
-                silence at {{ formatSourceTime(silenceMs) }}; an EQ app may soften the next onset
-              </span>
-            </div>
-            <p v-if="rateWarning" class="timing-hud-warning" role="status">
-              <span class="health-dot" aria-hidden="true"></span>
-              {{ rateWarning }}
-            </p>
-            <p v-if="error && blind" class="timing-hud-error" role="alert">
-              <span class="health-dot" aria-hidden="true"></span>
-              {{ error }}
-            </p>
-          </header>
-          <TimingStage
-            v-if="blind && audioBuffer && passage"
-            ref="stage"
-            :buffer="audioBuffer"
-            :span="span"
-            :bounds="bounds"
-            :view="view"
-            :proposals="stageProposals"
-            :marks="marks"
-            :selected-ids="draft?.state.selectedIds ?? []"
-            :playhead-ms="playheadMs"
-            :loop-region="loopRegion"
-            :looping="looping"
-            @resize="onStageResize"
-            @update:view="setView"
-            @place="(kind, timeMs) => place(kind, timeMs, 'click')"
-            @select="selectFromStage"
-            @seek="seek"
-            @loop-region="setLoopRegion"
-          />
-          <div v-else-if="error" class="stage-message">
-            <p class="inline-message inline-message--error" role="alert">{{ error }}</p>
-            <button class="button button--quiet" type="button" @click="select(passageIndex)">
-              Reload passage
-            </button>
-          </div>
-          <div v-else class="stage-empty">
-            {{ audioState === "loading" ? "Loading audio" : "Loading passage" }}
-          </div>
-        </section>
-
-        <aside class="annotation-rail annotation-details-rail timing-details" aria-label="Details">
-          <section class="details-transport" aria-label="Playback">
-            <div class="details-transport-status">
-              <div>
-                <span>Playhead</span>
-                <strong>{{ formatSourceTime(playheadMs) }}</strong>
-              </div>
-              <div class="details-transport-state">
-                <span>{{ revealed ? "Revealed" : "Blind" }}</span>
-                <span class="health-status" :class="`health-status--${status.tone}`">
-                  <span class="health-dot" aria-hidden="true"></span>
-                  {{ status.text }}
-                </span>
-              </div>
-            </div>
-
-            <fieldset class="transport-controls timing-transport" aria-label="Playback controls">
-              <button
-                class="transport-button transport-button--primary"
-                type="button"
-                :disabled="audioState !== 'ready'"
-                :aria-pressed="playing"
-                aria-keyshortcuts="Space"
-                @click="togglePlayback"
-              >
-                {{ playing ? "Pause" : "Play" }}
-              </button>
-              <button
-                class="transport-button"
-                :class="{ 'is-active': looping }"
-                type="button"
-                :disabled="audioState !== 'ready'"
-                :aria-pressed="looping"
-                aria-keyshortcuts="L"
-                @click="toggleLoop"
-              >
-                Loop
-              </button>
-              <button
-                class="transport-button"
-                type="button"
-                :disabled="audioState !== 'ready'"
-                aria-keyshortcuts="Escape"
-                @click="stop"
-              >
-                Stop
-              </button>
-              <button
-                class="transport-button"
-                type="button"
-                :disabled="audioState !== 'ready'"
-                aria-keyshortcuts="B"
-                title="Place a beat at the playhead, or where it is heard while playing (B)"
-                @pointerdown="onMarkButton('beat', $event)"
-                @click="onMarkButton('beat', $event)"
-              >
-                Beat <kbd>B</kbd>
-              </button>
-            </fieldset>
-
-            <div class="transport-tuning">
-              <div class="speed-controls">
-                <span>Rate</span>
-                <div class="speed-presets" :style="{ '--count': playbackRates.length }">
-                  <button
-                    v-for="value in playbackRates"
-                    :key="value"
-                    type="button"
-                    :class="{ 'is-active': rate === value }"
-                    :aria-pressed="rate === value"
-                    @click="setRate(value)"
-                  >
-                    {{ value }}×
-                  </button>
-                </div>
-              </div>
-              <div class="speed-controls">
-                <span>Zoom</span>
-                <div class="speed-presets" style="--count: 4">
-                  <button type="button" aria-keyshortcuts="+" @click="zoom(0.5)">In</button>
-                  <button type="button" aria-keyshortcuts="-" @click="zoom(2)">Out</button>
-                  <button type="button" aria-keyshortcuts="0" @click="fitPassage">Fit</button>
-                  <button type="button" aria-keyshortcuts="Z" @click="toggleFineZoom">Fine</button>
-                </div>
-              </div>
-              <div class="speed-controls">
-                <span>Follow</span>
-                <div class="speed-presets" style="--count: 3">
-                  <button
-                    type="button"
-                    :class="{ 'is-active': follow }"
-                    :aria-pressed="follow"
-                    aria-keyshortcuts="F"
-                    @click="follow = !follow"
-                  >
-                    {{ follow ? "On" : "Off" }}
-                  </button>
-                  <button type="button" aria-keyshortcuts="I" @click="setLoopEdge('startMs')">
-                    Loop in
-                  </button>
-                  <button type="button" aria-keyshortcuts="O" @click="setLoopEdge('endMs')">
-                    Loop out
-                  </button>
-                </div>
-              </div>
-              <AudioVolumeControl :model-value="preferences.volume" @update:model-value="setVolume" />
-              <label class="timing-check">
-                <input
-                  type="checkbox"
-                  :checked="loudnessMatch"
-                  @change="setLoudnessMatch(($event.target as HTMLInputElement).checked)"
-                />
-                <span>
-                  Match loudness
-                  <output>{{ (passage?.loudness_gain_db ?? 0).toFixed(1) }} dB</output>
-                </span>
-              </label>
-              <p v-if="(passage?.loudness_gain_db ?? 0) > 0" class="setup-note">
-                Gains above 0 dB are shown but not applied.
+                {{ rateWarning }}
               </p>
-              <label class="timing-check">
-                <input
-                  type="checkbox"
-                  :checked="preferences.markClicks"
-                  aria-keyshortcuts="C"
-                  @change="setMarkClicks(($event.target as HTMLInputElement).checked)"
-                />
-                <span>Click on my beats <kbd>C</kbd></span>
-              </label>
+              <p v-if="silenceMs !== undefined" class="notice-bar timing-hud-silence">
+                <span class="health-dot" aria-hidden="true"></span>
+                Digital silence at {{ formatSourceTime(silenceMs) }}; an EQ app may soften the next
+                onset.
+              </p>
+              <p v-if="error && blind" class="notice-bar notice-bar--error timing-hud-error" role="alert">
+                <span class="health-dot" aria-hidden="true"></span>
+                {{ error }}
+              </p>
+            </header>
+            <TimingStage
+              v-if="blind && audioBuffer && passage"
+              ref="stage"
+              :buffer="audioBuffer"
+              :span="span"
+              :bounds="bounds"
+              :view="view"
+              :proposals="stageProposals"
+              :marks="marks"
+              :selected-ids="draft?.state.selectedIds ?? []"
+              :playhead-ms="playheadMs"
+              :loop-region="loopRegion"
+              :looping="looping"
+              @resize="onStageResize"
+              @update:view="setView"
+              @place="(kind, timeMs) => place(kind, timeMs, 'click')"
+              @select="selectFromStage"
+              @seek="seek"
+              @loop-region="setLoopRegion"
+            />
+            <div v-else-if="error" class="stage-message">
+              <p class="inline-message inline-message--error" role="alert">{{ error }}</p>
+              <button class="tool-button" type="button" @click="select(passageIndex)">
+                Reload passage
+              </button>
+            </div>
+            <div v-else class="stage-empty">
+              {{ audioState === "loading" ? "Loading audio" : "Loading passage" }}
             </div>
           </section>
+        </template>
 
-          <section class="editor-section" aria-labelledby="offset-heading">
-            <div class="audio-offset-control">
-              <div class="transport-control-label">
-                <span id="offset-heading">Playhead offset</span>
-                <small>Wall-clock ms; positive moves the bar earlier</small>
+        <template #right>
+          <div class="timing-details">
+            <PanelSection id="timing-marks" title="Marks">
+              <template #meta>
+                {{ selection.length ? `${selection.length} of ${marks.length} selected` : `${marks.length}` }}
+              </template>
+              <div class="timing-mark-actions" role="group" aria-label="Mark actions">
+                <button
+                  type="button"
+                  class="tool-button"
+                  aria-keyshortcuts="B"
+                  title="Place a beat at the playhead, or where it is heard while playing (B)"
+                  @pointerdown="onMarkButton('beat', $event)"
+                  @click="onMarkButton('beat', $event)"
+                >
+                  Beat <kbd>B</kbd>
+                </button>
+                <button
+                  type="button"
+                  class="tool-button"
+                  aria-keyshortcuts="N"
+                  title="Place an unbeat at the playhead, or where it is heard while playing (N)"
+                  @pointerdown="onMarkButton('unbeat', $event)"
+                  @click="onMarkButton('unbeat', $event)"
+                >
+                  Unbeat <kbd>N</kbd>
+                </button>
+                <button
+                  type="button"
+                  class="tool-button"
+                  :disabled="!selection.length"
+                  aria-keyshortcuts="K"
+                  title="Flip the selected marks between beat and unbeat (K)"
+                  @click="updateMarks((state) => flipSelected(state, revealed))"
+                >
+                  Flip <kbd>K</kbd>
+                </button>
+                <button
+                  type="button"
+                  class="tool-button"
+                  :disabled="!selection.length"
+                  aria-keyshortcuts="Delete"
+                  title="Delete the selected marks (Delete)"
+                  @click="updateMarks(removeSelected)"
+                >
+                  Delete
+                </button>
+                <button
+                  type="button"
+                  class="tool-button"
+                  :disabled="!draft?.state.past.length"
+                  aria-keyshortcuts="Meta+Z Control+Z"
+                  title="Undo (Cmd/Ctrl+Z)"
+                  @click="updateMarks(undo)"
+                >
+                  Undo
+                </button>
+                <button
+                  type="button"
+                  class="tool-button"
+                  :disabled="!draft?.state.future.length"
+                  aria-keyshortcuts="Meta+Shift+Z Control+Shift+Z"
+                  title="Redo (Cmd/Ctrl+Shift+Z)"
+                  @click="updateMarks(redo)"
+                >
+                  Redo
+                </button>
               </div>
-              <div class="audio-offset-editor timing-offset-editor">
-                <button
-                  type="button"
-                  title="Shift: 10 ms"
-                  @click="setPlayheadOffset(preferences.playheadOffsetMs - ($event.shiftKey ? 10 : 1))"
-                >
-                  −1
-                </button>
-                <label for="timing-offset">
-                  <span class="sr-only">Playhead offset in milliseconds</span>
-                  <DraftNumberInput
-                    id="timing-offset"
-                    step="1"
-                    :model-value="preferences.playheadOffsetMs"
-                    @update:model-value="setPlayheadOffset"
-                  />
-                  <small>ms</small>
-                </label>
-                <button
-                  type="button"
-                  title="Shift: 10 ms"
-                  @click="setPlayheadOffset(preferences.playheadOffsetMs + ($event.shiftKey ? 10 : 1))"
-                >
-                  +1
-                </button>
-                <button
-                  type="button"
-                  :disabled="preferences.playheadOffsetMs === 0"
-                  @click="setPlayheadOffset(0)"
-                >
-                  Reset
-                </button>
-              </div>
-              <small v-if="offsetNeedsCheck" class="timing-warning">
-                The output changed since the offset was set; check it again.
-              </small>
-            </div>
-            <button
-              class="button button--quiet timing-wide"
-              type="button"
-              :disabled="busy || saving"
-              @click="select(passageIndex)"
-            >
-              Reopen audio after a device change
-            </button>
+              <fieldset class="timing-nudge" aria-labelledby="nudge-label">
+                <span id="nudge-label" class="toolbar-label">Move selected, ms</span>
+                <div class="segmented">
+                  <button
+                    v-for="step in nudgeStepsMs"
+                    :key="step"
+                    type="button"
+                    :disabled="!selection.length"
+                    :title="`Move the selected marks ${Math.abs(step)} ms ${step > 0 ? 'later' : 'earlier'}`"
+                    @click="nudge(step)"
+                  >
+                    {{ step > 0 ? `+${step}` : `−${-step}` }}
+                  </button>
+                </div>
+              </fieldset>
+              <ol class="timing-mark-list" aria-label="Marks in time order">
+                <li v-for="mark in marks" :key="mark.id">
+                  <button
+                    type="button"
+                    :class="{ 'is-active': selectedIds.has(mark.id) }"
+                    :aria-pressed="selectedIds.has(mark.id)"
+                    @click="selectFromList(mark, $event)"
+                  >
+                    <span class="timing-mark-glyph" aria-hidden="true">{{ mark.kind === "beat" ? "▼" : "⊘" }}</span>
+                    <span class="timing-mark-time">{{ formatSourceTime(mark.time_ms, 3) }}</span>
+                    <span class="timing-mark-sample">
+                      n {{ nearestSample(mark.time_ms, sampleRate) }}
+                    </span>
+                    <span class="timing-mark-kind">{{ mark.kind }}{{ mark.blind ? "" : " · seen" }}</span>
+                  </button>
+                </li>
+                <li v-if="!marks.length" class="timing-mark-empty">
+                  No marks yet. Shift+click the waveform or press B.
+                </li>
+              </ol>
+              <details class="timing-help">
+                <summary>Mouse and keys</summary>
+                <p>
+                  Click or drag on the waveform selects marks; ⌘-click adds or removes one.
+                  Shift+click places a beat, right-click an unbeat. ←/→ nudge 1 ms (Shift 0.1 ms),
+                  , and . one sample. [ and ] visit marks. Delete removes the selection. Pan with
+                  the wheel, by dragging the ruler, or with right- or Ctrl-drag.
+                </p>
+                <p>
+                  While playing, B, N and the Beat buttons mark the moment of the press as heard,
+                  without the playhead offset. Taps usually land some tens of ms early; refine them
+                  on the waveform.
+                </p>
+              </details>
+            </PanelSection>
 
-            <div class="timing-field-pair">
-              <label class="field-stack timing-inline-field" for="timing-preroll">
-                <span>Pre-roll ms (≥ {{ minimumPrerollMs }})</span>
-                <DraftNumberInput
-                  id="timing-preroll"
-                  :min="minimumPrerollMs"
-                  step="10"
-                  :model-value="preferences.prerollMs"
-                  @update:model-value="setPreroll"
+            <PanelSection id="timing-proposals" :title="revealed ? 'Proposals' : 'Proposals (blind)'">
+              <template v-if="stageProposals.length" #actions>
+                <button
+                  type="button"
+                  class="tool-button"
+                  :aria-pressed="Boolean(hiddenByP)"
+                  aria-keyshortcuts="P"
+                  title="Hide every proposal, or bring back the ones that were on (P)"
+                  @click="toggleAllProposals"
+                >
+                  {{ hiddenByP ? "Show again" : "Hide all" }} <kbd>P</kbd>
+                </button>
+              </template>
+              <ul class="timing-legend">
+                <li v-for="(proposal, index) in stageProposals" :key="proposal.key">
+                  <button
+                    type="button"
+                    class="timing-legend-row"
+                    :class="{ 'is-off': !proposal.visible }"
+                    :aria-pressed="proposal.visible"
+                    :aria-keyshortcuts="index < 9 ? String(index + 1) : undefined"
+                    @click="toggleProposal(index)"
+                  >
+                    <span class="timing-legend-index">{{ index + 1 }}</span>
+                    <span
+                      class="timing-swatch"
+                      :style="{ background: proposalColour(proposal.colour_index).colour }"
+                      aria-hidden="true"
+                    ></span>
+                    <span class="timing-legend-name">
+                      {{ proposalColour(proposal.colour_index).name }}
+                      <strong v-if="proposalName(proposal.key)">{{ proposalName(proposal.key) }}</strong>
+                    </span>
+                    <span class="timing-legend-state">{{ proposal.visible ? "on" : "off" }}</span>
+                  </button>
+                </li>
+                <li v-if="!stageProposals.length" class="setup-note">No proposals for this passage.</li>
+              </ul>
+              <p v-if="blind?.names_error" class="setup-note timing-warning">
+                Names unavailable: {{ blind.names_error }}
+              </p>
+            </PanelSection>
+
+            <PanelSection id="timing-save" title="Save and reveal" :collapsible="false">
+              <label class="field-stack" for="timing-setup">
+                <span>Playback setup</span>
+                <input
+                  id="timing-setup"
+                  :value="preferences.setup"
+                  placeholder="DT 270 PRO · FineTune bypassed · 48 kHz device"
+                  autocomplete="off"
+                  @input="setPreference('setup', ($event.target as HTMLInputElement).value)"
                 />
               </label>
-              <label class="field-stack timing-inline-field">
+              <label class="field-stack prop-field" for="timing-device-rate">
                 <span>Output device rate</span>
                 <select
                   id="timing-device-rate"
@@ -1641,225 +1723,164 @@ function handleKeydown(event: KeyboardEvent) {
                   </option>
                 </select>
               </label>
-            </div>
+              <button
+                class="tool-button timing-reveal"
+                type="button"
+                :disabled="!canReveal"
+                title="Show the proposal names; only after this passage's marks are saved"
+                @click="revealNames"
+              >
+                {{ revealed ? "Names revealed" : "Reveal names" }}
+              </button>
+              <p v-if="notice" class="inline-message" role="status">{{ notice }}</p>
+              <p class="setup-note timing-output">
+                Marks append to <span>{{ opened.marks_path }}</span>
+              </p>
+            </PanelSection>
 
-            <dl class="compact-facts timing-facts">
-              <div>
-                <dt>Recording</dt>
-                <dd>
-                  {{ passage?.audio.sample_rate.toLocaleString() }} Hz ·
-                  {{ passage?.audio.channels }} ch
-                </dd>
-              </div>
-              <div>
-                <dt>Context</dt>
-                <dd>{{ contextRate?.toLocaleString() ?? "—" }} Hz</dd>
-              </div>
-              <div>
-                <dt>Conversion</dt>
-                <dd :class="{ 'timing-warning': conversion.startsWith('Device converts') }">
-                  {{ conversion }}
-                </dd>
-              </div>
-              <div>
-                <dt>Latency</dt>
-                <dd>
-                  base {{ latencies.base_latency_ms?.toFixed(1) ?? "—" }} · out
-                  {{ latencies.output_latency_ms?.toFixed(1) ?? "—" }} ms
-                </dd>
-              </div>
-            </dl>
-          </section>
+            <PanelSection id="timing-listening" title="Listening">
+              <AudioVolumeControl :model-value="preferences.volume" @update:model-value="setVolume" />
+              <label class="timing-check">
+                <input
+                  type="checkbox"
+                  :checked="loudnessMatch"
+                  @change="setLoudnessMatch(($event.target as HTMLInputElement).checked)"
+                />
+                <span>Match loudness</span>
+                <output class="data">{{ (passage?.loudness_gain_db ?? 0).toFixed(1) }} dB</output>
+              </label>
+              <p v-if="(passage?.loudness_gain_db ?? 0) > 0" class="setup-note">
+                Gains above 0 dB are shown but not applied.
+              </p>
+              <label class="timing-check">
+                <input
+                  type="checkbox"
+                  :checked="preferences.markClicks"
+                  aria-keyshortcuts="C"
+                  @change="setMarkClicks(($event.target as HTMLInputElement).checked)"
+                />
+                <span>Click on my beats</span>
+                <kbd>C</kbd>
+              </label>
+              <label class="prop-row" for="timing-preroll">
+                <span>Pre-roll, ms (≥ {{ minimumPrerollMs }})</span>
+                <DraftNumberInput
+                  id="timing-preroll"
+                  class="prop-input"
+                  :min="minimumPrerollMs"
+                  step="10"
+                  :model-value="preferences.prerollMs"
+                  @update:model-value="setPreroll"
+                />
+              </label>
+            </PanelSection>
 
-          <section class="editor-section" aria-labelledby="proposals-heading">
-            <div class="editor-section-heading">
-              <h3 id="proposals-heading">Proposals {{ revealed ? "" : "(blind)" }}</h3>
-            </div>
-            <ul class="timing-legend">
-              <li v-for="(proposal, index) in stageProposals" :key="proposal.key">
-                <button
-                  type="button"
-                  class="timing-legend-row"
-                  :class="{ 'is-off': !proposal.visible }"
-                  :aria-pressed="proposal.visible"
-                  :aria-keyshortcuts="index < 9 ? String(index + 1) : undefined"
-                  @click="toggleProposal(index)"
-                >
-                  <span class="timing-legend-index">{{ index + 1 }}</span>
-                  <span
-                    class="timing-swatch"
-                    :style="{ background: proposalColour(proposal.colour_index).colour }"
-                    aria-hidden="true"
-                  ></span>
-                  <span class="timing-legend-name">
-                    {{ proposalColour(proposal.colour_index).name }}
-                    <strong v-if="proposalName(proposal.key)">{{ proposalName(proposal.key) }}</strong>
-                  </span>
-                  <span class="timing-legend-state">{{ proposal.visible ? "on" : "off" }}</span>
-                </button>
-              </li>
-              <li v-if="!stageProposals.length" class="setup-note">No proposals for this passage.</li>
-            </ul>
-            <p v-if="blind?.names_error" class="setup-note timing-warning">
-              Names unavailable: {{ blind.names_error }}
-            </p>
-            <button
-              v-if="stageProposals.length"
-              class="button button--quiet timing-wide"
-              type="button"
-              aria-keyshortcuts="P"
-              @click="toggleAllProposals"
-            >
-              {{ hiddenByP ? "Show proposals again" : "Hide all proposals" }}
-            </button>
-          </section>
-
-          <section class="editor-section" aria-labelledby="marks-heading">
-            <div class="editor-section-heading timing-marks-heading">
-              <h3 id="marks-heading">Marks</h3>
-              <span class="rail-count">
-                {{ selection.length ? `${selection.length} of ${marks.length}` : marks.length }}
-              </span>
-            </div>
-            <div class="timing-mark-actions">
-              <button
-                type="button"
-                class="button button--quiet"
-                aria-keyshortcuts="B"
-                @pointerdown="onMarkButton('beat', $event)"
-                @click="onMarkButton('beat', $event)"
-              >
-                Beat at playhead <kbd>B</kbd>
-              </button>
-              <button
-                type="button"
-                class="button button--quiet"
-                aria-keyshortcuts="N"
-                @pointerdown="onMarkButton('unbeat', $event)"
-                @click="onMarkButton('unbeat', $event)"
-              >
-                Unbeat at playhead <kbd>N</kbd>
-              </button>
-              <button
-                type="button"
-                class="button button--quiet"
-                :disabled="!selection.length"
-                aria-keyshortcuts="K"
-                @click="updateMarks((state) => flipSelected(state, revealed))"
-              >
-                Flip kind
-              </button>
-              <button
-                type="button"
-                class="button button--quiet"
-                :disabled="!selection.length"
-                aria-keyshortcuts="Delete"
-                @click="updateMarks(removeSelected)"
-              >
-                Delete
-              </button>
-              <button
-                type="button"
-                class="button button--quiet"
-                :disabled="!draft?.state.past.length"
-                aria-keyshortcuts="Meta+Z Control+Z"
-                @click="updateMarks(undo)"
-              >
-                Undo
-              </button>
-              <button
-                type="button"
-                class="button button--quiet"
-                :disabled="!draft?.state.future.length"
-                aria-keyshortcuts="Meta+Shift+Z Control+Shift+Z"
-                @click="updateMarks(redo)"
-              >
-                Redo
-              </button>
-            </div>
-            <fieldset class="timing-nudge" aria-labelledby="nudge-label">
-              <span id="nudge-label">Move selected, ms</span>
-              <div class="speed-presets" :style="{ '--count': nudgeStepsMs.length }">
-                <button
-                  v-for="step in nudgeStepsMs"
-                  :key="step"
-                  type="button"
-                  :disabled="!selection.length"
-                  :title="`Move the selected marks ${Math.abs(step)} ms ${step > 0 ? 'later' : 'earlier'}`"
-                  @click="nudge(step)"
-                >
-                  {{ step > 0 ? `+${step}` : `−${-step}` }}
-                </button>
+            <PanelSection id="timing-sync" title="Output and sync">
+              <div class="audio-offset-control">
+                <div class="transport-control-label">
+                  <span id="offset-heading">Playhead offset</span>
+                  <small>Wall-clock ms; positive moves the bar earlier</small>
+                </div>
+                <div class="audio-offset-editor timing-offset-editor">
+                  <button
+                    type="button"
+                    title="Shift: 10 ms"
+                    @click="setPlayheadOffset(preferences.playheadOffsetMs - ($event.shiftKey ? 10 : 1))"
+                  >
+                    −1
+                  </button>
+                  <label for="timing-offset">
+                    <span class="sr-only">Playhead offset in milliseconds</span>
+                    <DraftNumberInput
+                      id="timing-offset"
+                      step="1"
+                      :model-value="preferences.playheadOffsetMs"
+                      @update:model-value="setPlayheadOffset"
+                    />
+                    <small>ms</small>
+                  </label>
+                  <button
+                    type="button"
+                    title="Shift: 10 ms"
+                    @click="setPlayheadOffset(preferences.playheadOffsetMs + ($event.shiftKey ? 10 : 1))"
+                  >
+                    +1
+                  </button>
+                  <button
+                    type="button"
+                    :disabled="preferences.playheadOffsetMs === 0"
+                    @click="setPlayheadOffset(0)"
+                  >
+                    Reset
+                  </button>
+                </div>
+                <small v-if="offsetNeedsCheck" class="timing-warning">
+                  The output changed since the offset was set; check it again.
+                </small>
               </div>
-            </fieldset>
-            <ol class="timing-mark-list">
-              <li v-for="mark in marks" :key="mark.id">
-                <button
-                  type="button"
-                  :class="{ 'is-active': selectedIds.has(mark.id) }"
-                  :aria-pressed="selectedIds.has(mark.id)"
-                  @click="selectFromList(mark, $event)"
-                >
-                  <span aria-hidden="true">{{ mark.kind === "beat" ? "▼" : "⊘" }}</span>
-                  <span class="timing-mark-time">{{ formatSourceTime(mark.time_ms, 3) }}</span>
-                  <span class="timing-mark-sample">
-                    n {{ nearestSample(mark.time_ms, passage?.audio.sample_rate ?? 44_100) }}
-                  </span>
-                  <span>{{ mark.kind }}{{ mark.blind ? "" : " · seen" }}</span>
-                </button>
-              </li>
-            </ol>
-            <p class="setup-note">
-              Click or drag on the waveform selects marks; ⌘-click adds or removes one. Shift+click
-              places a beat, right-click an unbeat. ←/→ nudge 1 ms (Shift 0.1 ms), , and . one
-              sample. [ and ] visit marks. Delete removes the selection. Pan with the wheel, by
-              dragging the ruler, or with right- or Ctrl-drag.
-            </p>
-            <p class="setup-note">
-              While playing, B, N and the Beat buttons mark the moment of the press as heard, without
-              the playhead offset. Taps usually land some tens of ms early; refine them on the
-              waveform.
-            </p>
-          </section>
+              <button
+                class="tool-button timing-wide"
+                type="button"
+                :disabled="busy || saving"
+                @click="select(passageIndex)"
+              >
+                Reopen audio after a device change
+              </button>
+              <dl class="compact-facts timing-facts">
+                <div>
+                  <dt>Recording</dt>
+                  <dd>
+                    {{ passage?.audio.sample_rate.toLocaleString() }} Hz ·
+                    {{ passage?.audio.channels }} ch
+                  </dd>
+                </div>
+                <div>
+                  <dt>Context</dt>
+                  <dd>{{ contextRate?.toLocaleString() ?? "—" }} Hz</dd>
+                </div>
+                <div>
+                  <dt>Conversion</dt>
+                  <dd :class="{ 'timing-warning': conversion.startsWith('Device converts') }">
+                    {{ conversion }}
+                  </dd>
+                </div>
+                <div>
+                  <dt>Latency</dt>
+                  <dd>
+                    base {{ latencies.base_latency_ms?.toFixed(1) ?? "—" }} · out
+                    {{ latencies.output_latency_ms?.toFixed(1) ?? "—" }} ms
+                  </dd>
+                </div>
+              </dl>
+            </PanelSection>
+          </div>
+        </template>
 
-          <section class="editor-section" aria-labelledby="save-heading">
-            <div class="editor-section-heading">
-              <h3 id="save-heading">Save</h3>
-            </div>
-            <label class="field-stack">
-              <span>Playback setup</span>
-              <input
-                id="timing-setup"
-                :value="preferences.setup"
-                placeholder="DT 270 PRO · FineTune bypassed · 48 kHz device"
-                autocomplete="off"
-                @input="setPreference('setup', ($event.target as HTMLInputElement).value)"
-              />
-            </label>
-            <button
-              class="button button--primary timing-wide"
-              type="button"
-              :disabled="saving || !blind"
-              aria-keyshortcuts="Meta+S Control+S Enter"
-              @click="save"
-            >
-              {{ saving ? "Saving" : "Save marks" }}
-            </button>
-            <button
-              class="button button--quiet timing-wide"
-              type="button"
-              :disabled="!canReveal"
-              @click="revealNames"
-            >
-              {{ revealed ? "Names revealed" : "Reveal names" }}
-            </button>
-            <p v-if="notice" class="inline-message" role="status">{{ notice }}</p>
-            <p class="setup-note timing-output">
-              Marks append to <span>{{ opened.marks_path }}</span>
-            </p>
-          </section>
-        </aside>
-      </div>
+        <template #status>
+          <span class="status-item">Zoom <b>{{ zoomLabel }}</b></span>
+          <span class="status-item">Follow <b>{{ follow ? "on" : "off" }}</b></span>
+          <span class="status-item">
+            Loop <b>{{ looping ? "on" : "off" }}</b>
+            <b>{{ formatSourceTime(loopRegion.startMs) }}–{{ formatSourceTime(loopRegion.endMs) }}</b>
+          </span>
+          <span class="status-item">Rate <b>{{ rate }}×</b></span>
+          <span v-if="passage" class="status-item">
+            <b>{{ passage.audio.sample_rate.toLocaleString() }} Hz · {{ passage.audio.channels }} ch</b>
+          </span>
+          <span
+            class="status-item"
+            :class="{ 'status-warning': conversion.startsWith('Device converts') || !preferences.deviceRateHz }"
+          >
+            {{ conversion }}
+          </span>
+          <span class="status-item">
+            Offset <b>{{ preferences.playheadOffsetMs }} ms</b>
+          </span>
+          <span class="status-item status-item--end status-item--path" :title="opened.marks_path">
+            {{ opened.marks_path }}
+          </span>
+        </template>
+      </WorkspaceFrame>
     </template>
   </main>
 </template>
@@ -1867,211 +1888,240 @@ function handleKeydown(event: KeyboardEvent) {
 <style scoped>
 .timing-stage-column {
   display: flex;
+  min-height: 0;
+  flex: 1 1 auto;
   flex-direction: column;
-  background: #101820;
+  background: var(--well);
 }
 
 .timing-hud {
-  display: grid;
   flex: 0 0 auto;
-  gap: 4px;
-  padding: 10px 14px;
-  color: oklch(92% 0.01 255);
-  border-bottom: 1px solid oklch(30% 0.02 255);
-  background: #0b1117;
+  border-bottom: 1px solid var(--seam);
 }
 
-.timing-hud-line {
+.stage-toolbar {
   display: flex;
+  min-height: 32px;
   flex-wrap: wrap;
   align-items: center;
-  gap: 6px 14px;
-  min-width: 0;
-  font-size: 0.62rem;
+  gap: 4px 12px;
+  padding: 3px 8px;
+  background: var(--surface-2);
 }
 
-.timing-hud-line strong {
-  font-family: var(--font-data);
-  font-weight: 620;
-}
-
-.timing-hud-warning,
-.timing-hud-error {
+.stage-identity {
   display: flex;
-  align-items: center;
-  gap: 7px;
+  min-width: 180px;
+  flex: 1 1 220px;
+  align-items: baseline;
+  gap: 8px;
+  overflow: hidden;
+  font-size: var(--text-xs);
+  white-space: nowrap;
+}
+
+.stage-identity strong {
+  font-weight: 650;
+}
+
+.stage-identity .data {
+  color: var(--ink-secondary);
+}
+
+.stage-flag {
+  padding: 1px 5px;
+  color: var(--ink-secondary);
+  border-radius: 3px;
+  background: var(--surface-3);
+  font-size: var(--text-2xs);
+}
+
+.timing-hud-hint {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink-muted);
+  text-overflow: ellipsis;
+}
+
+.timing-transport {
   margin: 0;
-  font-size: 0.62rem;
-  font-weight: 600;
-  text-wrap: pretty;
+  padding: 0;
+  border: 0;
 }
 
-.timing-hud-warning {
-  color: oklch(82% 0.14 76);
+.tool-icon-fill {
+  fill: currentColor;
+  stroke: none;
 }
 
-.timing-hud-warning .health-dot {
-  background: var(--warning);
+.timing-identity {
+  max-width: 180px;
 }
 
-.timing-hud-error {
-  color: oklch(92% 0.01 255);
+.timing-blind {
+  color: var(--ink-muted);
+  font-size: var(--text-xs);
 }
 
-.timing-hud-error .health-dot {
-  background: var(--danger);
+.timing-status {
+  min-width: 0;
+  overflow: hidden;
+  font-size: var(--text-xs);
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.timing-hud .health-status {
-  color: oklch(85% 0.01 255);
-  font-size: 0.56rem;
+.timing-passage-list {
+  flex: 1 1 auto;
 }
 
-.timing-hud-data {
-  color: oklch(78% 0.01 255);
-  font-family: var(--font-data);
-  font-size: 0.58rem;
-  font-variant-numeric: tabular-nums;
+.pane-footer {
+  flex: 0 0 auto;
+  padding: 8px;
+  border-top: 1px solid var(--seam);
 }
 
 .timing-details {
-  overflow-y: auto;
-  overscroll-behavior: contain;
-}
-
-.details-transport .timing-transport {
-  grid-template-columns: 1.4fr 1fr 1fr 1.2fr;
-}
-
-.timing-workspace.is-passages-hidden {
-  grid-template-columns: minmax(0, 1fr) minmax(320px, 360px);
-}
-
-@media (max-width: 1160px) {
-  .timing-workspace.is-passages-hidden {
-    grid-template-columns: minmax(0, 1fr) clamp(270px, 28vw, 320px);
-  }
-}
-
-.timing-hud-toggle {
-  min-height: 24px;
-  padding: 2px 8px;
-  color: inherit;
-  font: inherit;
-  border: 1px solid oklch(42% 0.02 255);
-  border-radius: 4px;
-  background: transparent;
-  cursor: pointer;
-}
-
-.timing-hud-toggle:hover {
-  background: oklch(26% 0.02 255);
-}
-
-.timing-hud-toggle:focus-visible {
-  outline: 2px solid var(--signal);
-  outline-offset: 1px;
-}
-
-.details-transport .speed-controls {
-  grid-template-columns: 56px minmax(0, 1fr);
-}
-
-.details-transport .speed-presets {
-  grid-template-columns: repeat(var(--count), minmax(0, 1fr));
-}
-
-.timing-check {
   display: flex;
-  min-height: 40px;
+  min-height: 100%;
+  flex-direction: column;
+}
+
+.timing-mark-actions {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 4px;
+}
+
+.timing-nudge {
+  display: flex;
+  min-width: 0;
   align-items: center;
+  justify-content: space-between;
   gap: 8px;
-  font-size: 12px;
+  margin: 0;
+  padding: 0;
+  border: 0;
 }
 
-.timing-check input {
-  accent-color: var(--signal);
+.timing-nudge .segmented {
+  flex: 1 1 auto;
+  max-width: 240px;
 }
 
-.timing-check output {
-  margin-left: 6px;
-  font-family: var(--font-data);
-  font-variant-numeric: tabular-nums;
+.timing-nudge .segmented button {
+  flex: 1 1 0;
+  min-width: 0;
+  padding: 0 2px;
 }
 
-.timing-offset-editor {
-  grid-template-columns: auto minmax(64px, 1fr) auto auto;
-}
-
-.timing-warning {
-  color: oklch(72% 0.15 76);
-  font-size: 0.55rem;
-}
-
-.timing-details .timing-warning {
-  color: oklch(52% 0.14 76);
-}
-
-.timing-field-pair {
+.timing-mark-list,
+.timing-legend {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px;
-  margin-top: 12px;
-}
-
-.timing-inline-field input,
-.timing-inline-field select {
-  min-height: 40px;
-}
-
-.timing-facts {
-  margin-top: 12px;
-}
-
-.timing-facts dd {
-  font-family: var(--font-data);
-  font-variant-numeric: tabular-nums;
-}
-
-.timing-legend,
-.timing-mark-list {
-  display: grid;
-  gap: 2px;
   margin: 0;
   padding: 0;
   list-style: none;
 }
 
-.timing-legend-row,
-.timing-mark-list button {
+.timing-mark-list {
+  max-height: min(320px, 40vh);
+  overflow-y: auto;
+  border-radius: var(--radius-control);
+  background: var(--field);
+  box-shadow: inset 0 0 0 1px var(--seam);
+}
+
+.timing-mark-list button,
+.timing-legend-row {
   display: grid;
   width: 100%;
-  min-height: 40px;
+  min-height: 24px;
   align-items: center;
   gap: 8px;
   padding: 0 8px;
-  color: var(--ink);
+  color: var(--ink-secondary);
   border: 0;
-  border-radius: 8px;
+  border-radius: 0;
   background: transparent;
   cursor: pointer;
-  font-size: 0.66rem;
+  font-size: var(--text-xs);
   text-align: left;
 }
 
-.timing-legend-row {
-  grid-template-columns: 14px 14px minmax(0, 1fr) auto;
+.timing-mark-list button {
+  grid-template-columns: 12px auto auto minmax(0, 1fr);
 }
 
-.timing-legend-row:hover,
-.timing-mark-list button:hover {
-  background: var(--surface-hover);
+.timing-mark-list li + li button {
+  box-shadow: inset 0 1px 0 oklch(100% 0 0 / 0.03);
+}
+
+.timing-mark-list button.is-active {
+  color: var(--ink);
+  background: var(--signal-soft);
+  box-shadow: inset 2px 0 0 var(--signal);
+}
+
+.timing-mark-glyph {
+  color: var(--ink-muted);
+  font-size: 9px;
+}
+
+.timing-mark-list button.is-active .timing-mark-glyph {
+  color: var(--ink);
+}
+
+.timing-mark-time,
+.timing-mark-sample,
+.timing-legend-index,
+.timing-legend-state {
+  font-family: var(--font-data);
+  font-variant-numeric: tabular-nums;
+}
+
+.timing-mark-time {
+  color: var(--ink);
+}
+
+.timing-mark-sample,
+.timing-mark-kind {
+  color: var(--ink-muted);
+}
+
+.timing-mark-kind {
+  justify-self: end;
+}
+
+.timing-mark-empty {
+  padding: 8px;
+  color: var(--ink-muted);
+  font-size: var(--text-xs);
+}
+
+.timing-help summary {
+  min-height: 22px;
+  color: var(--ink-muted);
+  cursor: pointer;
+  font-size: var(--text-xs);
+}
+
+.timing-help p {
+  margin: 4px 0 0;
+  color: var(--ink-muted);
+  font-size: var(--text-xs);
+  line-height: 1.5;
+  text-wrap: pretty;
+}
+
+.timing-legend-row {
+  grid-template-columns: 12px 12px minmax(0, 1fr) auto;
+  border-radius: var(--radius-control);
 }
 
 .timing-swatch {
-  width: 12px;
-  height: 12px;
-  border-radius: 3px;
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
 }
 
 .timing-legend-row.is-off {
@@ -2079,62 +2129,89 @@ function handleKeydown(event: KeyboardEvent) {
 }
 
 .timing-legend-row.is-off .timing-swatch {
-  opacity: 0.3;
+  opacity: 0.25;
 }
 
 .timing-legend-index,
-.timing-legend-state,
-.timing-mark-time,
-.timing-mark-sample {
-  font-family: var(--font-data);
-  font-variant-numeric: tabular-nums;
-}
-
-.timing-mark-sample {
+.timing-legend-state {
   color: var(--ink-muted);
 }
 
 .timing-legend-name strong {
   margin-left: 6px;
+  color: var(--ink);
   font-weight: 650;
 }
 
-.timing-wide {
-  width: 100%;
-  min-height: 40px;
-  margin-top: 10px;
+@media (hover: hover) {
+  .timing-mark-list button:hover,
+  .timing-legend-row:hover {
+    color: var(--ink);
+    background: var(--surface-hover);
+  }
+
+  .timing-mark-list button.is-active:hover {
+    background: oklch(37% 0.08 258);
+  }
 }
 
-.timing-marks-heading {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-}
-
-.timing-mark-actions {
+.timing-check {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 6px;
-  margin-bottom: 10px;
+  min-height: var(--control-h);
+  grid-template-columns: 16px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  color: var(--ink-secondary);
+  font-size: var(--text-xs);
 }
 
-.timing-mark-actions .button {
-  min-height: 40px;
-  font-size: 0.6rem;
+.timing-check input {
+  margin: 0;
+  accent-color: var(--signal-fill);
 }
 
-.timing-mark-list {
-  max-height: 280px;
-  overflow-y: auto;
+.timing-check output,
+.timing-check kbd {
+  color: var(--ink-muted);
+  font-family: var(--font-data);
+  font-size: var(--text-2xs);
 }
 
-.timing-mark-list button {
-  grid-template-columns: 14px auto auto minmax(0, 1fr);
+.prop-input {
+  width: 88px;
+  min-height: var(--control-h);
+  padding: 0 6px;
+  color: var(--ink);
+  border: 0;
+  border-radius: var(--radius-control);
+  background: var(--field);
+  box-shadow: inset 0 0 0 1px var(--field-edge);
+  font-family: var(--font-data);
+  font-size: var(--text-xs);
+  text-align: right;
 }
 
-.timing-mark-list button.is-active {
-  color: var(--signal);
-  background: var(--signal-soft);
+.timing-offset-editor {
+  grid-template-columns: auto minmax(64px, 1fr) auto auto;
+}
+
+.timing-warning {
+  color: var(--warning);
+  font-size: var(--text-xs);
+}
+
+.timing-wide,
+.timing-reveal {
+  width: 100%;
+}
+
+.timing-facts dd {
+  font-family: var(--font-data);
+  font-variant-numeric: tabular-nums;
+}
+
+.timing-output {
+  font-size: var(--text-2xs);
 }
 
 .timing-output span {
@@ -2142,36 +2219,14 @@ function handleKeydown(event: KeyboardEvent) {
   overflow-wrap: anywhere;
 }
 
-.timing-nudge {
-  display: grid;
-  gap: 6px;
-  min-width: 0;
-  margin: 10px 0 0;
-  padding: 0;
-  border: 0;
-  font-size: 11px;
-}
-
-.timing-nudge .speed-presets {
-  display: grid;
-  grid-template-columns: repeat(var(--count), minmax(0, 1fr));
-}
-
-.timing-nudge .speed-presets button {
-  min-width: 0;
-  padding: 0;
-}
-
-.timing-mark-actions kbd,
-.timing-check kbd {
-  margin-left: 4px;
-  font-family: var(--font-data);
-  font-size: 0.85em;
-  opacity: 0.72;
-}
-
 .timing-desktop-note {
   display: none;
+}
+
+@media (max-width: 1240px) {
+  .timing-workspace :deep(.toolbar-optional) {
+    display: none;
+  }
 }
 
 @media (max-width: 920px) {
@@ -2179,7 +2234,7 @@ function handleKeydown(event: KeyboardEvent) {
     display: block;
     margin: 0;
     padding: 24px;
-    font-size: 0.8rem;
+    font-size: var(--text-md);
   }
 
   .timing-workspace {
