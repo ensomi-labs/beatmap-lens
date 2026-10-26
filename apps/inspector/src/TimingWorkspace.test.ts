@@ -4,12 +4,14 @@ import { createApp, defineComponent, h, nextTick } from "vue";
 import TimingWorkspace from "./TimingWorkspace.vue";
 import { timingJson, timingRequest } from "./timing/client";
 import { type BlindPassageRow, type OpenTiming, staleSessionError } from "./timing/contracts";
+import type { PlayheadMotion } from "./timing/display";
 
 vi.mock("./timing/client", () => ({ timingJson: vi.fn(), timingRequest: vi.fn() }));
 const engine = vi.hoisted(() => ({
   plays: 0,
   loudness: [] as number[],
   positionMs: undefined as number | undefined,
+  motion: undefined as PlayheadMotion | undefined,
   offsets: [] as number[],
   positionTimes: [] as (number | undefined)[],
   clicks: [] as (number[] | null)[],
@@ -39,9 +41,14 @@ vi.mock("./timing/audio-engine", () => ({
       this.playing = false;
       return undefined;
     }
-    position(offsetMs: number, nowMs?: number) {
+    sampleClock() {}
+    motion(offsetMs: number) {
       engine.offsets.push(offsetMs);
-      engine.positionTimes.push(nowMs);
+      return this.playing ? engine.motion : undefined;
+    }
+    shownAt(frameMs: number, offsetMs: number) {
+      engine.offsets.push(offsetMs);
+      engine.positionTimes.push(frameMs);
       return this.playing ? engine.positionMs : undefined;
     }
     heardAt(nowMs: number) {
@@ -122,6 +129,7 @@ beforeEach(() => {
     plays: 0,
     loudness: [],
     positionMs: undefined,
+    motion: undefined,
     offsets: [],
     positionTimes: [],
     clicks: [],
@@ -656,4 +664,31 @@ it("does not repeat a held B or C", async () => {
   await nextTick();
   expect(markIds()).toHaveLength(1);
   expect(engine.clicks.at(-1)).toBeNull();
+});
+
+it("hands the stage the playhead's motion and refreshes the HUD at most every 100 ms", async () => {
+  await opened();
+  const frames: FrameRequestCallback[] = [];
+  vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => frames.push(callback));
+  key(" ");
+  await vi.waitFor(() => expect(frames).toHaveLength(1));
+  const motion = { startPerfMs: 0, holdMs: 100, speed: 1, firstEndMs: 900, loop: null };
+  engine.motion = motion;
+  const frame = async (frameMs: number) => {
+    frames.shift()?.(frameMs);
+    await nextTick();
+  };
+  await frame(0);
+  expect(stage.props["playhead-motion"]).toBe(motion);
+  expect(hud()).toContain("00:00.100");
+  await frame(50);
+  expect(hud()).toContain("00:00.100");
+  // A refit that moves the playhead by a fraction of a millisecond keeps the running motion.
+  engine.motion = { ...motion, startPerfMs: 0.01 };
+  await frame(120);
+  expect(stage.props["playhead-motion"]).toBe(motion);
+  expect(hud()).toContain("00:00.220");
+  key(" ");
+  await nextTick();
+  expect(stage.props["playhead-motion"]).toBeUndefined();
 });

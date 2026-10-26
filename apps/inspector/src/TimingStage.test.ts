@@ -3,11 +3,20 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { createApp, h, nextTick, reactive } from "vue";
 import TimingStage from "./TimingStage.vue";
 import type { Mark } from "./timing/contracts";
+import type { PlayheadMotion } from "./timing/display";
 
 let app: ReturnType<typeof createApp>;
 let frames: FrameRequestCallback[];
 let overlayDraws: number;
 let events: unknown[][];
+/** Web Animations started on the playhead elements. */
+let animations: {
+  element: Element;
+  keyframes: Keyframe[];
+  options: KeyframeAnimationOptions;
+  startTime: number | null;
+  cancelled: boolean;
+}[];
 
 /** A 2D context that accepts every call; `clearRect` happens only when the overlay is drawn. */
 function context(): CanvasRenderingContext2D {
@@ -51,6 +60,7 @@ const proposals: never[] = [];
 
 const props = reactive({
   playheadMs: 100,
+  playheadMotion: undefined as PlayheadMotion | undefined,
   selectedIds: [] as string[],
 });
 
@@ -58,8 +68,28 @@ beforeEach(() => {
   frames = [];
   overlayDraws = 0;
   events = [];
+  animations = [];
   props.playheadMs = 100;
+  props.playheadMotion = undefined;
   props.selectedIds = [];
+  HTMLElement.prototype.animate = function (keyframes, options) {
+    const record = {
+      element: this,
+      keyframes: keyframes as Keyframe[],
+      options: options as KeyframeAnimationOptions,
+      startTime: null as number | null,
+      cancelled: false,
+    };
+    animations.push(record);
+    return {
+      set startTime(value: number) {
+        record.startTime = value;
+      },
+      cancel() {
+        record.cancelled = true;
+      },
+    } as unknown as Animation;
+  };
   vi.stubGlobal(
     "ResizeObserver",
     class {
@@ -94,6 +124,7 @@ beforeEach(() => {
         marks,
         selectedIds: props.selectedIds,
         playheadMs: props.playheadMs,
+        playheadMotion: props.playheadMotion,
         loopRegion,
         looping: false,
         onSelect: (...args: unknown[]) => events.push(["select", ...args]),
@@ -139,17 +170,59 @@ function runFrames() {
   for (const frame of frames.splice(0)) frame(0);
 }
 
-it("redraws the playhead on every change while the frames keep coming", async () => {
+function playhead(): HTMLElement {
+  const element = document.querySelector<HTMLElement>(".timing-stage-playhead");
+  if (!element) throw new Error("No playhead");
+  return element;
+}
+
+it("places the playhead with a transform, like a mark, and redraws no canvas for it", async () => {
   await nextTick();
   runFrames();
-  // Playback moves the playhead from inside each animation frame; the drawing must not wait for
-  // a frame requested from there, which used to be cancelled and requested again every time.
-  for (const timeMs of [150, 200, 250, 300]) {
-    const before = overlayDraws;
+  const before = overlayDraws;
+  for (const timeMs of [150, 200.04, 250]) {
     props.playheadMs = timeMs;
     await nextTick();
-    expect(overlayDraws).toBe(before + 1);
+    // x px is x × 10 ms; a one-device-pixel line sits on the pixel its time falls in.
+    expect(playhead().style.transform).toBe(`translateX(${Math.floor(timeMs / 10)}px)`);
   }
+  expect(overlayDraws).toBe(before);
+  expect(frames).toHaveLength(0);
+});
+
+it("runs the playhead on the compositor while playing, placed again only for a new motion", async () => {
+  await nextTick();
+  runFrames();
+  // Heard from page time 1000 ms at source 100 ms, at full speed, looping 200-400 ms.
+  props.playheadMotion = {
+    startPerfMs: 1000,
+    holdMs: 100,
+    speed: 1,
+    firstEndMs: 400,
+    loop: { startMs: 200, endMs: 400 },
+  };
+  await nextTick();
+  const line = animations.filter((record) => record.element === playhead());
+  expect(line).toHaveLength(2);
+  expect(line.map((record) => record.startTime)).toEqual([1000, 1300]);
+  // Centred on the time, unrounded: the line is 1 px wide.
+  expect(line[0]?.keyframes).toEqual([
+    { transform: "translateX(9.5px)" },
+    { transform: "translateX(39.5px)" },
+  ]);
+  expect(line[1]?.options).toMatchObject({ duration: 200, iterations: Infinity, easing: "linear" });
+  expect(playhead().style.transform).toBe("translateX(9.5px)");
+  // The HUD's readouts while playing move nothing.
+  const count = animations.length;
+  props.playheadMs = 250;
+  await nextTick();
+  expect(animations).toHaveLength(count);
+  // Stopping cancels the animations and holds the playhead still.
+  props.playheadMotion = undefined;
+  props.playheadMs = 321;
+  await nextTick();
+  expect(animations.every((record) => record.cancelled)).toBe(true);
+  expect(playhead().style.transform).toBe("translateX(32px)");
 });
 
 it("keeps a requested base frame instead of requesting another for each change", async () => {
@@ -196,7 +269,7 @@ it("draws the overlay with a pending base frame, so the layers never disagree", 
   props.selectedIds = ["a"];
   await nextTick();
   const before = overlayDraws;
-  props.playheadMs = 500;
+  pointer("pointermove", 50, 50);
   await nextTick();
   expect(overlayDraws).toBe(before);
   runFrames();

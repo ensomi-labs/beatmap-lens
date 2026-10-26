@@ -4,7 +4,7 @@ import { TimingAudioEngine } from "./audio-engine";
 /** The Web Audio surface the engine uses, with a resume the test settles by hand. */
 const audio = vi.hoisted(() => ({
   resumes: [] as (() => void)[],
-  sources: [] as { started: boolean; stopped: boolean; at?: number }[],
+  sources: [] as { started: boolean; stopped: boolean; at?: number; offset?: number }[],
   context: undefined as { currentTime: number } | undefined,
 }));
 
@@ -39,6 +39,7 @@ beforeEach(() => {
       getOutputTimestamp() {
         return { contextTime: 0, performanceTime: 0 };
       }
+      addEventListener() {}
       async close() {}
     },
   );
@@ -61,7 +62,7 @@ beforeEach(() => {
   vi.stubGlobal(
     "AudioBufferSourceNode",
     class extends Node {
-      readonly record: { started: boolean; stopped: boolean; at?: number } = {
+      readonly record: { started: boolean; stopped: boolean; at?: number; offset?: number } = {
         started: false,
         stopped: false,
       };
@@ -70,9 +71,10 @@ beforeEach(() => {
         super();
         audio.sources.push(this.record);
       }
-      start(at?: number) {
+      start(at?: number, offset?: number) {
         this.record.started = true;
         if (at !== undefined) this.record.at = at;
+        if (offset !== undefined) this.record.offset = offset;
       }
       stop() {
         this.record.stopped = true;
@@ -173,4 +175,37 @@ it("gives a tap no heard time until the output has reached the start", async () 
   context.getOutputTimestamp = () => ({ contextTime: 0.05, performanceTime: 1000 });
   expect(engine.heardAt(1000)).toBeCloseTo(20, 9);
   expect(engine.heardAt(970)).toBeUndefined();
+});
+
+it("starts a running context at once, on whole frames, and anchors the frame really played", async () => {
+  const engine = loaded();
+  const first = engine.play(options);
+  audio.resumes[0]?.();
+  await first;
+  if (audio.context) audio.context.currentTime = 1280 / 44_100;
+  // Running now: no resume is awaited, so the source exists as soon as play returns.
+  void engine.play({ fromMs: 3.3, endMs: 10, rate: 1, loop: null });
+  const music = audio.sources.at(-1);
+  expect(audio.resumes).toHaveLength(1);
+  expect(Math.ceil((music?.at ?? 0) * 44_100)).toBe(1280 + 1323);
+  expect(Math.ceil((music?.offset ?? 0) * 44_100)).toBe(146);
+});
+
+it("moves the playhead on the clock model's line, offset for the display only", async () => {
+  const engine = loaded();
+  const play = engine.play({ fromMs: 0, endMs: 10_000, rate: 1, loop: null });
+  audio.resumes[0]?.();
+  await play;
+  const context = engine.context as unknown as { getOutputTimestamp: () => object };
+  context.getOutputTimestamp = () => ({ contextTime: 0.05, performanceTime: 1000 });
+  engine.sampleClock();
+  // The start is at 0.03 s, heard at page time 980 ms; frames show the time heard at frame − offset.
+  expect(engine.motion(0)?.startPerfMs).toBeCloseTo(980, 9);
+  expect(engine.shownAt(1100, 0)).toBeCloseTo(120, 9);
+  expect(engine.shownAt(1100, 20)).toBeCloseTo(100, 9);
+  expect(engine.heardAt(1100)).toBeCloseTo(120, 9);
+  // Stopped, nothing is shown or heard.
+  engine.stop();
+  expect(engine.motion(0)).toBeUndefined();
+  expect(engine.heardAt(1100)).toBeUndefined();
 });
