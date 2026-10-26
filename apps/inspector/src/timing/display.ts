@@ -1,5 +1,5 @@
 import { type ClockLine, type PlaybackAnchor, perfAt, wrapLoop } from "./clock";
-import { msToX, placeAt, type TimeView } from "./time-view";
+import { msToX, placeAt, type TimeView, xToMs } from "./time-view";
 
 /**
  * Display path of the Timing engine: which source time the playhead shows in the frame that
@@ -18,7 +18,10 @@ import { msToX, placeAt, type TimeView } from "./time-view";
  *
  * Within one play the shown time is a straight line in page time, held before the start, clamped at
  * the end or wrapping in a loop: a `PlayheadMotion`. The stage hands it to the compositor as an
- * animation, so the playhead keeps moving while the main thread is busy.
+ * animation, so the playhead keeps moving while the main thread is busy. Nothing on the main thread
+ * runs per frame while playing: a page that runs an animation-frame loop makes the compositor wait
+ * for it, so a stall there would hold the playhead too (measured: docs/inspector/timing-latency.md).
+ * The workspace's bookkeeping (clock samples, resync, follow, the HUD readout) runs on a timer.
  */
 export interface PlayheadMotion {
   /** Page time at which the shown position leaves `holdMs`. */
@@ -125,6 +128,40 @@ export function needsResync(
 
 /** While playing, the HUD's time readout is refreshed at most this often (page ms). */
 export const readoutIntervalMs = 100;
+
+/** While playing, the transport's bookkeeping runs at least this often (page ms). */
+export const transportIntervalMs = 25;
+
+/**
+ * The next page time after `nowMs` at which following could need a jump: when the shown position
+ * crosses the view's right edge, or when a loop wraps (it may land left of the view). Infinity when
+ * nothing will change: a non-looping play that has ended, or one whose rest stays in view.
+ */
+export function nextFollowCheckMs(
+  motion: PlayheadMotion,
+  view: TimeView,
+  widthPx: number,
+  nowMs: number,
+): number {
+  if (nowMs < motion.startPerfMs) return motion.startPerfMs;
+  const firstEndPerfMs = motion.startPerfMs + (motion.firstEndMs - motion.holdMs) / motion.speed;
+  let pieceStart = motion.startPerfMs;
+  let fromMs = motion.holdMs;
+  let toMs = motion.firstEndMs;
+  const loop = motion.loop;
+  if (loop && nowMs >= firstEndPerfMs) {
+    const passMs = (loop.endMs - loop.startMs) / motion.speed;
+    pieceStart = firstEndPerfMs + Math.floor((nowMs - firstEndPerfMs) / passMs) * passMs;
+    fromMs = loop.startMs;
+    toMs = loop.endMs;
+  }
+  const pieceEnd = pieceStart + (toMs - fromMs) / motion.speed;
+  const edgeMs = xToMs(view, widthPx);
+  const crossing =
+    edgeMs >= fromMs && edgeMs < toMs ? pieceStart + (edgeMs - fromMs) / motion.speed : Infinity;
+  const events = [crossing, loop ? pieceEnd : Infinity].filter((at) => at > nowMs);
+  return Math.min(Number.POSITIVE_INFINITY, ...events);
+}
 
 /**
  * The view to jump to while following the playhead, or undefined to stay: the view jumps (never

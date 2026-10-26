@@ -23,8 +23,10 @@ import {
   followView,
   motionAt,
   needsResync,
+  nextFollowCheckMs,
   type PlayheadMotion,
   readoutIntervalMs,
+  transportIntervalMs,
 } from "./timing/display";
 import { nearestSample } from "./timing/format";
 import {
@@ -192,8 +194,9 @@ let fitPending = true;
 
 let engine: TimingAudioEngine | undefined;
 let loadedHandle = "";
-let frame = 0;
-/** Frame time of the last HUD readout while playing. */
+/** The transport's next run while playing (a timer, never an animation-frame loop). */
+let transportTimer: ReturnType<typeof setTimeout> | undefined;
+/** Page time of the last HUD readout while playing. */
 let readoutAtMs = Number.NEGATIVE_INFINITY;
 let disposed = false;
 
@@ -299,7 +302,7 @@ onBeforeUnmount(() => {
   window.removeEventListener("change", releasePressed);
   window.removeEventListener("beforeunload", guardUnload);
   navigator.mediaDevices?.removeEventListener?.("devicechange", markDeviceChanged);
-  cancelAnimationFrame(frame);
+  clearTimeout(transportTimer);
   void engine?.close();
   engine = undefined;
 });
@@ -545,7 +548,7 @@ async function loadAudio(row: BlindPassageRow) {
     if (previousRate !== undefined && previousRate !== engine.sampleRate) rateChanged.value = true;
     reopenNeeded.value = false;
     engine.onEnded = (positionMs) => {
-      cancelAnimationFrame(frame);
+      clearTimeout(transportTimer);
       playing.value = false;
       motion.value = undefined;
       playheadMs.value = positionMs;
@@ -656,38 +659,50 @@ async function start(fromMs: number, endMs: number, loop: boolean) {
     playing.value = true;
     if (preferences.value.markClicks) noteClicksHeard();
     readoutAtMs = Number.NEGATIVE_INFINITY;
-    cancelAnimationFrame(frame);
-    frame = requestAnimationFrame(tick);
+    clearTimeout(transportTimer);
+    transportStep();
   } catch (cause) {
     report(cause);
   }
 }
 
 /**
- * Once per frame while playing, at the frame's time stamp: feeds the clock model, hands the stage a
+ * The transport's bookkeeping while playing, on a timer: feeds the clock model, hands the stage a
  * new motion only when the playhead would move by more than the resync tolerance, follows the
- * playhead and refreshes the HUD readout every `readoutIntervalMs`. Nothing reactive changes in
- * most frames, so the workspace does not re-render per frame; the compositor moves the playhead.
+ * playhead and refreshes the HUD readout every `readoutIntervalMs`. It runs every
+ * `transportIntervalMs`, and exactly when the playhead will leave the view or wrap, so a follow
+ * jump is on time. Nothing here runs per frame: the compositor moves the playhead, and an
+ * animation-frame loop would make it wait for the main thread.
  */
-function tick(frameMs: number) {
+function transportStep() {
+  transportTimer = undefined;
   if (!engine?.playing) return;
+  const nowMs = performance.now();
   const offsetMs = preferences.value.playheadOffsetMs;
   engine.sampleClock();
   const next = engine.motion(offsetMs);
   if (!next) motion.value = undefined;
-  else if (needsResync(motion.value, next, frameMs)) motion.value = next;
-  const shownMs = motion.value ? motionAt(motion.value, frameMs) : engine.shownAt(frameMs, offsetMs);
+  else if (needsResync(motion.value, next, nowMs)) motion.value = next;
+  const current = motion.value;
+  const shownMs = current ? motionAt(current, nowMs) : engine.shownAt(nowMs, offsetMs);
   if (shownMs !== undefined) {
     if (follow.value && stageWidth.value) {
       const jump = followView(view.value, shownMs, stageWidth.value, preferences.value.prerollMs);
       if (jump) setView(jump);
     }
-    if (!motion.value || frameMs - readoutAtMs >= readoutIntervalMs) {
+    if (!current || nowMs - readoutAtMs >= readoutIntervalMs) {
       playheadMs.value = shownMs;
-      readoutAtMs = frameMs;
+      readoutAtMs = nowMs;
     }
   }
-  frame = requestAnimationFrame(tick);
+  const followAt =
+    current && follow.value && stageWidth.value
+      ? nextFollowCheckMs(current, view.value, stageWidth.value, nowMs) + 0.5
+      : Number.POSITIVE_INFINITY;
+  transportTimer = setTimeout(
+    transportStep,
+    Math.max(0, Math.min(transportIntervalMs, followAt - nowMs)),
+  );
 }
 
 /** The playhead's position now: exact while playing, between the HUD's readouts. */
@@ -721,7 +736,7 @@ function playRegionOnce() {
 
 /** Stops at once, without a fade, and keeps the position that was being heard. */
 function stop() {
-  cancelAnimationFrame(frame);
+  clearTimeout(transportTimer);
   const shown = engine?.stop(preferences.value.playheadOffsetMs);
   if (playing.value && shown !== undefined) playheadMs.value = clampToBounds(shown);
   motion.value = undefined;

@@ -3,6 +3,7 @@ import { type ClockLine, contextAt, type PlaybackAnchor, sourceAtContext } from 
 import {
   followView,
   motionAt,
+  nextFollowCheckMs,
   motionSegments,
   needsResync,
   type PlayheadMotion,
@@ -133,5 +134,34 @@ describe("followView", () => {
   it("does not move for the pre-roll just left of the view", () => {
     expect(followView(view, 900, 500, 120)).toBeUndefined();
     expect(followView(view, 800, 500, 120)).toEqual({ startMs: 800 - 150, msPerPx: 2 });
+  });
+});
+
+describe("nextFollowCheckMs", () => {
+  // Shown from page time 1000 ms at source 1000 ms, full speed, looping 1100-1300 after 1300.
+  const motion: PlayheadMotion = {
+    startPerfMs: 1000,
+    holdMs: 1000,
+    speed: 1,
+    firstEndMs: 1300,
+    loop: { startMs: 1100, endMs: 1300 },
+  };
+  const view = { startMs: 900, msPerPx: 1 };
+
+  it("waits for the start, then the right edge, then each wrap", () => {
+    expect(nextFollowCheckMs(motion, view, 1000, 500)).toBe(1000);
+    // The edge is at 1900 ms of source, beyond the loop: only the wraps matter.
+    expect(nextFollowCheckMs(motion, view, 1000, 1100)).toBe(1300);
+    expect(nextFollowCheckMs(motion, view, 1000, 1350)).toBe(1500);
+    // A narrow view's edge at 1150 ms of source is crossed at 1150 on the first pass, at 1350 later.
+    expect(nextFollowCheckMs(motion, view, 250, 1100)).toBe(1150);
+    expect(nextFollowCheckMs(motion, view, 250, 1320)).toBe(1350);
+  });
+
+  it("has nothing to wait for once a non-looping play ends inside the view", () => {
+    const once = { ...motion, loop: null };
+    expect(nextFollowCheckMs(once, view, 1000, 1100)).toBe(Number.POSITIVE_INFINITY);
+    expect(nextFollowCheckMs(once, view, 250, 1100)).toBe(1150);
+    expect(nextFollowCheckMs(once, view, 250, 1400)).toBe(Number.POSITIVE_INFINITY);
   });
 });

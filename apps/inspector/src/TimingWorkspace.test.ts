@@ -1,5 +1,5 @@
 // @vitest-environment happy-dom
-import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, expect, it, onTestFinished, vi } from "vitest";
 import { createApp, defineComponent, h, nextTick } from "vue";
 import TimingWorkspace from "./TimingWorkspace.vue";
 import { timingJson, timingRequest } from "./timing/client";
@@ -463,15 +463,17 @@ it("lists mark times to 0.001 ms with the sample index, so a one-sample nudge sh
   expect(row()).toContain("n 4422");
 });
 
-it("keeps digits typed into the offset and pre-roll fields while playback redraws every frame", async () => {
+it("keeps digits typed into the offset and pre-roll fields while playback updates the HUD", async () => {
   await opened();
-  const frames: FrameRequestCallback[] = [];
-  vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => frames.push(callback));
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
+  onTestFinished(() => {
+    vi.useRealTimers();
+  });
   key(" ");
-  await vi.waitFor(() => expect(frames).toHaveLength(1));
+  await vi.waitFor(() => expect(engine.plays).toBe(1));
   const redraw = async (positionMs: number) => {
     engine.positionMs = positionMs;
-    frames.shift()?.(0);
+    vi.advanceTimersByTime(25);
     await nextTick();
     expect(hud()).toContain(`00:00.${positionMs}`);
   };
@@ -666,28 +668,40 @@ it("does not repeat a held B or C", async () => {
   expect(engine.clicks.at(-1)).toBeNull();
 });
 
-it("hands the stage the playhead's motion and refreshes the HUD at most every 100 ms", async () => {
+it("hands the stage the playhead's motion and refreshes the HUD on a timer, at most every 100 ms", async () => {
   await opened();
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
+  onTestFinished(() => {
+    vi.useRealTimers();
+  });
   const frames: FrameRequestCallback[] = [];
   vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => frames.push(callback));
   key(" ");
-  await vi.waitFor(() => expect(frames).toHaveLength(1));
-  const motion = { startPerfMs: 0, holdMs: 100, speed: 1, firstEndMs: 900, loop: null };
+  await vi.waitFor(() => expect(engine.plays).toBe(1));
+  const motion = {
+    startPerfMs: performance.now(),
+    holdMs: 100,
+    speed: 1,
+    firstEndMs: 900,
+    loop: null,
+  };
   engine.motion = motion;
-  const frame = async (frameMs: number) => {
-    frames.shift()?.(frameMs);
+  const advance = async (ms: number) => {
+    vi.advanceTimersByTime(ms);
     await nextTick();
   };
-  await frame(0);
+  await advance(25);
   expect(stage.props["playhead-motion"]).toBe(motion);
-  expect(hud()).toContain("00:00.100");
-  await frame(50);
-  expect(hud()).toContain("00:00.100");
+  expect(hud()).toContain("00:00.125");
+  await advance(50);
+  expect(hud()).toContain("00:00.125");
   // A refit that moves the playhead by a fraction of a millisecond keeps the running motion.
-  engine.motion = { ...motion, startPerfMs: 0.01 };
-  await frame(120);
+  engine.motion = { ...motion, startPerfMs: motion.startPerfMs + 0.01 };
+  await advance(50);
   expect(stage.props["playhead-motion"]).toBe(motion);
-  expect(hud()).toContain("00:00.220");
+  expect(hud()).toContain("00:00.225");
+  // No animation-frame loop runs while playing.
+  expect(frames).toHaveLength(0);
   key(" ");
   await nextTick();
   expect(stage.props["playhead-motion"]).toBeUndefined();
