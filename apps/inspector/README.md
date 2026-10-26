@@ -161,6 +161,7 @@ conversion, the playhead offset and the marks file.
 | --- | --- |
 | `src/App.vue` | Picks the workspace from the URL and the mode switch |
 | `src/*Workspace.vue` | One component per workspace |
+| `src/layout/` | The frame every workspace shares: toolbar, resizable side panes, inspector sections, status bar |
 | `src/annotation/` | Annotation contracts, dataset storage, playback clocks, scene buffering |
 | `src/compare/` | Comparison contracts, excerpt proposals, audio envelope |
 | `src/timing/` | Timing formats, time axis, marks, spectrogram, audio engine and output clock |
@@ -169,6 +170,7 @@ conversion, the playhead offset and the marks file.
 | `server/comparisons.ts` | Blind comparison sessions and verdict files for Compare |
 | `server/timing.ts` | Blind timing sessions, PCM serving, marks files and guarded reveal |
 | `server/timing-server.ts` | The plain-Node server for a timing bundle |
+| `scripts/ui-shots/` | Synthetic inputs, screenshots and browser checks of every mode (Playwright supplied by the caller) |
 | `server/review-workspace.mjs` | The connected Review service behind `/review` |
 
 Run `pnpm check` from the repository root before merging; the
