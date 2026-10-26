@@ -245,17 +245,29 @@ async function timingChecks() {
   const { context, page, errors } = await newPage(1440, 900, 2);
   try {
     let box = await openTiming(page);
-    const playheadX = () =>
-      page.evaluate(() => {
-        const canvas = document.querySelector(".timing-stage-overlay");
-        const y = 10 * (window.devicePixelRatio || 1);
-        const row = canvas.getContext("2d").getImageData(0, y, canvas.width, 1).data;
-        for (let x = 0; x < canvas.width; x++) {
-          const [r, g, b, a] = row.slice(x * 4, x * 4 + 4);
-          if (r > 200 && g < 120 && b < 120 && a > 100) return x;
-        }
-        return null;
+    // The playhead is an element the compositor moves, not canvas pixels: read the presented
+    // frame. A one-row screenshot through the ruler's red triangle, decoded in the page; the
+    // centre of the red run, in device pixels from the stage's left edge.
+    const playheadX = async () => {
+      const stage = await page.locator(".timing-stage-overlay").boundingBox();
+      const png = await page.screenshot({
+        clip: { x: stage.x, y: stage.y + 2, width: stage.width, height: 1 },
       });
+      return page.evaluate(async (data) => {
+        const bytes = Uint8Array.from(atob(data), (c) => c.charCodeAt(0));
+        const bitmap = await createImageBitmap(new Blob([bytes], { type: "image/png" }));
+        const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+        const context = canvas.getContext("2d");
+        context.drawImage(bitmap, 0, 0);
+        const row = context.getImageData(0, 0, bitmap.width, 1).data;
+        const red = [];
+        for (let x = 0; x < bitmap.width; x++) {
+          const [r, g, b] = row.slice(x * 4, x * 4 + 3);
+          if (r > 180 && g < 120 && b < 120 && r - g > 90) red.push(x);
+        }
+        return red.length ? (red[0] + red[red.length - 1]) / 2 : null;
+      }, png.toString("base64"));
+    };
     const count = () => page.locator(".timing-mark-list li").count();
     const times = () => page.locator(".timing-mark-time").allInnerTexts();
     const waveY = () => box.y + box.height * 0.55;
