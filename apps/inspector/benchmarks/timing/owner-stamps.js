@@ -5,8 +5,13 @@
 //
 // Use: open the Timing page in Arc with the usual output device and rate (FineTune as usual),
 // click once anywhere on the page, open the DevTools console, paste this file, press Enter, wait
-// about 40 s until it prints "copied", then paste into the file.
+// about 40 s until it prints "Copied", then paste into the file. If it prints "NOT copied"
+// instead, type `copy(ownerStamps)` in the console, press Enter, and paste.
 (async () => {
+  // The console's own `copy()` works while the console has the focus; the clipboard API refuses a
+  // page that is not focused, so it is only the fallback. Read before the first await, while the
+  // console's evaluation is still running.
+  const consoleCopy = typeof copy === "function" ? copy : null;
   const conditions = [
     [48_000, "interactive"],
     [44_100, "interactive"],
@@ -15,7 +20,14 @@
   ];
   const results = [];
   for (const [sampleRate, latencyHint] of conditions) {
-    const context = new AudioContext({ sampleRate, latencyHint });
+    let context;
+    try {
+      context = new AudioContext({ sampleRate, latencyHint });
+    } catch (error) {
+      results.push({ latencyHint, sampleRate, error: String(error) });
+      console.warn(`skipped ${sampleRate} ${latencyHint}: ${error}`);
+      continue;
+    }
     await context.resume();
     const stamps = [];
     let last = 0;
@@ -63,6 +75,22 @@
     brands: navigator.userAgentData?.brands ?? null,
     experiments: { contextOptions: results },
   });
-  await navigator.clipboard.writeText(json).catch(() => console.log(json));
-  console.log("copied");
-})();
+  window.ownerStamps = json;
+  let copied = false;
+  if (consoleCopy) {
+    try {
+      consoleCopy(json);
+      copied = true;
+    } catch {}
+  }
+  if (!copied)
+    copied = await navigator.clipboard.writeText(json).then(
+      () => true,
+      () => false,
+    );
+  if (copied) console.log(`Copied (${json.length} characters). Paste them into owner-stamps.json.`);
+  else
+    console.error(
+      "NOT copied. Type copy(ownerStamps) here and press Enter, then paste into owner-stamps.json.",
+    );
+})().catch((error) => console.error("owner-stamps.js stopped:", error));
