@@ -145,6 +145,9 @@ Every open workspace is a `WorkspaceFrame` (`src/layout/`):
 - Timing keeps all of its behaviour: proposals are anonymous and never audible; names only after
   a save and a reveal; Beat and Unbeat buttons are timed by their press; the marks list shows
   0.001 ms and the sample index; the README's shortcuts and gestures are the contract.
+- On Timing's stage the middle button and Option+click locate the playhead (the listener's own
+  binding: left, right, Shift and Cmd already belong to marks). While playing, the target is the
+  hover line drawn dashed in the playhead red, and the release restarts playback once.
 - Nothing that updates during playback may change layout: the toolbar counter is the only text
   that changes per frame besides the stage, and it is contained.
 - Kept from v1.4: active timeline gestures are routed by their start target; Shift+drag creates a

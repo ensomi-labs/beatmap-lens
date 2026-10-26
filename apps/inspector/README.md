@@ -113,6 +113,15 @@ Open the printed address; it opens the session directly. Marks append to
   repeat. Taps usually land some tens of ms early; refine them on the waveform.
   Marks can be placed only inside the passage; the shaded context around it is
   for listening.
+- The middle mouse button, or <kbd>Option</kbd>+click, anywhere on the stage puts
+  the playhead where it is released; on the overview strip at the time there,
+  and the view centres on it. Stopped, the playhead follows a middle drag and
+  nothing plays. While playing, a dashed red line marks the target and the
+  release restarts playback there once, with the pre-roll (inside the loop
+  region when looping, as <kbd>Space</kbd> does); a start still waiting for the
+  audio restarts at the new point. It never selects, places, pans or clears,
+  whatever other keys are held, and <kbd>Esc</kbd> cancels the drag. The view
+  does not move.
 - <kbd>←</kbd>/<kbd>→</kbd> nudge the selected marks (or step the playhead) by
   1 ms, with <kbd>Shift</kbd> 0.1 ms; <kbd>,</kbd>/<kbd>.</kbd> by one sample;
   the −15 to +15 buttons by 2, 5 or 15 ms. Selected marks move together and stop

@@ -1,5 +1,5 @@
 // @vitest-environment happy-dom
-import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createApp, h, nextTick, reactive } from "vue";
 import TimingStage from "./TimingStage.vue";
 import type { Mark } from "./timing/contracts";
@@ -8,7 +8,10 @@ import type { PlayheadMotion } from "./timing/display";
 let app: ReturnType<typeof createApp>;
 let frames: FrameRequestCallback[];
 let overlayDraws: number;
+/** Every fill style set on any canvas, in order. */
+let fills: unknown[];
 let events: unknown[][];
+let exposed: { cancelDrag: () => boolean } | undefined;
 /** Web Animations started on the playhead elements. */
 let animations: {
   element: Element;
@@ -29,6 +32,7 @@ function context(): CanvasRenderingContext2D {
       return () => {};
     },
     set(target, key, value) {
+      if (key === "fillStyle") fills.push(value);
       target[key] = value;
       return true;
     },
@@ -67,6 +71,7 @@ const props = reactive({
 beforeEach(() => {
   frames = [];
   overlayDraws = 0;
+  fills = [];
   events = [];
   animations = [];
   props.playheadMs = 100;
@@ -117,6 +122,9 @@ beforeEach(() => {
   app = createApp({
     render: () =>
       h(TimingStage, {
+        ref: (instance) => {
+          exposed = instance as unknown as typeof exposed;
+        },
         buffer,
         span,
         bounds,
@@ -131,6 +139,7 @@ beforeEach(() => {
         onSelect: (...args: unknown[]) => events.push(["select", ...args]),
         onPlace: (...args: unknown[]) => events.push(["place", ...args]),
         onSeek: (...args: unknown[]) => events.push(["seek", ...args]),
+        onLocate: (...args: unknown[]) => events.push(["locate", ...args]),
         "onLoop-region": (...args: unknown[]) => events.push(["loop", ...args]),
         "onUpdate:view": (...args: unknown[]) => events.push(["view", ...args]),
       }),
@@ -337,4 +346,83 @@ it("places the playhead for a new view with the base frame that draws that view"
   expect(playhead().style.transform).toBe("translateX(50px)");
   runFrames();
   expect(playhead().style.transform).toBe("translateX(40px)");
+});
+
+describe("locate", () => {
+  const middle = { button: 1 };
+  const option = { button: 0, altKey: true };
+
+  it("locates with the middle button or Option+click on every lane, whatever the modifiers", () => {
+    // Ruler, waveform (on mark a) and marks lane; then the overview, whose scale is the bounds.
+    for (const y of [10, 50, 150]) {
+      click(31, y, middle);
+      click(31, y, { ...middle, shiftKey: true, metaKey: true });
+      click(31, y, option);
+      click(31, y, { ...option, shiftKey: true, ctrlKey: true });
+    }
+    click(0.5, 170, middle);
+    expect(events).toEqual([
+      ...Array.from({ length: 12 }, () => ["locate", 310, "end"]),
+      ["view", { startMs: 500, msPerPx: 10 }],
+      ["locate", 500, "end"],
+    ]);
+    // A plain click still selects, so the locate presses changed nothing else.
+    click(31);
+    expect(events.at(-1)).toEqual(["select", ["a"], "replace"]);
+  });
+
+  it("cancels the press and the mouse events after it, so nothing scrolls or pastes", () => {
+    const send = (event: Event) => {
+      overlay().dispatchEvent(event);
+      return event.defaultPrevented;
+    };
+    const init = { clientX: 20, clientY: 50, pointerId: 1, bubbles: true, cancelable: true };
+    expect(send(new PointerEvent("pointerdown", { ...init, ...middle }))).toBe(true);
+    expect(send(new MouseEvent("mousedown", { ...init, ...middle }))).toBe(true);
+    expect(send(new PointerEvent("pointerup", { ...init, ...middle }))).toBe(false);
+    expect(send(new MouseEvent("auxclick", { ...init, ...middle }))).toBe(true);
+    expect(send(new PointerEvent("pointerdown", { ...init, ...option }))).toBe(true);
+    pointer("pointerup", 20, 50, option);
+    expect(send(new PointerEvent("pointerdown", init))).toBe(false);
+  });
+
+  it("shows a dashed target while dragging and locates once, on release", async () => {
+    await nextTick();
+    runFrames();
+    pointer("pointerdown", 20, 50, middle);
+    pointer("pointermove", 22, 50, middle);
+    expect(events).toEqual([]);
+    pointer("pointermove", 30, 50, middle);
+    await nextTick();
+    expect(fills).toContain("rgba(255, 77, 79, 0.9)");
+    pointer("pointermove", 40, 170, middle);
+    pointer("pointerup", 45, 50, middle);
+    expect(events).toEqual([
+      ["locate", 300, "move"],
+      ["locate", 400, "move"],
+      ["locate", 450, "end"],
+    ]);
+  });
+
+  it("Esc cancels a locate drag, and the release then does nothing", () => {
+    pointer("pointerdown", 20, 50, middle);
+    pointer("pointermove", 30, 50, middle);
+    expect(exposed?.cancelDrag()).toBe(true);
+    pointer("pointerup", 30, 50, middle);
+    expect(events).toEqual([
+      ["locate", 300, "move"],
+      ["locate", 200, "cancel"],
+    ]);
+  });
+
+  it("ignores a middle button chorded into a left drag", () => {
+    pointer("pointerdown", 20, 50, { buttons: 1 });
+    pointer("pointermove", 50, 50, { buttons: 1 });
+    // The second button arrives as a move; a browser that sends a press instead is ignored too.
+    pointer("pointermove", 52, 50, { button: 1, buttons: 5 });
+    pointer("pointerdown", 52, 50, { button: 1, buttons: 5 });
+    pointer("pointermove", 64, 50, { button: 0, buttons: 4 });
+    pointer("pointerup", 64, 50, { button: 1, buttons: 0 });
+    expect(events).toEqual([["select", ["a", "b"], "replace"]]);
+  });
 });

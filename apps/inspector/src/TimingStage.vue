@@ -49,6 +49,9 @@ const props = defineProps<{
   looping: boolean;
 }>();
 
+/** A locate drag: the pointer moved (`move`), was released (`end`) or Esc cancelled it. */
+export type LocatePhase = "move" | "end" | "cancel";
+
 const emit = defineEmits<{
   "update:view": [view: TimeView];
   resize: [widthPx: number, devicePixelRatio: number];
@@ -56,6 +59,8 @@ const emit = defineEmits<{
   select: [ids: string[], mode: SelectMode];
   seek: [timeMs: number];
   "loop-region": [region: TimeRange];
+  /** The middle button, or Option+click: put the playhead at the source time under the release. */
+  locate: [timeMs: number, phase: LocatePhase];
 }>();
 
 // Lane colours follow the Inspector's strata (DESIGN.md): the data lanes are the well, the ruler
@@ -70,6 +75,8 @@ const markColour = "#ffffff";
 /** Either side of a selected mark, so it differs from a proposal bar of any colour. */
 const markCasingColour = "#06090e";
 const markSelectedPlate = "#2466c3";
+/** Where a locate drag will put the playhead: the playhead's red, dashed. */
+const locateTargetColour = "rgba(255, 77, 79, 0.9)";
 /** A selection drag in progress: the interface accent, as selected rows in the marks list. */
 const selectionDragFill = "rgba(101, 167, 250, 0.16)";
 const selectionDragEdge = "rgba(101, 167, 250, 0.75)";
@@ -95,6 +102,8 @@ const hoverX = ref<number>();
 const pendingLoop = ref<TimeRange>();
 /** The time range a selection drag covers so far. */
 const pendingSelection = ref<TimeRange>();
+/** Where a locate drag in progress would put the playhead. */
+const pendingLocate = ref<number>();
 
 const sampleRate = computed(() => props.buffer.sampleRate);
 const channels = computed(() =>
@@ -256,7 +265,7 @@ watch(
 // The overlay (hover line, drags) is drawn at once, not in a later frame. While a base frame is
 // pending (the view moved), the overlay is drawn with it, so the two layers never disagree.
 watch(
-  () => [hoverX.value, pendingLoop.value, pendingSelection.value, props.view],
+  () => [hoverX.value, pendingLoop.value, pendingSelection.value, pendingLocate.value, props.view],
   () => {
     if (!baseFrame) drawOverlay();
   },
@@ -650,11 +659,25 @@ function drawOverlay() {
     vline(context, left, top, height);
     vline(context, right, top, height);
   }
-  if (hoverX.value !== undefined) {
-    const timeMs = xToMs(props.view, hoverX.value);
-    const x = hoverX.value * dpr;
-    context.fillStyle = "rgba(255, 255, 255, 0.35)";
-    vline(context, x, L.strip.top * dpr, (L.overview.top - L.strip.top) * dpr);
+  const locating = pendingLocate.value;
+  if (locating !== undefined) {
+    // The target in the overview too, since a locate there may land outside the view.
+    context.fillStyle = locateTargetColour;
+    const overviewX = deviceX(locating, overviewView.value);
+    dashedVline(context, overviewX, L.overview.top * dpr, L.overview.height * dpr, dpr, 3 * dpr, 2 * dpr);
+  }
+  if (hoverX.value !== undefined || locating !== undefined) {
+    const timeMs = locating ?? xToMs(props.view, hoverX.value ?? 0);
+    const x = deviceX(timeMs);
+    const top = L.strip.top * dpr;
+    const height = (L.overview.top - L.strip.top) * dpr;
+    if (locating !== undefined) {
+      context.fillStyle = locateTargetColour;
+      dashedVline(context, x, top, height, dpr, 6 * dpr, 4 * dpr);
+    } else {
+      context.fillStyle = "rgba(255, 255, 255, 0.35)";
+      vline(context, x, top, height);
+    }
     const digits = props.view.msPerPx < 0.1 ? 2 : props.view.msPerPx < 1 ? 1 : 0;
     let label = formatSourceTime(timeMs, digits);
     if (props.view.msPerPx < 1) label += ` · n ${nearestSample(timeMs, sampleRate.value)}`;
@@ -719,11 +742,17 @@ function placePlayhead() {
 //   places a beat, right-click an unbeat, Shift+drag selects the loop region, right-drag pans.
 // - Ruler and proposal strip: a click seeks, a drag pans (Shift+drag: loop region).
 // - Overview: a click or drag jumps.
+// - Anywhere, the middle button or Option+click locates: the playhead goes to the time under the
+//   release (overview: the time there, and the view centres on it). Stopped, the playhead follows
+//   the drag; playing, a dashed red target does, and the release restarts the play once. It never
+//   selects, places or pans, whatever the modifiers.
 let press:
   | {
       x: number;
       y: number;
       lane: LaneName;
+      /** The middle button, or the main button with Option: a locate. */
+      locate: boolean;
       /** Right button, or Control+click (the macOS secondary click). */
       secondary: boolean;
       shift: boolean;
@@ -745,7 +774,24 @@ function localPoint(event: PointerEvent | WheelEvent | MouseEvent) {
   return { x: event.clientX - (rect?.left ?? 0), y: event.clientY - (rect?.top ?? 0) };
 }
 
+/** The middle button, or Option (Alt) with the main button. */
+function isLocate(event: MouseEvent): boolean {
+  return event.button === 1 || (event.button === 0 && event.altKey);
+}
+
+/** The source time a locate at `x` means: on the overview its own scale, elsewhere the view's. */
+function locateTime(lane: LaneName, x: number): number {
+  return xToMs(lane === "overview" ? overviewView.value : props.view, x);
+}
+
 function onPointerDown(event: PointerEvent) {
+  // A second button pressed while another is held is chorded and arrives as a move; if a browser
+  // sends a press instead, the press in progress keeps the pointer.
+  const ownButton = [1, 4, 2][event.button] ?? 0;
+  if (press && (event.buttons & ~ownButton) !== 0) return;
+  const locate = isLocate(event);
+  // No autoscroll, paste or other default action for the middle button.
+  if (locate) event.preventDefault();
   // A rail button keeps focus after a click and would take Space; working on the stage returns
   // the keyboard to the workspace shortcuts.
   if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
@@ -754,6 +800,7 @@ function onPointerDown(event: PointerEvent) {
     x,
     y,
     lane: laneAt(y),
+    locate,
     secondary: event.button === 2 || (event.button === 0 && event.ctrlKey),
     shift: event.shiftKey,
     meta: event.metaKey,
@@ -769,9 +816,14 @@ function onPointerMove(event: PointerEvent) {
   hoverX.value = x;
   if (!press) return;
   const dx = x - press.x;
-  const threshold = press.shift ? shiftDragThresholdPx : dragThresholdPx;
+  const threshold = press.shift && !press.locate ? shiftDragThresholdPx : dragThresholdPx;
   if (!press.dragging && Math.abs(dx) < threshold) return;
   press.dragging = true;
+  if (press.locate) {
+    pendingLocate.value = locateTime(press.lane, x);
+    emit("locate", pendingLocate.value, "move");
+    return;
+  }
   const timeMs = xToMs(props.view, x);
   const range = { startMs: Math.min(press.timeMs, timeMs), endMs: Math.max(press.timeMs, timeMs) };
   if (press.lane === "overview") {
@@ -789,6 +841,13 @@ function onPointerUp(event: PointerEvent) {
   const current = press;
   press = undefined;
   if (!current) return;
+  if (current.locate) {
+    pendingLocate.value = undefined;
+    const timeMs = locateTime(current.lane, localPoint(event).x);
+    if (current.lane === "overview") jumpTo(timeMs);
+    emit("locate", timeMs, "end");
+    return;
+  }
   if (current.dragging) {
     if (pendingLoop.value) emit("loop-region", pendingLoop.value);
     if (pendingSelection.value) {
@@ -833,9 +892,16 @@ function onPointerUp(event: PointerEvent) {
 }
 
 function onPointerCancel() {
+  if (press?.locate) emit("locate", press.timeMs, "cancel");
   press = undefined;
   pendingLoop.value = undefined;
   pendingSelection.value = undefined;
+  pendingLocate.value = undefined;
+}
+
+/** The mouse events that follow a locate press keep no default action either. */
+function onMouseDefault(event: MouseEvent) {
+  if (isLocate(event)) event.preventDefault();
 }
 
 /** Centres the view on a time picked in the overview. */
@@ -865,12 +931,15 @@ function onWheel(event: WheelEvent) {
   });
 }
 
-/** Cancels a loop-region or selection drag; returns whether one was in progress. */
+/** Cancels a loop-region, selection or locate drag; returns whether one was in progress. */
 function cancelDrag(): boolean {
-  const active = Boolean(press?.dragging);
+  const locate = press?.locate;
+  const active = Boolean(press?.dragging || locate);
+  if (locate && press) emit("locate", press.timeMs, "cancel");
   press = undefined;
   pendingLoop.value = undefined;
   pendingSelection.value = undefined;
+  pendingLocate.value = undefined;
   return active;
 }
 
@@ -886,8 +955,10 @@ defineExpose({ cancelDrag });
       ref="overlay"
       class="timing-stage-canvas timing-stage-overlay"
       role="img"
-      aria-label="Spectrogram and waveform; click or drag selects marks, Shift+click places a beat, right-click an unbeat"
+      aria-label="Spectrogram and waveform; click or drag selects marks, Shift+click places a beat, right-click an unbeat, middle-click or Option+click moves the playhead"
       @pointerdown="onPointerDown"
+      @mousedown="onMouseDefault"
+      @auxclick="onMouseDefault"
       @pointermove="onPointerMove"
       @pointerup="onPointerUp"
       @pointercancel="onPointerCancel"

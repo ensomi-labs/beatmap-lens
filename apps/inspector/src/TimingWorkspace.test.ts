@@ -15,6 +15,10 @@ vi.mock("./timing/client", () => ({ timingJson: vi.fn(), timingRequest: vi.fn() 
 const { motionAt } = await vi.hoisted(() => import("./timing/display"));
 const engine = vi.hoisted(() => ({
   plays: 0,
+  /** Where each play was asked to start, pre-roll included. */
+  starts: [] as number[],
+  /** While set, a play waits for it, as for a suspended context. */
+  resume: undefined as Promise<void> | undefined,
   loudness: [] as number[],
   positionMs: undefined as number | undefined,
   motion: undefined as PlayheadMotion | undefined,
@@ -41,12 +45,23 @@ vi.mock("./timing/audio-engine", () => ({
       };
     }
     starting = false;
-    async play() {
+    token = 0;
+    async play(options: { fromMs: number }) {
       engine.plays++;
+      engine.starts.push(options.fromMs);
+      const token = ++this.token;
+      if (engine.resume) {
+        this.starting = true;
+        await engine.resume;
+        if (token !== this.token) return false;
+        this.starting = false;
+      }
       this.playing = true;
       return true;
     }
     stop() {
+      this.token++;
+      this.starting = false;
       this.playing = false;
       return undefined;
     }
@@ -176,6 +191,8 @@ beforeEach(() => {
   });
   Object.assign(engine, {
     plays: 0,
+    starts: [],
+    resume: undefined,
     loudness: [],
     positionMs: undefined,
     motion: undefined,
@@ -1122,4 +1139,70 @@ it("reads the exact playhead, not the HUD's readout, for zoom, the adjacent mark
   await nextTick();
   expect(stage.props["loop-region"]).toEqual({ startMs: exactMs, endMs: 900 });
   await vi.waitFor(() => expect(engine.plays).toBe(2));
+});
+
+describe("locate with the middle button or Option+click", () => {
+  const counter = () => container.querySelector(".timing-counter")?.textContent ?? "";
+
+  it("stopped: the playhead follows the drag, nothing plays, and Esc puts it back", async () => {
+    await opened();
+    stageEmit("locate", 400, "move");
+    await nextTick();
+    expect(stage.props["playhead-ms"]).toBe(400);
+    expect(counter()).toContain("00:00.400");
+    expect(counter()).toContain(`n ${Math.floor((400 * 44_100) / 1000 + 0.5)}`);
+    stageEmit("locate", 500.5, "move");
+    stageEmit("locate", 600.25, "end");
+    await nextTick();
+    expect(stage.props["playhead-ms"]).toBe(600.25);
+    expect(engine.plays).toBe(0);
+
+    stageEmit("locate", 300, "move");
+    stageEmit("locate", 0, "cancel");
+    await nextTick();
+    expect(stage.props["playhead-ms"]).toBe(600.25);
+    // Clamped to the shown bounds (the passage and its context, inside the 1 s recording).
+    stageEmit("locate", 5000, "end");
+    await nextTick();
+    expect(stage.props["playhead-ms"]).toBe(1000);
+    expect(engine.plays).toBe(0);
+  });
+
+  it("playing: moves change nothing and the release restarts once, from the target minus the pre-roll", async () => {
+    await opened();
+    stageEmit("resize", 1000, 1);
+    const view = { startMs: 0, msPerPx: 1 };
+    stageEmit("update:view", view);
+    key(" ");
+    await vi.waitFor(() => expect(engine.plays).toBe(1));
+    stageEmit("locate", 300, "move");
+    stageEmit("locate", 400, "move");
+    await nextTick();
+    expect(engine.plays).toBe(1);
+    stageEmit("locate", 500, "end");
+    await vi.waitFor(() => expect(engine.plays).toBe(2));
+    expect(engine.starts.at(-1)).toBe(500 - 120);
+    expect(stage.props.view).toEqual(view);
+    // With follow off, the same.
+    key("f");
+    stageEmit("locate", 700, "end");
+    await vi.waitFor(() => expect(engine.plays).toBe(3));
+    expect(engine.starts.at(-1)).toBe(700 - 120);
+    expect(stage.props.view).toEqual(view);
+  });
+
+  it("a locate while a start waits for the audio restarts at the new point", async () => {
+    await opened();
+    let resume = () => {};
+    engine.resume = new Promise<void>((resolve) => {
+      resume = resolve;
+    });
+    key(" ");
+    await vi.waitFor(() => expect(engine.plays).toBe(1));
+    stageEmit("locate", 500, "end");
+    await vi.waitFor(() => expect(engine.plays).toBe(2));
+    resume();
+    await vi.waitFor(() => expect(button("Pause")).toBeDefined());
+    expect(engine.starts).toEqual([0, 500 - 120]);
+  });
 });

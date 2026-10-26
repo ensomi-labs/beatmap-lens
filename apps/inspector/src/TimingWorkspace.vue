@@ -6,7 +6,7 @@ import DraftNumberInput from "./DraftNumberInput.vue";
 import PanelSection from "./layout/PanelSection.vue";
 import type { PaneSpec } from "./layout/pane-layout";
 import WorkspaceFrame from "./layout/WorkspaceFrame.vue";
-import TimingStage, { type StageProposal } from "./TimingStage.vue";
+import TimingStage, { type LocatePhase, type StageProposal } from "./TimingStage.vue";
 import { TimingAudioEngine } from "./timing/audio-engine";
 import { timingJson, timingRequest } from "./timing/client";
 import {
@@ -901,6 +901,41 @@ function seek(timeMs: number) {
   });
 }
 
+/** The playhead before a stopped locate drag moved it, so Esc can put it back. */
+let locateFrom: number | undefined;
+
+/**
+ * The middle button or Option+click on the stage. Stopped, the playhead follows the drag; playing,
+ * the stage shows the target and nothing changes until the release. Esc puts a stopped playhead
+ * back.
+ */
+function onLocate(timeMs: number, phase: LocatePhase) {
+  const moving = playing.value || Boolean(engine?.starting);
+  if (phase === "cancel") {
+    if (locateFrom !== undefined && !moving) playheadMs.value = locateFrom;
+    locateFrom = undefined;
+  } else if (phase === "move") {
+    if (moving) return;
+    locateFrom ??= playheadMs.value;
+    playheadMs.value = clampToBounds(timeMs);
+  } else {
+    locateFrom = undefined;
+    locate(timeMs);
+  }
+}
+
+/**
+ * Puts the playhead at `timeMs`, inside the shown bounds. A play, or a start still waiting for the
+ * audio, restarts there once through `start`, with the pre-roll; looping outside the loop region,
+ * it restarts at the region's start, as Space does. The view does not move.
+ */
+function locate(timeMs: number) {
+  const wasPlaying = playing.value || Boolean(engine?.starting);
+  stop();
+  playheadMs.value = clampToBounds(timeMs);
+  if (wasPlaying) togglePlayback();
+}
+
 function stepPlayhead(deltaMs: number) {
   if (playing.value) return;
   playheadMs.value = clampToBounds(playheadMs.value + deltaMs);
@@ -1722,6 +1757,7 @@ function handleKeydown(event: KeyboardEvent) {
               @place="(kind, timeMs) => place(kind, timeMs, 'click')"
               @select="selectFromStage"
               @seek="seek"
+              @locate="onLocate"
               @loop-region="setLoopRegion"
             />
             <div v-else-if="error" class="stage-message">
@@ -1848,6 +1884,10 @@ function handleKeydown(event: KeyboardEvent) {
                   Shift+click places a beat, right-click an unbeat. ←/→ nudge 1 ms (Shift 0.1 ms),
                   , and . one sample. [ and ] visit marks. Delete removes the selection. Pan with
                   the wheel, by dragging the ruler, or with right- or Ctrl-drag.
+                </p>
+                <p>
+                  The middle button or ⌥-click anywhere on the stage moves the playhead to where it
+                  is released; while playing, playback restarts there once. Esc cancels the drag.
                 </p>
                 <p>
                   While playing, B, N and the Beat buttons mark the moment of the press as heard,
