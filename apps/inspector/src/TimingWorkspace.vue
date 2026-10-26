@@ -60,7 +60,7 @@ import {
   zoomLimits,
 } from "./timing/time-view";
 import { prerollStart } from "./timing/transport";
-import { digitalSilence } from "./timing/waveform";
+import { nearSilence } from "./timing/waveform";
 import WorkspaceModeSwitch from "./WorkspaceModeSwitch.vue";
 import type { WorkspaceMode } from "./workspace-mode";
 
@@ -501,12 +501,11 @@ async function select(index: number) {
     playheadMs.value = row.start_ms;
     const buffer = audioBuffer.value;
     silenceMs.value = buffer
-      ? digitalSilence(
+      ? nearSilence(
           Array.from({ length: buffer.numberOfChannels }, (_, c) => buffer.getChannelData(c)),
           buffer.sampleRate,
           row.start_ms,
           row.end_ms,
-          200,
         )
       : undefined;
     fitPending = true;

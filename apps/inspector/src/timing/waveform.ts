@@ -14,23 +14,34 @@ export function peak(data: Float32Array, from: number, to: number): [number, num
 }
 
 /**
- * The first run of exact digital silence (every channel zero) at least `minRunMs` long inside
- * `[startMs, endMs)`, as its start time, or undefined.
+ * FineTune, the EQ app in the owner's output path, arms an onset gate after this long with every
+ * buffer's peak at or below `gatePeak` (about −80 dBFS): the first louder buffer after it is muted
+ * and the next 40 ms fade in (FineTune 1.9.0, `ProcessTapController.swift`; see
+ * docs/inspector/timing-latency.md).
  */
-export function digitalSilence(
+export const gateSilenceMs = 200;
+export const gatePeak = 1e-4;
+
+/**
+ * The first run at least `minRunMs` long inside `[startMs, endMs)` in which every channel stays
+ * within ±`peak`, as its start time, or undefined. With FineTune in the path, the onset that ends
+ * such a run is heard late and soft, whatever the pre-roll.
+ */
+export function nearSilence(
   channels: Float32Array[],
   sampleRate: number,
   startMs: number,
   endMs: number,
-  minRunMs: number,
+  minRunMs = gateSilenceMs,
+  peak = gatePeak,
 ): number | undefined {
   const from = Math.max(0, Math.floor((startMs * sampleRate) / 1000));
   const to = Math.min(channels[0]?.length ?? 0, Math.ceil((endMs * sampleRate) / 1000));
   const minRun = (minRunMs * sampleRate) / 1000;
   let runStart = -1;
   for (let index = from; index < to; index++) {
-    const silent = channels.every((data) => data[index] === 0);
-    if (!silent) {
+    const quiet = channels.every((data) => Math.abs(data[index] as number) <= peak);
+    if (!quiet) {
       runStart = -1;
       continue;
     }

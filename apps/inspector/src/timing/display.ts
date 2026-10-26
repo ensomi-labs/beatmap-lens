@@ -8,8 +8,8 @@ import { msToX, placeAt, type TimeView, xToMs } from "./time-view";
  * The frame is seen a display delay later, which the page cannot measure but which is constant for
  * a given browser and screen; the listener's playhead offset stands in for it. So the frame shows
  * the source time heard at `frameMs − offsetMs`. The offset is applied here and nowhere else, as
- * ensomi-runtime applies its audio offset exactly once (crates/gameplay/src/session.rs lines 16-22,
- * README lines 29-31, at edf4066). Taps never see it (`input.ts`).
+ * ensomi-runtime applies its audio offset exactly once (crates/gameplay/src/session.rs lines 16-22
+ * and crates/gameplay/README.md lines 29-31, at edf4066). Taps never see it (`input.ts`).
  *
  * The frame time stamp, not the moment the frame's code runs, is the right clock: frames are shown
  * at a fixed cadence from their time stamps, while their callbacks start late by however long the
