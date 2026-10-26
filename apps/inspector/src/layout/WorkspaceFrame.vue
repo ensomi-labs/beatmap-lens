@@ -16,7 +16,7 @@ export type MobilePanel = "source" | "preview" | "details";
 const props = withDefaults(
   defineProps<{
     layoutKey: string;
-    mode?: WorkspaceMode;
+    mode?: WorkspaceMode | undefined;
     modeDisabled?: boolean;
     left?: PaneSpec;
     right?: PaneSpec;

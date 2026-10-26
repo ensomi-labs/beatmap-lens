@@ -2724,24 +2724,17 @@ function errorMessage(error: unknown): string {
     tabindex="-1"
   >
     <header v-if="!directory" class="app-bar annotation-app-bar">
-      <div class="brand-lockup">
-        <span class="brand-mark" aria-hidden="true"></span>
-        <div>
-          <p class="brand-name">Beatmap Lens</p>
-          <p class="brand-edition">Section annotation</p>
-        </div>
-      </div>
-
-      <div class="annotation-chart-context">
-        <span>{{ futureDataset?.manifest.name ?? "Local dataset" }}</span>
-        <strong>{{ currentChartLabel }}</strong>
-      </div>
-
+      <span class="brand-glyph" aria-hidden="true" title="Beatmap Lens"></span>
+      <span class="sr-only">Beatmap Lens</span>
       <WorkspaceModeSwitch
         model-value="annotate"
         :disabled="operationLocked || draftCleanupBlocked"
         @update:model-value="changeWorkspaceMode"
       />
+      <div class="annotation-chart-context">
+        <span>{{ futureDataset?.manifest.name ?? "Local dataset" }}</span>
+        <strong>{{ currentChartLabel }}</strong>
+      </div>
 
       <div class="annotation-toolbar-status">
         <span v-if="directory" class="queue-progress">

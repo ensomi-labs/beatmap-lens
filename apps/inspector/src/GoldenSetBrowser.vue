@@ -136,43 +136,45 @@ onBeforeUnmount(() => { stopped = true; selection++; window.removeEventListener(
 </template>
 
 <style scoped>
-.golden-browser { padding-top: 20px; font-size: 13px; }
+.golden-browser { padding-top: 12px; font-size: var(--text-sm); }
 .golden-heading { display: flex; justify-content: space-between; align-items: start; gap: 24px; }
 h2, h3, p { margin: 0; }
-h2 { font-size: 17px; line-height: 1.4; }
-h2 span { font-size: 14px; font-weight: 450; }
-p { line-height: 1.6; }
-.golden-heading p, .golden-empty, .golden-count { color: var(--ink-secondary); font-size: 12px; }
-.golden-heading p { max-width: 720px; margin-top: 8px; }
-.golden-count { margin: 12px 0; font-variant-numeric: tabular-nums; }
+h2 { font-size: var(--text-md); line-height: 1.4; }
+h2 span { color: var(--ink-secondary); font-size: var(--text-sm); font-weight: 450; }
+p { line-height: 1.55; }
+.golden-heading p, .golden-empty, .golden-count { color: var(--ink-secondary); font-size: var(--text-xs); }
+.golden-heading p { max-width: 720px; margin-top: 4px; }
+.golden-count { margin: 8px 0; font-variant-numeric: tabular-nums; }
 .golden-error { margin: 16px 0; color: var(--danger); }
-button, input, select { min-height: 40px; border: 0; border-radius: 10px; padding: 10px 12px; background: var(--surface); color: var(--ink); font: inherit; box-shadow: var(--shadow-control); }
-button { cursor: pointer; transition: transform 120ms, background-color 120ms; }
-button:active { transform: scale(.96); }
+button, input, select { min-height: var(--control-h); border: 0; border-radius: var(--radius-control); padding: 3px 8px; background: var(--surface-3); color: var(--ink-secondary); font: inherit; font-size: var(--text-xs); box-shadow: var(--shadow-control); }
+input, select { color: var(--ink); background: var(--field); box-shadow: inset 0 0 0 1px var(--field-edge); }
+button { cursor: pointer; transition: color 120ms var(--ease-out), background-color 120ms var(--ease-out); }
+button:active { background: var(--surface-2); }
 button:disabled { opacity: .5; cursor: default; }
-button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
-.golden-filters { display: grid; grid-template-columns: 1fr 1fr 1.5fr; gap: 16px; margin: 20px 0; }
-label { display: grid; gap: 8px; font-size: 12px; min-width: 0; }
+button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-visible { outline: 2px solid var(--signal); outline-offset: 1px; }
+.golden-filters { display: grid; grid-template-columns: 1fr 1fr 1.5fr; gap: 8px; margin: 12px 0; }
+label { display: grid; gap: 3px; color: var(--ink-muted); font-size: var(--text-xs); min-width: 0; }
 input, select { width: 100%; min-width: 0; box-sizing: border-box; }
-.golden-layout { display: grid; grid-template-columns: 300px minmax(0, 1fr); border-top: 1px solid var(--line); }
-.golden-list { max-height: 75dvh; overflow: auto; padding-right: 16px; border-right: 1px solid var(--line); }
-.golden-list button { display: grid; gap: 4px; width: 100%; border-radius: 0; box-shadow: none; text-align: left; border-top: 1px solid var(--line); }
-.golden-list button:hover, .golden-list button[aria-pressed=true] { background: var(--surface-quiet); }
+.golden-layout { display: grid; grid-template-columns: 300px minmax(0, 1fr); border-top: 1px solid var(--seam); }
+.golden-list { max-height: 75dvh; overflow: auto; border-right: 1px solid var(--seam); }
+.golden-list button { display: grid; gap: 2px; width: 100%; padding: 5px 8px; border-radius: 0; background: transparent; box-shadow: none; text-align: left; border-top: 1px solid var(--line); }
+.golden-list button:hover { background: var(--surface-hover); }
+.golden-list button[aria-pressed=true] { color: var(--ink); background: var(--signal-soft); box-shadow: inset 2px 0 0 var(--signal); }
 .golden-list button[aria-pressed=true] strong, .is-match { color: var(--signal); }
-.golden-list small { color: var(--ink-secondary); font-size: 11px; }
-.golden-labels { display: grid; gap: 4px; margin-top: 6px; font-size: 11px; }
-.golden-reference { min-width: 0; padding: 20px 0 0 24px; }
-.golden-range { margin: 12px 0; font: 12px/1.8 var(--font-data); }
-.golden-assessments { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 24px; }
-.golden-assessments section { padding: 12px 0; border-top: 1px solid var(--line); color: var(--ink); }
-h3 { font-size: 13px; line-height: 1.6; }
+.golden-list small { color: var(--ink-muted); font-size: var(--text-2xs); }
+.golden-labels { display: grid; gap: 2px; margin-top: 4px; font-size: var(--text-2xs); }
+.golden-reference { min-width: 0; padding: 12px 0 0 16px; }
+.golden-range { margin: 8px 0; font: var(--text-xs)/1.7 var(--font-data); }
+.golden-assessments { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 16px; }
+.golden-assessments section { padding: 6px 0; border-top: 1px solid var(--line); color: var(--ink); }
+h3 { font-size: var(--text-sm); line-height: 1.5; }
 h3 span { display: block; font-weight: 450; }
 .golden-assessments .is-match h3 { color: var(--signal); }
-.golden-comment { white-space: pre-line; margin-top: 8px; }
-summary { min-height: 40px; padding-top: 12px; cursor: pointer; box-sizing: border-box; }
-details p { margin-bottom: 8px; color: var(--ink-secondary); font-size: 12px; }
-.golden-pages { display: grid; gap: 16px; margin-top: 16px; padding: 8px; border-radius: 22px; background: var(--surface-quiet); }
-.golden-pages > div { overflow-x: auto; border-radius: 14px; }
+.golden-comment { white-space: pre-line; margin-top: 4px; }
+summary { min-height: var(--header-h); padding-top: 6px; color: var(--ink-secondary); cursor: pointer; box-sizing: border-box; font-size: var(--text-xs); font-weight: 650; }
+details p { margin-bottom: 6px; color: var(--ink-secondary); font-size: var(--text-xs); }
+.golden-pages { display: grid; gap: 8px; margin-top: 8px; background: var(--well); }
+.golden-pages > div { overflow-x: auto; }
 @media (max-width: 920px) {
   .golden-layout { grid-template-columns: 230px minmax(0, 1fr); }
   .golden-assessments { grid-template-columns: 1fr; }

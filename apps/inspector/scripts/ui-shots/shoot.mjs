@@ -494,8 +494,13 @@ const modes = {
     await page.getByLabel("Catalog manifest path").fill(join(fixtures, "catalog.json"));
     await page.getByLabel("Mapped corpus directory path").fill(join(fixtures, "corpus"));
     await page.getByRole("button", { name: /Open workspace/ }).click();
+    // Narrow windows show one view at a time; the task queue is under Source.
+    const source = page.getByRole("button", { name: "Source", exact: true });
+    if (await source.count()) await source.click();
     await page.waitForSelector(".task-row", { timeout: 15000 });
     await page.locator(".task-row").first().click();
+    const preview = page.getByRole("button", { name: "Preview", exact: true });
+    if (await preview.count()) await preview.click();
     await page.waitForSelector(".falling-note-viewport", { timeout: 15000 });
     await sleep(1200);
   },
@@ -536,6 +541,22 @@ async function modeShots(base) {
         await open(page, base);
         await shot(page, `${name}-${width}`);
         if (width === 1440) {
+          const hide = page.getByRole("button", { name: /^Hide / });
+          if (await hide.count()) {
+            await check(`${name}: hiding a side pane widens the main view`, async () => {
+              const before = (await page.locator(".frame-main").boundingBox()).width;
+              await hide.first().click();
+              await sleep(250);
+              const after = (await page.locator(".frame-main").boundingBox()).width;
+              await shot(page, `${name}-${width}-pane-hidden`);
+              await page
+                .getByRole("button", { name: /^Show / })
+                .first()
+                .click();
+              await sleep(250);
+              return { ok: after > before + 150, before, after };
+            });
+          }
           const splitters = page.locator('[role="separator"]');
           const found = await splitters.count();
           if (found) {

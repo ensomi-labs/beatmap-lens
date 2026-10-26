@@ -21,9 +21,10 @@ vi.mock("./ReviewWorkspace.vue", () => ({
     props: ["openClaim", "remoteSource", "openHumanObservationIds"],
     emits: ["saved", "back-to-inbox"],
     setup:
-      (props, { emit }) =>
+      (props, { emit, slots }) =>
       () =>
         h("div", { class: "test-review" }, [
+          slots.navigation?.(),
           h("output", JSON.stringify(props.openClaim)),
           h(
             "output",

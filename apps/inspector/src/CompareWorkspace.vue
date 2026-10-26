@@ -360,22 +360,17 @@ function handleKeydown(event: KeyboardEvent) {
     tabindex="-1"
   >
     <header v-if="!opened" class="app-bar annotation-app-bar">
-      <div class="brand-lockup">
-        <span class="brand-mark" aria-hidden="true"></span>
-        <div>
-          <p class="brand-name">Beatmap Lens</p>
-          <p class="brand-edition">Blind comparison</p>
-        </div>
-      </div>
-      <div class="annotation-chart-context">
-        <span>Comparison</span>
-        <strong>Not opened</strong>
-      </div>
+      <span class="brand-glyph" aria-hidden="true" title="Beatmap Lens"></span>
+      <span class="sr-only">Beatmap Lens</span>
       <WorkspaceModeSwitch
         model-value="compare"
         :disabled="busy"
         @update:model-value="emit('change-mode', $event)"
       />
+      <div class="annotation-chart-context">
+        <span>Comparison</span>
+        <strong>Not opened</strong>
+      </div>
     </header>
 
     <section v-if="!opened" class="annotation-onboarding" aria-labelledby="compare-heading">

@@ -359,76 +359,84 @@ onBeforeUnmount(() => { stopped = true; clearTimeout(timer); });
     <footer v-if="inbox"><details><summary>Workspace details &amp; help</summary><div class="inbox-summary"><span>{{ counts['agent-reviewed'] ?? 0 }} machine-reviewed</span><span>{{ humanAssessments.settled }} explicit human judgments</span><span>{{ humanAssessments.unresolved + humanAssessments.unreviewed }} uncertain or unreviewed human records</span><span>{{ counts.deferred ?? 0 }} deferred</span></div><p>Version filters apply to requests, sampling and history. Skill names, revisions and content hashes identify separate versions. Evidence context is shown separately from work status and agent version.</p><p>History includes human decisions, stale results and superseded proposals. Open a result to inspect its audits and related versions.</p><p>Decisions are saved to the connected workspace and returned to the agent automatically.</p></details></footer>
   </div>
   <div v-if="activeSource" v-show="!showingInbox" class="inbox-active">
-    <div class="inbox-navigation"><button type="button" @click="showingInbox = true">{{ activeConfidenceId ? `Confidence · ${confidenceCompleted}/${confidenceTotal}` : activeSampleKey ? `Sample · ${sampleReviewed}/${sampleRows.length}` : `Inbox · ${tasks.length}` }}{{ connectionError ? ' · offline' : '' }}</button><button v-if="activeConfidenceId && nextConfidence" type="button" :disabled="loading" @click="openConfidence(nextConfidence)">Next confidence section →</button><button v-if="activeSampleKey && nextSample" type="button" :disabled="loading" @click="openSample(nextSample)">Next sample →</button></div>
     <p v-if="loadError" class="inbox-active-error" role="alert">{{ loadError }}</p>
-    <ReviewWorkspace :active="!showingInbox" :remote-source="activeSource" v-bind="{ ...(openClaim ? { openClaim } : {}), ...(openHumanObservationIds ? { openHumanObservationIds } : {}) }" @back-to-inbox="showingInbox = true" @saved="refresh" />
+    <ReviewWorkspace :active="!showingInbox" :remote-source="activeSource" v-bind="{ ...(openClaim ? { openClaim } : {}), ...(openHumanObservationIds ? { openHumanObservationIds } : {}) }" @back-to-inbox="showingInbox = true" @saved="refresh" >
+      <template #navigation>
+        <div class="inbox-navigation"><button type="button" class="tool-button" @click="showingInbox = true">{{ activeConfidenceId ? `Confidence · ${confidenceCompleted}/${confidenceTotal}` : activeSampleKey ? `Sample · ${sampleReviewed}/${sampleRows.length}` : `Inbox · ${tasks.length}` }}{{ connectionError ? ' · offline' : '' }}</button><button v-if="activeConfidenceId && nextConfidence" type="button" class="tool-button" :disabled="loading" @click="openConfidence(nextConfidence)">Next confidence section →</button><button v-if="activeSampleKey && nextSample" type="button" class="tool-button" :disabled="loading" @click="openSample(nextSample)">Next sample →</button></div>
+      </template>
+    </ReviewWorkspace>
   </div>
 </template>
 
 <style scoped>
-.inbox-page { max-width: 1100px; margin: 0 auto; padding: 48px 32px; color: var(--ink); }
+.inbox-page { max-width: 1100px; margin: 0 auto; padding: 24px 24px 40px; color: var(--ink); font-size: var(--text-sm); }
 .inbox-page--golden { max-width: 1500px; }
-.inbox-header { display: flex; justify-content: space-between; gap: 32px; align-items: flex-start; }
-h1 { margin: 8px 0 12px; font-size: 32px; letter-spacing: -.025em; }
-h2 { font-size: 17px; margin: 6px 0 12px; }
-h2 span { font-size: 14px; font-weight: 400; color: var(--ink-secondary); }
-p { line-height: 1.65; margin: 0; }
-.inbox-kicker, .inbox-connection { font: 11px var(--font-data); color: var(--ink-secondary); }
-.inbox-connection { padding-top: 8px; white-space: nowrap; }
-.inbox-summary { display: flex; gap: 24px; flex-wrap: wrap; padding: 12px 0; margin-bottom: 12px; border-block: 1px solid var(--line); font-size: 13px; }
+.inbox-header { display: flex; justify-content: space-between; gap: 24px; align-items: flex-start; }
+.inbox-page h1 { margin: 4px 0 8px; font-size: 20px; font-weight: 650; letter-spacing: -0.015em; }
+.inbox-page h2 { margin: 4px 0 8px; font-size: var(--text-md); font-weight: 650; }
+.inbox-page p { margin: 0; line-height: 1.55; }
+.inbox-kicker, .inbox-connection { color: var(--ink-muted); font: var(--text-xs) var(--font-data); }
+.inbox-connection { padding-top: 6px; white-space: nowrap; }
+.inbox-summary { display: flex; flex-wrap: wrap; gap: 16px; margin-bottom: 8px; padding: 8px 0; border-block: 1px solid var(--line); font-size: var(--text-xs); }
 .inbox-summary span { color: var(--ink-secondary); }
-.inbox-empty { padding: 56px 0; }
-.inbox-empty p, footer { color: var(--ink-secondary); font-size: 13px; }
-.inbox-task { padding: 28px 0; border-bottom: 1px solid var(--line); display: grid; grid-template-columns: 1fr 1fr; gap: 32px; }
-.inbox-question { font-size: 14px; white-space: pre-line; }
-button { display: flex; justify-content: space-between; gap: 16px; align-items: center; width: 100%; min-height: 44px; padding: 12px; border: 0; border-radius: 10px; background: var(--surface); color: var(--ink); box-shadow: var(--shadow-control); text-align: left; cursor: pointer; }
-button { transition: transform 120ms, background-color 120ms; }
-button:active { transform: scale(.96); }
-button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
-button:hover { background: var(--surface-quiet); }
-button:disabled { opacity: .5; }
-button small { display: block; margin-top: 6px; font: 11px var(--font-data); color: var(--ink-secondary); }
-.inbox-claims { display: grid; gap: 8px; align-content: start; }
-.inbox-history { padding: 20px 0; }
-summary { cursor: pointer; min-height: 40px; font-size: 14px; }
-.inbox-history section { margin-top: 20px; }
-.inbox-history-list button { border-radius: 0; box-shadow: none; border-bottom: 1px solid var(--line); font-size: 12px; }
-.inbox-history p { font-size: 12px; color: var(--ink-secondary); }
-footer { padding-top: 28px; }
-.inbox-error { color: var(--danger); margin-top: 16px; }
-.inbox-navigation { position: fixed; z-index: 40; top: 8px; left: 280px; display: flex; gap: 8px; }
-.inbox-navigation button { width: auto; padding: 8px 12px; min-height: 40px; font-size: 12px; }
-.inbox-active-error { position: fixed; z-index: 40; top: 56px; left: 280px; max-width: 380px; padding: 12px; background: var(--surface); color: var(--danger); box-shadow: var(--shadow-control); border-radius: 10px; font-size: 13px; }
-.inbox-sampler > p, .inbox-sample-heading > span { font-size: 12px; color: var(--ink-secondary); }
-.inbox-sampler { padding: 8px 0 24px; border-bottom: 1px solid var(--line); }
-.inbox-sample-controls { display: grid; grid-template-columns: 1.3fr 1.3fr .7fr auto; gap: 16px; align-items: end; margin: 20px 0 8px; }
-.inbox-sample-controls label { display: grid; gap: 8px; font-size: 12px; }
-.inbox-filter-controls { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin: 20px 0 12px; }
-.inbox-filter-controls label { display: grid; min-width: 0; gap: 8px; font-size: 12px; }
-.inbox-filter-controls select, .inbox-filter-controls input, .inbox-sample-controls select, .inbox-sample-controls input { width: 100%; min-width: 0; box-sizing: border-box; min-height: 44px; padding: 10px; border: 0; border-radius: 10px; background: var(--surface); color: var(--ink); box-shadow: var(--shadow-control); font: inherit; }
-.inbox-version-filters p { font-size: 12px; color: var(--ink-secondary); }
+.inbox-empty { padding: 32px 0; }
+.inbox-empty p, .inbox-page footer { color: var(--ink-secondary); font-size: var(--text-xs); }
+.inbox-task { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; padding: 16px 0; border-bottom: 1px solid var(--line); }
+.inbox-question { font-size: var(--text-sm); white-space: pre-line; }
+.inbox-page button {
+  display: flex; width: 100%; min-height: 30px; align-items: center; justify-content: space-between; gap: 12px; padding: 5px 10px;
+  color: var(--ink-secondary); border: 0; border-radius: var(--radius-control); background: var(--surface-3); box-shadow: var(--shadow-control);
+  cursor: pointer; font-size: var(--text-xs); font-weight: 600; text-align: left; transition: color 120ms var(--ease-out), background-color 120ms var(--ease-out);
+}
+.inbox-page button:active { background: var(--surface-2); }
+.inbox-page button:focus-visible, .inbox-page input:focus-visible, .inbox-page select:focus-visible, .inbox-page summary:focus-visible { outline: 2px solid var(--signal); outline-offset: 1px; }
+@media (hover: hover) { .inbox-page button:hover:not(:disabled) { color: var(--ink); background: var(--surface-3-hover); } }
+.inbox-page button:disabled { cursor: not-allowed; opacity: 0.5; }
+.inbox-page button small { display: block; margin-top: 3px; color: var(--ink-muted); font: var(--text-2xs) var(--font-data); }
+.inbox-claims { display: grid; align-content: start; gap: 4px; }
+.inbox-history { padding: 12px 0; }
+.inbox-page summary { min-height: var(--header-h); color: var(--ink-secondary); cursor: pointer; font-size: var(--text-xs); font-weight: 650; line-height: var(--header-h); }
+.inbox-history section { margin-top: 12px; }
+.inbox-page .inbox-history-list button { border-bottom: 1px solid var(--line); border-radius: 0; background: transparent; box-shadow: none; }
+.inbox-history p { color: var(--ink-secondary); font-size: var(--text-xs); }
+.inbox-page footer { padding-top: 16px; }
+.inbox-error { margin-top: 8px; color: var(--danger); }
+.inbox-navigation { display: flex; gap: 4px; }
+.inbox-active-error {
+  position: fixed; z-index: 40; top: 46px; left: 50%; max-width: 420px; padding: 6px 10px; color: oklch(88% 0.06 25); border-radius: var(--radius-control);
+  background: var(--danger-soft); box-shadow: inset 0 0 0 1px oklch(72% 0.17 25 / 0.4); font-size: var(--text-xs); transform: translateX(-50%);
+}
+.inbox-sampler > p, .inbox-sample-heading > span { color: var(--ink-secondary); font-size: var(--text-xs); }
+.inbox-sampler { padding: 12px 0 16px; border-bottom: 1px solid var(--line); }
+.inbox-sample-controls { display: grid; grid-template-columns: 1.3fr 1.3fr 0.7fr auto; align-items: end; gap: 8px; margin: 12px 0 6px; }
+.inbox-sample-controls label, .inbox-filter-controls label { display: grid; min-width: 0; gap: 3px; color: var(--ink-muted); font-size: var(--text-xs); }
+.inbox-filter-controls { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin: 12px 0 8px; }
+.inbox-filter-controls select, .inbox-filter-controls input, .inbox-sample-controls select, .inbox-sample-controls input {
+  width: 100%; min-width: 0; min-height: var(--control-h); padding: 3px 6px; color: var(--ink); border: 0; border-radius: var(--radius-control);
+  background: var(--field); box-shadow: inset 0 0 0 1px var(--field-edge); font: inherit; font-size: var(--text-xs);
+}
+.inbox-version-filters p { color: var(--ink-secondary); font-size: var(--text-xs); }
 .inbox-history-controls { grid-template-columns: 2fr 1fr 1fr; }
-.inbox-history-list { margin: 16px 0; }
+.inbox-history-list { margin: 8px 0; }
 .inbox-history-list button > span { min-width: 0; overflow-wrap: anywhere; }
 .inbox-history-list button > span:last-child { text-align: right; }
-.inbox-sample-controls .inbox-sample-draw { background: var(--ink); color: var(--surface); justify-content: center; }
-.inbox-sample-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; margin-top: 28px; }
-.inbox-sample-list { margin-top: 16px; }
-.inbox-sample-list button { border-radius: 0; box-shadow: none; border-top: 1px solid var(--line); font-size: 13px; }
-.inbox-sample-list button > span:last-child { text-align: right; flex-shrink: 0; }
-.inbox-sample-number { font: 11px var(--font-data); color: var(--ink-secondary); }
-.inbox-continue { margin: 12px 0; background: var(--ink); color: var(--surface); }
-.inbox-sample-setup { margin: 12px 0; }
-.inbox-view-switch { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 24px; border-bottom: 1px solid var(--line); }
-.inbox-view-switch button { justify-content: center; width: auto; min-width: 100px; box-shadow: none; border-radius: 0; border-bottom: 2px solid transparent; font-size: 14px; }
-.inbox-view-switch button[aria-pressed=true] { border-bottom-color: var(--signal); color: var(--signal); }
-.inbox-view-switch span { font: 11px var(--font-data); }
-.inbox-filter-summary, .inbox-section-heading { display: flex; justify-content: space-between; align-items: center; gap: 12px; font-size: 12px; color: var(--ink-secondary); }
-.inbox-filter-summary button, .inbox-section-heading button { width: auto; padding: 8px; font-size: 12px; box-shadow: none; }
+.inbox-page .inbox-sample-controls .inbox-sample-draw, .inbox-page .inbox-continue { justify-content: center; color: oklch(100% 0 0); background: var(--signal-fill); }
+.inbox-sample-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-top: 16px; }
+.inbox-sample-list { margin-top: 8px; }
+.inbox-page .inbox-sample-list button { border-top: 1px solid var(--line); border-radius: 0; background: transparent; box-shadow: none; }
+.inbox-sample-list button > span:last-child { flex-shrink: 0; text-align: right; }
+.inbox-sample-number { color: var(--ink-muted); font: var(--text-2xs) var(--font-data); }
+.inbox-page .inbox-continue { margin: 8px 0; }
+.inbox-sample-setup { margin: 8px 0; }
+.inbox-view-switch { display: flex; flex-wrap: wrap; gap: 2px; margin-top: 12px; border-bottom: 1px solid var(--seam); }
+.inbox-page .inbox-view-switch button { width: auto; min-width: 80px; justify-content: center; border-bottom: 2px solid transparent; border-radius: 0; background: transparent; box-shadow: none; }
+.inbox-page .inbox-view-switch button[aria-pressed="true"] { color: var(--ink); border-bottom-color: var(--signal); }
+.inbox-view-switch span { font: var(--text-2xs) var(--font-data); }
+.inbox-filter-summary, .inbox-section-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--ink-secondary); font-size: var(--text-xs); }
+.inbox-page .inbox-filter-summary button, .inbox-page .inbox-section-heading button { width: auto; }
 .inbox-section-heading h2 { margin: 0; color: var(--ink); }
-.inbox-help { color: var(--ink-secondary); font-size: 12px; }
-.inbox-help summary { font-size: 12px; }
-.inbox-sampler { padding-top: 20px; }
-@media (max-width: 920px) { .inbox-page { padding: 28px 20px; } .inbox-header, .inbox-task { display: block; } .inbox-connection, .inbox-claims { margin-top: 20px; } .inbox-navigation, .inbox-active-error { left: auto; right: 8px; } }
-@media (max-width: 600px) { .inbox-navigation button:first-child:not(:last-child) { display: none; } .inbox-sample-controls { grid-template-columns: 1fr 1fr; } .inbox-filter-controls { grid-template-columns: 1fr; } .inbox-sample-heading { align-items: flex-start; flex-direction: column; gap: 8px; } .inbox-history-list button, .inbox-sample-list button { align-items: flex-start; flex-direction: column; gap: 4px; } .inbox-history-list button > span:last-child, .inbox-sample-list button > span:last-child { text-align: left; } }
+.inbox-help { color: var(--ink-secondary); font-size: var(--text-xs); }
+.inbox-page h2 span { color: var(--ink-secondary); font-size: var(--text-sm); font-weight: 450; }
+@media (max-width: 920px) { .inbox-page { padding: 16px; } .inbox-header, .inbox-task { display: block; } .inbox-connection, .inbox-claims { margin-top: 12px; } }
+@media (max-width: 600px) { .inbox-sample-controls { grid-template-columns: 1fr 1fr; } .inbox-filter-controls { grid-template-columns: 1fr; } .inbox-sample-heading { flex-direction: column; align-items: flex-start; gap: 6px; } .inbox-page .inbox-history-list button, .inbox-page .inbox-sample-list button { flex-direction: column; align-items: flex-start; gap: 3px; } .inbox-history-list button > span:last-child, .inbox-sample-list button > span:last-child { text-align: left; } }
 </style>

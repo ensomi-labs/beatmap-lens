@@ -163,12 +163,15 @@ textarea:focus-visible,
   animation: bench-enter 320ms var(--ease-out) both;
 }
 
+/* The bar of a workspace that is not open yet, laid out like the frame's toolbar. */
+
 .app-bar {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto auto;
-  align-items: center;
-  gap: 12px;
+  display: flex;
+  min-width: 0;
   min-height: var(--toolbar-h);
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
   padding: max(6px, env(safe-area-inset-top)) max(8px, env(safe-area-inset-right)) 6px
     max(8px, env(safe-area-inset-left));
   border-bottom: 1px solid var(--seam);
@@ -212,7 +215,6 @@ textarea:focus-visible,
   box-shadow: inset 0 -2px 0 var(--signal);
 }
 
-.brand-lockup,
 .health-status,
 .diagnostic-main,
 .diagnostic-result,
@@ -221,35 +223,23 @@ textarea:focus-visible,
   align-items: center;
 }
 
-.brand-lockup {
-  gap: 10px;
-  min-width: max-content;
-}
-
-.brand-lockup p {
-  margin: 0;
-}
-
-.brand-mark,
 .brand-glyph {
   position: relative;
-  width: 24px;
-  height: 24px;
+  width: 20px;
+  height: 20px;
   flex: 0 0 auto;
-  border-radius: 6px;
+  border-radius: 5px;
   background: var(--ink);
 }
 
-.brand-mark::before,
 .brand-glyph::before {
   position: absolute;
-  inset: 5px;
+  inset: 4px;
   border: 2px solid var(--seam);
   border-radius: 50%;
   content: "";
 }
 
-.brand-mark::after,
 .brand-glyph::after {
   position: absolute;
   right: 4px;
@@ -260,32 +250,6 @@ textarea:focus-visible,
   border-radius: 50%;
   background: var(--signal-fill);
   content: "";
-}
-
-.brand-glyph {
-  width: 20px;
-  height: 20px;
-  border-radius: 5px;
-}
-
-.brand-glyph::before {
-  inset: 4px;
-}
-
-.brand-name {
-  font-family: var(--font-data);
-  font-size: var(--text-sm);
-  font-weight: 700;
-  line-height: 1.2;
-  letter-spacing: -0.02em;
-}
-
-.brand-edition {
-  margin-top: 1px;
-  color: var(--ink-muted);
-  font-size: var(--text-xs);
-  font-weight: 500;
-  line-height: 1.2;
 }
 
 .health-status {
@@ -410,8 +374,7 @@ textarea:focus-visible,
   }
 }
 
-.section-kicker,
-.brand-lockup p {
+.section-kicker {
   margin: 0;
 }
 
@@ -707,18 +670,6 @@ button.diagnostic:active {
     flex-direction: column;
   }
 
-  .app-bar {
-    grid-template-columns: auto 1fr auto;
-    gap: 14px;
-    min-height: 64px;
-    padding: max(10px, env(safe-area-inset-top)) max(12px, env(safe-area-inset-right)) 10px
-      max(12px, env(safe-area-inset-left));
-  }
-
-  .workspace-mode-switch {
-    justify-self: center;
-  }
-
   .preview-body,
   .editor-shell {
     min-height: 0;
@@ -734,31 +685,8 @@ button.diagnostic:active {
     gap: 8px;
   }
 
-  .brand-lockup {
-    gap: 8px;
-  }
-
-  .brand-mark {
-    width: 32px;
-    height: 32px;
-    border-radius: 10px;
-  }
-
-  .brand-name {
-    font-size: var(--text-sm);
-  }
-
-  .brand-edition {
-    font-size: var(--text-xs);
-  }
-
-  .workspace-mode-switch {
-    grid-template-columns: repeat(2, minmax(62px, 1fr));
-  }
-
   .workspace-mode-button {
-    padding: 0 8px;
-    font-size: var(--text-xs);
+    padding: 0 6px;
   }
 
   .health-status {
@@ -775,30 +703,12 @@ button.diagnostic:active {
     display: none;
   }
 
-  .preview-frame,
-  .editor-shell {
-    padding: 6px;
-  }
-
-  .preview-frame {
-    border-radius: 20px;
-  }
-
   .svg-output {
     min-height: 220px;
-  }
-
-  .svg-output,
-  #source-input {
-    border-radius: var(--radius-inner);
   }
 }
 
 @media (max-width: 360px) {
-  .brand-edition {
-    display: none;
-  }
-
   .source-footer {
     padding-right: 10px;
     padding-left: 10px;
@@ -844,10 +754,6 @@ button:disabled {
   opacity: 0.48;
 }
 
-.annotation-app-bar {
-  background: var(--canvas);
-}
-
 .annotation-chart-context {
   display: grid;
   min-width: 0;
@@ -859,6 +765,11 @@ button:disabled {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.app-bar > .annotation-chart-context {
+  flex: 1 1 auto;
+  margin-left: 4px;
 }
 
 .annotation-chart-context span {
@@ -2701,14 +2612,6 @@ button:disabled {
 }
 
 @media (max-width: 520px) {
-  .annotation-app-bar {
-    grid-template-columns: auto 1fr;
-  }
-
-  .annotation-app-bar .workspace-mode-switch {
-    justify-self: end;
-  }
-
   .onboarding-intro,
   .onboarding-form {
     padding-right: 16px;
@@ -2767,12 +2670,6 @@ button:disabled {
   .annotation-row-actions button,
   .annotation-seek {
     transition-duration: 0.001ms;
-  }
-}
-
-@media (max-width: 520px) {
-  .app-bar:not(.annotation-app-bar) .brand-lockup > div {
-    display: none;
   }
 }
 
