@@ -381,22 +381,39 @@ async function stageBox(page) {
   return page.locator(".timing-stage-overlay").boundingBox();
 }
 
-async function record(page, act, { browser, trace = false, samplePlayhead = false } = {}) {
+async function record(
+  page,
+  act,
+  { browser, trace = false, samplePlayhead = false, watchChanges = false } = {},
+) {
   if (trace) await browser.startTracing(page, { categories: traceCategories });
-  await page.evaluate((samplePlayhead) => {
-    performance.mark("bench-sync");
-    window.__bench.samplePlayhead = samplePlayhead;
-    if (samplePlayhead) window.__bench.startSampler();
-    window.__bench.recording = true;
-  }, samplePlayhead);
+  await page.evaluate(
+    ([samplePlayhead, watchChanges]) => {
+      performance.mark("bench-sync");
+      window.__bench.samplePlayhead = samplePlayhead;
+      if (samplePlayhead) window.__bench.startSampler();
+      if (watchChanges) window.__bench.watchChanges(true);
+      window.__bench.recording = true;
+    },
+    [samplePlayhead, watchChanges],
+  );
   await act();
   await page.evaluate(() => {
     window.__bench.recording = false;
     window.__bench.samplePlayhead = false;
+    window.__bench.watchChanges(false);
   });
   const bench = await page.evaluate(() => {
-    const { contexts, current, baseDraw, lastBaseDraw, elementPlayheadX, startSampler, ...rest } =
-      window.__bench;
+    const {
+      contexts,
+      current,
+      baseDraw,
+      lastBaseDraw,
+      elementPlayheadX,
+      startSampler,
+      watchChanges,
+      ...rest
+    } = window.__bench;
     const result = {
       ...rest,
       baseDraws: [lastBaseDraw, ...rest.baseDraws].filter(Boolean),
@@ -408,7 +425,17 @@ async function record(page, act, { browser, trace = false, samplePlayhead = fals
       })),
       dpr: window.devicePixelRatio,
     };
-    for (const key of ["frames", "playhead", "baseDraws", "stamps", "starts", "keys", "loafs"])
+    for (const key of [
+      "frames",
+      "playhead",
+      "baseDraws",
+      "stamps",
+      "starts",
+      "keys",
+      "loafs",
+      "stalls",
+      "changes",
+    ])
       if (Array.isArray(window.__bench[key])) window.__bench[key] = [];
     return result;
   });
@@ -416,14 +443,19 @@ async function record(page, act, { browser, trace = false, samplePlayhead = fals
   return bench;
 }
 
-/** Busy main-thread work in the page: `ms` long, every `everyMs`, `count` times. */
+/**
+ * Busy main-thread work in the page: `ms` long, every `everyMs`, `count` times. Each stall's start
+ * and end are recorded in `__bench.stalls`.
+ */
 function jank(page, ms, everyMs, count) {
   return page.evaluate(
     ([ms, everyMs, count]) => {
       let done = 0;
       const timer = setInterval(() => {
-        const until = performance.now() + ms;
+        const start = performance.now();
+        const until = start + ms;
         while (performance.now() < until);
+        window.__bench?.stalls?.push([start, performance.now()]);
         if (++done >= count) clearInterval(timer);
       }, everyMs);
     },
@@ -749,13 +781,17 @@ const scenarios = {
         await sleep(400);
         let bench;
         const frames = await screencast(context, page, async () => {
-          bench = await record(page, async () => {
-            await page.keyboard.press("Space");
-            if (load === "burst") await jank(page, 80, 500, 5);
-            await sleep(2800);
-            await page.keyboard.press("Escape");
-            await sleep(200);
-          });
+          bench = await record(
+            page,
+            async () => {
+              await page.keyboard.press("Space");
+              if (load === "burst") await jank(page, 80, 500, 5);
+              await sleep(2800);
+              await page.keyboard.press("Escape");
+              await sleep(200);
+            },
+            { watchChanges: true },
+          );
         });
         const centroids = await redCentroids(
           decoder,

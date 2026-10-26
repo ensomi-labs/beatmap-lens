@@ -335,6 +335,9 @@
           } else draw = (x) => (line.style.transform = `translateX(${x}px)`);
         }
         let running = true;
+        // Page times of the readout changes and of each stall, for the analysis's per-stall cost.
+        const readouts = [];
+        const stalls = [];
         const frame = (ts) => {
           if (!running) return;
           const start = performance.now();
@@ -344,6 +347,7 @@
           if (hud && ts - hudAt >= hudEvery) {
             hud.textContent = `${(ts - t0).toFixed(1)} ms`;
             hudAt = ts;
+            readouts.push(performance.now());
           }
           if (load.steadyMs) busy(load.steadyMs);
           frames.push({ ts, start, end: performance.now(), x: variant.startsWith("waapi") ? null : x });
@@ -357,15 +361,22 @@
               if (hud && now - hudAt >= hudEvery) {
                 hud.textContent = `${(now - t0).toFixed(1)} ms`;
                 hudAt = now;
+                readouts.push(performance.now());
               }
             }, 25)
           : undefined;
-        const burst = load.burstMs ? setInterval(() => busy(load.burstMs), 500) : undefined;
+        const burst = load.burstMs
+          ? setInterval(() => {
+              const start = performance.now();
+              busy(load.burstMs);
+              stalls.push([start, performance.now()]);
+            }, 500)
+          : undefined;
         await new Promise((done) => setTimeout(done, seconds * 1000));
         running = false;
         clearInterval(burst);
         clearInterval(timer);
-        return { variant, load: loadName, t0, speedPxPerMs, dpr, attributes, frames, timeOrigin: performance.timeOrigin };
+        return { variant, load: loadName, t0, speedPxPerMs, dpr, attributes, frames, readouts, stalls, timeOrigin: performance.timeOrigin };
       }
 
       window.lab = { offlineExactness, contextOptions, displayVariant };

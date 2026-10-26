@@ -16,7 +16,11 @@
 // - stamps: AudioContext.getOutputTimestamp() every 4 ms (and every frame while sampling);
 // - starts: every AudioBufferSourceNode.start(), with the context time when it was called;
 // - keys: each keydown's timeStamp and when the page received it;
-// - loafs: Long Animation Frame entries (frames over 50 ms), with their script attribution.
+// - loafs: Long Animation Frame entries (frames over 50 ms), with their script attribution;
+// - stalls: [start, end] of each main-thread stall the harness makes (run.mjs `jank`);
+// - changes: while `watchChanges()` runs (the presented scenario only), the page time of each task
+//   that changed the DOM (a MutationObserver callback, at the end of the task) and of each
+//   `animate()` call: what makes the page ask for a main-thread frame without a frame loop.
 (() => {
   const bench = {
     recording: false,
@@ -33,6 +37,8 @@
     starts: [],
     keys: [],
     loafs: [],
+    stalls: [],
+    changes: [],
     contexts: [],
     timeOrigin: performance.timeOrigin,
   };
@@ -145,6 +151,27 @@
     raf(sampleFrame);
   };
   bench.startSampler = () => raf(sampleFrame);
+
+  let watching = false;
+  const observer = new MutationObserver(() => {
+    if (watching && bench.recording) bench.changes.push({ at: now(), kind: "dom" });
+  });
+  bench.watchChanges = (on) => {
+    watching = on;
+    if (on)
+      observer.observe(document, {
+        subtree: true,
+        childList: true,
+        characterData: true,
+        attributes: true,
+      });
+    else observer.disconnect();
+  };
+  const animate = Element.prototype.animate;
+  Element.prototype.animate = function (keyframes, options) {
+    if (watching && bench.recording) bench.changes.push({ at: now(), kind: "animate" });
+    return animate.call(this, keyframes, options);
+  };
 
   const start = AudioBufferSourceNode.prototype.start;
   AudioBufferSourceNode.prototype.start = function (when, offset, duration) {

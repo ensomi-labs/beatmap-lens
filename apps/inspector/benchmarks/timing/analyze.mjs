@@ -93,6 +93,35 @@ function heldError(rows, rate = 1) {
   };
 }
 
+/**
+ * What each main-thread stall cost the presented picture. `stalls` are [start, end] in page ms,
+ * `swaps` the presented frames' swap times in order, `changes` the page times of the page's
+ * main-thread changes (DOM changes, animate() calls, animation-frame callbacks). A stall loses a
+ * frame when the longest gap between presented frames across it exceeds 1.75 frames (29.2 ms at
+ * 60 Hz; idle, the longest gap in runs 1-3 was 25.5 ms). `sinceChangeMs` is how long before the
+ * stall the last change came: within a frame, a main-thread frame was most likely still pending.
+ */
+function stallCosts(stalls, swaps, changes, frameMs = 1000 / 60) {
+  const sortedChanges = sorted(changes);
+  const perStall = (stalls ?? []).map(([start, end]) => {
+    let gap = 0;
+    for (let i = 0; i + 1 < swaps.length; i++)
+      if (swaps[i + 1] > start && swaps[i] < end) gap = Math.max(gap, swaps[i + 1] - swaps[i]);
+    const before = sortedChanges.filter((t) => t <= start).at(-1);
+    return {
+      durationMs: round(end - start, 1),
+      longestGapMs: round(gap, 1),
+      lostFrame: gap > 1.75 * frameMs,
+      sinceChangeMs: before === undefined ? null : round(start - before, 1),
+    };
+  });
+  return {
+    stalls: perStall.length,
+    lostFrame: perStall.filter((s) => s.lostFrame).length,
+    perStall,
+  };
+}
+
 /** Page time of the first Escape (the stop), or Infinity. */
 function stopTime(run) {
   return (run.keys ?? []).find((k) => k.key === "Escape")?.timeStamp ?? Number.POSITIVE_INFINITY;
@@ -330,6 +359,7 @@ function displaySummary(run) {
     const modelMoved = (moving[i].swapMs - moving[i - 1].swapMs) * run.speedPxPerMs;
     if (modelMoved > 4 && Math.abs(moving[i].xCss - moving[i - 1].xCss) < 0.1) stale++;
   }
+  const changes = [...(run.readouts ?? []), ...(run.frames ?? []).map((f) => f.start)];
   return {
     variant: run.variant,
     load: run.load,
@@ -344,6 +374,14 @@ function displaySummary(run) {
     held: heldError(
       moving.map((p) => ({ t: p.swapMs, error: p.xCss / run.speedPxPerMs - (p.swapMs - run.t0) })),
     ),
+    // Every frame with the line found, not only `moving`: the last stall ends near the window's end.
+    stallCost: run.stalls?.length
+      ? stallCosts(
+          run.stalls,
+          presented.map((p) => p.swapMs),
+          changes,
+        )
+      : null,
   };
 }
 
@@ -560,6 +598,10 @@ function presentedSummary(part) {
   for (let i = 1; i < rows.length; i++)
     if (rows[i].swapMs - rows[i - 1].swapMs > 8 && Math.abs(rows[i].x - rows[i - 1].x) < 0.2)
       stale++;
+  const changes = [
+    ...(part.changes ?? []).map((c) => c.at),
+    ...(part.frames ?? []).map((f) => f.start),
+  ];
   return {
     presentedFrames: rows.length,
     msPerDevicePx: round(1 / mapping.pxPerMs, 4),
@@ -567,6 +609,16 @@ function presentedSummary(part) {
     deviationFromMedianMs: spread(errors.map((e) => e - m)),
     staleFrames: stale,
     held: heldError(rows.map((r) => ({ t: r.swapMs, error: r.error }))),
+    pageFrames: (part.frames ?? []).length,
+    domChanges: (part.changes ?? []).filter((c) => c.kind === "dom").length,
+    animateCalls: (part.changes ?? []).filter((c) => c.kind === "animate").length,
+    stallCost: part.stalls?.length
+      ? stallCosts(
+          part.stalls,
+          rows.map((r) => r.swapMs),
+          changes,
+        )
+      : null,
   };
 }
 
@@ -733,6 +785,20 @@ if (summary.apps.length) {
       (a) =>
         `${a.presented.burst.held.p95Ms}/${a.presented.burst.held.maxMs}, ${a.presented.burst.held.longestGapMs}`,
     ),
+    row(
+      "presented (80 ms stalls): stalls losing a frame / stalls",
+      (a) => `${a.presented.burst.stallCost.lostFrame}/${a.presented.burst.stallCost.stalls}`,
+    ),
+    row("presented (80 ms stalls): per stall, longest gap ms @ ms since the last change", (a) =>
+      a.presented.burst.stallCost.perStall
+        .map((s) => `${s.longestGapMs}@${s.sinceChangeMs ?? "–"}`)
+        .join(" "),
+    ),
+    row(
+      "presented (80 ms stalls): page frames / DOM changes / animate() calls",
+      (a) =>
+        `${a.presented.burst.pageFrames}/${a.presented.burst.domChanges}/${a.presented.burst.animateCalls}`,
+    ),
   ];
   lines.push(`| ${header.join(" | ")} |`, `| ${header.map(() => "---").join(" | ")} |`);
   for (const r of rows) lines.push(`| ${r.join(" | ")} |`);
@@ -759,13 +825,17 @@ for (const lab of summary.labs) {
   );
   if (Array.isArray(lab.display)) {
     lines.push(
-      "| variant | load | desync | rAF p95 ms | long frames | callback delay p50/p95 ms | presented | swap delay ms | presented error sd/p95abs/maxabs ms | held error p95/max ms | longest gap ms |",
-      "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+      "| variant | load | desync | rAF p95 ms | long frames | callback delay p50/p95 ms | presented | swap delay ms | presented error sd/p95abs/maxabs ms | held error p95/max ms | longest gap ms | stalls losing a frame: gap ms @ ms since a change |",
+      "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     );
-    for (const d of lab.display)
+    for (const d of lab.display) {
+      const cost = d.stallCost
+        ? `${d.stallCost.lostFrame}/${d.stallCost.stalls}: ${d.stallCost.perStall.map((s) => `${s.longestGapMs}@${s.sinceChangeMs ?? "–"}`).join(" ")}`
+        : "–";
       lines.push(
-        `| ${d.variant} | ${d.load} | ${d.desynchronized} | ${fmt(d.rafIntervalMs, "p95")} | ${d.longFrames} | ${fmt(d.callbackDelayMs)}/${fmt(d.callbackDelayMs, "p95")} | ${d.presentedFrames} | ${d.swapDelayMs} | ${fmt(d.presentedErrorMs, "sd")}/${fmt(d.presentedErrorMs, "p95abs")}/${fmt(d.presentedErrorMs, "maxabs")} | ${d.held.p95Ms}/${d.held.maxMs} | ${d.held.longestGapMs} |`,
+        `| ${d.variant} | ${d.load} | ${d.desynchronized} | ${fmt(d.rafIntervalMs, "p95")} | ${d.longFrames} | ${fmt(d.callbackDelayMs)}/${fmt(d.callbackDelayMs, "p95")} | ${d.presentedFrames} | ${d.swapDelayMs} | ${fmt(d.presentedErrorMs, "sd")}/${fmt(d.presentedErrorMs, "p95abs")}/${fmt(d.presentedErrorMs, "maxabs")} | ${d.held.p95Ms}/${d.held.maxMs} | ${d.held.longestGapMs} | ${cost} |`,
       );
+    }
   } else lines.push("Display:", "```json", JSON.stringify(lab.display), "```");
 }
 if (summary.owner)
