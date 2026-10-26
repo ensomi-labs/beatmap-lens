@@ -267,36 +267,36 @@ async function runLab() {
     await attempt("display", async () => {
       const decoder = await context.newPage();
       const out = [];
+      const matrix = [];
       for (const load of ["none", "steady8", "burst"])
-        for (const variant of [
-          "canvas-now",
-          "canvas-frame",
-          "dom-frame",
-          "waapi",
-          "canvas-desync",
-        ]) {
-          let run;
-          const frames = await screencast(context, page, async () => {
-            run = await page.evaluate(
-              ([variant, load]) => window.lab.displayVariant(variant, load, 2.6),
-              [variant, load],
-            );
-          });
-          // The stage is the top 400 of 420 CSS px; read the row at 200 px.
-          const centroids = await redCentroids(
-            decoder,
-            frames.map((f) => f.data),
-            200 / 420,
+        for (const variant of ["canvas-now", "canvas-frame", "dom-frame", "waapi", "canvas-desync"])
+          matrix.push([variant, load]);
+      for (const load of ["none", "burst"])
+        for (const variant of ["waapi-noraf", "waapi-hud10", "waapi-hud60"])
+          matrix.push([variant, load]);
+      for (const [variant, load] of matrix) {
+        let run;
+        const frames = await screencast(context, page, async () => {
+          run = await page.evaluate(
+            ([variant, load]) => window.lab.displayVariant(variant, load, 2.6),
+            [variant, load],
           );
-          out.push({
-            ...run,
-            presented: frames.map((frame, index) => ({
-              swapMs: frame.swapS === null ? null : frame.swapS * 1000 - run.timeOrigin,
-              x: centroids[index]?.x ?? null,
-              imageWidth: centroids[index]?.width ?? null,
-            })),
-          });
-        }
+        });
+        // The stage is the top 400 of 420 CSS px; read the row at 200 px.
+        const centroids = await redCentroids(
+          decoder,
+          frames.map((f) => f.data),
+          200 / 420,
+        );
+        out.push({
+          ...run,
+          presented: frames.map((frame, index) => ({
+            swapMs: frame.swapS === null ? null : frame.swapS * 1000 - run.timeOrigin,
+            x: centroids[index]?.x ?? null,
+            imageWidth: centroids[index]?.width ?? null,
+          })),
+        });
+      }
       await decoder.close();
       return out;
     });

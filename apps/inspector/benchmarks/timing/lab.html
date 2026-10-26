@@ -270,6 +270,9 @@
       /**
        * L3. Display variants: one moving line, drawn five ways, with optional main-thread load.
        * x(t) = speed · (t − t0) CSS px from the left edge; the harness reads the presented frames.
+       * Web Animation variants also vary what else the page does: `waapi-noraf` runs no animation
+       * frame loop at all, `waapi-hud10` changes a text readout every 100 ms (as the Timing HUD
+       * does) and `waapi-hud60` changes it every frame.
        */
       const speedPxPerMs = 0.5;
       const loads = {
@@ -294,6 +297,14 @@
         const frames = [];
         let draw = () => {};
         let attributes = null;
+        const hudEvery = { "waapi-hud10": 100, "waapi-hud60": 0 }[variant];
+        let hud = null;
+        let hudAt = Number.NEGATIVE_INFINITY;
+        if (hudEvery !== undefined) {
+          hud = document.createElement("p");
+          hud.style.cssText = "position:absolute;bottom:0;left:0;margin:0;color:#fff;font:12px monospace";
+          stage.append(hud);
+        }
         if (variant.startsWith("canvas")) {
           const canvas = document.createElement("canvas");
           canvas.width = 1470 * dpr;
@@ -310,7 +321,7 @@
           const line = document.createElement("div");
           line.className = "line";
           stage.append(line);
-          if (variant === "waapi") {
+          if (variant.startsWith("waapi")) {
             const animation = line.animate(
               [{ transform: "translateX(0px)" }, { transform: `translateX(${1400}px)` }],
               { duration: 1400 / speedPxPerMs, iterations: 1, easing: "linear", fill: "both" },
@@ -325,11 +336,15 @@
           const at = variant === "canvas-now" ? start : ts;
           const x = xAt(at);
           draw(x);
+          if (hud && ts - hudAt >= hudEvery) {
+            hud.textContent = `${(ts - t0).toFixed(1)} ms`;
+            hudAt = ts;
+          }
           if (load.steadyMs) busy(load.steadyMs);
-          frames.push({ ts, start, end: performance.now(), x: variant === "waapi" ? null : x });
+          frames.push({ ts, start, end: performance.now(), x: variant.startsWith("waapi") ? null : x });
           requestAnimationFrame(frame);
         };
-        requestAnimationFrame(frame);
+        if (variant !== "waapi-noraf") requestAnimationFrame(frame);
         const burst = load.burstMs ? setInterval(() => busy(load.burstMs), 500) : undefined;
         await new Promise((done) => setTimeout(done, seconds * 1000));
         running = false;
