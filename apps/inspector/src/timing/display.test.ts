@@ -2,6 +2,9 @@ import { describe, expect, it } from "vitest";
 import { type ClockLine, contextAt, type PlaybackAnchor, sourceAtContext } from "./clock";
 import {
   followView,
+  loopReanchorDue,
+  loopReanchorPasses,
+  type MotionSegment,
   motionAt,
   motionSegments,
   needsResync,
@@ -96,12 +99,90 @@ describe("motionSegments", () => {
     }
   });
 
-  it("starts the loop where the first pass ends", () => {
+  it("starts the loop where the first pass ends, which holds its end over any gap", () => {
     const motion = planMotion(anchor({ loop: { startMs: 1100, endMs: 1300 } }), line, 0);
     const [first, loop] = motionSegments(motion);
     expect(loop?.startPerfMs).toBeCloseTo((first?.startPerfMs ?? 0) + (first?.durationMs ?? 0), 9);
     expect(loop?.iterations).toBe(Number.POSITIVE_INFINITY);
-    expect(first?.holdEnd).toBe(false);
+    // Each piece's start and end round to microseconds on their own: a frame between them shows
+    // the first pass's end, not the hold.
+    expect(first?.holdEnd).toBe(true);
+    expect(loop?.holdEnd).toBe(false);
+    expect(motionSegments({ ...motion, loop: null }).map((segment) => segment.holdEnd)).toEqual([
+      true,
+    ]);
+  });
+
+  /**
+   * The compositor's view of the pieces, if it keeps time in whole microseconds as Chromium's
+   * `base::TimeDelta` does: start times, durations and frame times truncated to 1 µs.
+   */
+  function compositorAt(segments: MotionSegment[], holdMs: number, perfMs: number): number {
+    const us = (ms: number) => Math.trunc(ms * 1000);
+    let shown = holdMs;
+    for (const segment of segments) {
+      const elapsedUs = us(perfMs) - us(segment.startPerfMs);
+      const durationUs = us(segment.durationMs);
+      if (elapsedUs < 0) continue;
+      if (elapsedUs >= durationUs * segment.iterations) {
+        if (segment.holdEnd) shown = segment.toMs;
+        continue;
+      }
+      const fraction = (elapsedUs % durationUs) / durationUs;
+      shown = segment.fromMs + (segment.toMs - segment.fromMs) * fraction;
+    }
+    return shown;
+  }
+
+  it("starts the loop piece at a recent wrap, so rounding each pass cannot build up", () => {
+    // A 213.354 ms loop at rate 0.75 on a clock 30 ppm slow: a pass is not a whole microsecond.
+    const loop = { startMs: 1000.0208, endMs: 1213.3748 };
+    const motion = planMotion(anchor({ startSourceMs: 990, rate: 0.75, loop }), line, 0);
+    const lengthMs = loop.endMs - loop.startMs;
+    /** Shown minus intended, as the shorter way round the loop. */
+    const error = (shown: number, intended: number) =>
+      ((((shown - intended) % lengthMs) + 1.5 * lengthMs) % lengthMs) - lengthMs / 2;
+    const worst = (segments: MotionSegment[], fromMs: number) =>
+      Math.max(
+        ...Array.from({ length: 200 }, (_, index) => {
+          const perfMs = fromMs + index * 7.37;
+          return Math.abs(
+            error(compositorAt(segments, motion.holdMs, perfMs), motionAt(motion, perfMs)),
+          );
+        }),
+      );
+    // Half an hour into the loop, pieces made now are within a few microseconds of the motion;
+    // pieces anchored at the first wrap would have drifted by milliseconds.
+    const nowMs = motion.startPerfMs + 30 * 60_000;
+    expect(worst(motionSegments(motion, nowMs), nowMs)).toBeLessThan(0.005);
+    expect(worst(motionSegments(motion), nowMs)).toBeGreaterThan(0.5);
+    // Before the first wrap, the loop piece starts there.
+    const [first, early] = motionSegments(motion, motion.startPerfMs + 10);
+    expect(early?.startPerfMs).toBe((first?.startPerfMs ?? 0) + (first?.durationMs ?? 0));
+  });
+});
+
+describe("loopReanchorDue", () => {
+  // Shown from page time 1000 ms at source 1000 ms, full speed, wrapping every 50 ms from 1100 ms.
+  const motion: PlayheadMotion = {
+    startPerfMs: 1000,
+    holdMs: 1000,
+    speed: 1,
+    firstEndMs: 1100,
+    loop: { startMs: 1050, endMs: 1100 },
+  };
+
+  it("asks for a new loop piece once the one on the stage has run that many passes", () => {
+    const due = 1100 + loopReanchorPasses * 50;
+    expect(loopReanchorDue(motion, 1000, due - 1)).toBe(false);
+    expect(loopReanchorDue(motion, 1000, due)).toBe(true);
+    expect(loopReanchorDue(motion, 2000, 2000 + loopReanchorPasses * 50 - 1)).toBe(false);
+    expect(loopReanchorDue(motion, 2000, 2000 + loopReanchorPasses * 50)).toBe(true);
+  });
+
+  it("never for a play that does not loop, or no motion", () => {
+    expect(loopReanchorDue({ ...motion, loop: null }, 0, 1e9)).toBe(false);
+    expect(loopReanchorDue(undefined, 0, 1e9)).toBe(false);
   });
 });
 

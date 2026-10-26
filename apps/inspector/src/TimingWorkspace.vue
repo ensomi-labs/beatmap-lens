@@ -21,6 +21,7 @@ import {
 } from "./timing/contracts";
 import {
   followView,
+  loopReanchorDue,
   motionAt,
   needsResync,
   nextFollowCheckMs,
@@ -198,6 +199,8 @@ let loadedHandle = "";
 let transportTimer: ReturnType<typeof setTimeout> | undefined;
 /** Page time of the last HUD readout while playing. */
 let readoutAtMs = Number.NEGATIVE_INFINITY;
+/** Page time at which the stage was last handed a motion (and started its loop piece). */
+let motionPlacedAtMs = Number.NEGATIVE_INFINITY;
 let disposed = false;
 
 const passage = computed(() => opened.value?.passages[passageIndex.value]);
@@ -667,11 +670,12 @@ async function start(fromMs: number, endMs: number, loop: boolean) {
 
 /**
  * The transport's bookkeeping while playing, on a timer: feeds the clock model, hands the stage a
- * new motion only when the playhead would move by more than the resync tolerance, follows the
- * playhead and refreshes the HUD readout every `readoutIntervalMs`. It runs every
- * `transportIntervalMs`, and exactly when the playhead will leave the view or wrap, so a follow
- * jump is on time. Nothing here runs per frame: the compositor moves the playhead, and an
- * animation-frame loop would make it wait for the main thread.
+ * new motion only when the playhead would move by more than the resync tolerance or a loop's
+ * compositor piece has run `loopReanchorPasses` passes, follows the playhead and refreshes the
+ * HUD readout every `readoutIntervalMs`. It runs every `transportIntervalMs`, and exactly when the
+ * playhead will leave the view or wrap, so a follow jump is on time. Nothing here runs per frame:
+ * the compositor moves the playhead, and an animation-frame loop would make it wait for the main
+ * thread.
  */
 function transportStep() {
   transportTimer = undefined;
@@ -681,7 +685,13 @@ function transportStep() {
   engine.sampleClock();
   const next = engine.motion(offsetMs);
   if (!next) motion.value = undefined;
-  else if (needsResync(motion.value, next, nowMs)) motion.value = next;
+  else if (
+    needsResync(motion.value, next, nowMs) ||
+    loopReanchorDue(motion.value, motionPlacedAtMs, nowMs)
+  ) {
+    motion.value = next;
+    motionPlacedAtMs = nowMs;
+  }
   const current = motion.value;
   const shownMs = current ? motionAt(current, nowMs) : engine.shownAt(nowMs, offsetMs);
   if (shownMs !== undefined) {

@@ -142,6 +142,7 @@ afterEach(() => {
   app.unmount();
   document.body.replaceChildren();
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
 });
 
 function overlay(): HTMLCanvasElement {
@@ -194,6 +195,7 @@ it("places the playhead with a transform, like a mark, and redraws no canvas for
 it("runs the playhead on the compositor while playing, placed again only for a new motion", async () => {
   await nextTick();
   runFrames();
+  vi.spyOn(performance, "now").mockReturnValue(900);
   // Heard from page time 1000 ms at source 100 ms, at full speed, looping 200-400 ms.
   props.playheadMotion = {
     startPerfMs: 1000,
@@ -212,6 +214,8 @@ it("runs the playhead on the compositor while playing, placed again only for a n
     { transform: "translateX(39.5px)" },
   ]);
   expect(line[1]?.options).toMatchObject({ duration: 200, iterations: Infinity, easing: "linear" });
+  // The first pass holds its end until the loop piece takes over, so no frame shows the hold.
+  expect(line.map((record) => record.options.fill)).toEqual(["forwards", "none"]);
   expect(playhead().style.transform).toBe("translateX(9.5px)");
   // The HUD's readouts while playing, and base redraws for a new selection, move nothing.
   const count = animations.length;
@@ -227,6 +231,28 @@ it("runs the playhead on the compositor while playing, placed again only for a n
   await nextTick();
   expect(animations.every((record) => record.cancelled)).toBe(true);
   expect(playhead().style.transform).toBe("translateX(32px)");
+});
+
+it("holds a play's end, and starts a long-running loop's piece at a recent wrap", async () => {
+  await nextTick();
+  runFrames();
+  const motion: PlayheadMotion = {
+    startPerfMs: 1000,
+    holdMs: 100,
+    speed: 1,
+    firstEndMs: 400,
+    loop: null,
+  };
+  props.playheadMotion = motion;
+  await nextTick();
+  const once = animations.filter((record) => record.element === playhead());
+  expect(once.map((record) => record.options.fill)).toEqual(["forwards"]);
+  // Handed the loop again a minute in: its piece starts at the wrap at least 100 ms before now.
+  vi.spyOn(performance, "now").mockReturnValue(61_000);
+  props.playheadMotion = { ...motion, loop: { startMs: 200, endMs: 400 } };
+  await nextTick();
+  const looped = animations.filter((record) => record.element === playhead()).slice(-2);
+  expect(looped.map((record) => record.startTime)).toEqual([1000, 1300 + 298 * 200]);
 });
 
 it("keeps a requested base frame instead of requesting another for each change", async () => {

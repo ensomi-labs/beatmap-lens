@@ -68,34 +68,76 @@ export interface MotionSegment {
   fromMs: number;
   toMs: number;
   iterations: number;
-  /** A non-looping play holds its end after the last piece. */
+  /**
+   * The piece holds its end after it: a non-looping play stays at its end, and the first pass of a
+   * loop covers any rounding gap before the loop piece, which overrides it where it runs.
+   */
   holdEnd: boolean;
 }
 
-/** The pieces after the hold: the first pass, then the loop repeated, if there is one. */
-export function motionSegments(motion: PlayheadMotion): MotionSegment[] {
-  const firstMs = Math.max(0, motion.firstEndMs - motion.holdMs);
+/**
+ * The compositor keeps animation time in whole microseconds, so each pass of a loop repeated
+ * forever may run up to 1 µs short of the motion's (plausible from Chromium's source, not
+ * measured), and the drawn playhead would drift ahead over a long loop. The loop piece therefore
+ * starts at a recent wrap, and the workspace hands the stage the motion again once it has run this
+ * many passes: the drift stays within tens of microseconds.
+ */
+export const loopReanchorPasses = 32;
+/** A new loop piece starts at a wrap at least this much earlier: every frame to come is in it. */
+const loopAnchorLeadMs = 100;
+
+/** Page time at which the first pass ends and a loop first wraps. */
+function firstWrapPerfMs(motion: PlayheadMotion): number {
+  return motion.startPerfMs + Math.max(0, motion.firstEndMs - motion.holdMs) / motion.speed;
+}
+
+/**
+ * The pieces after the hold: the first pass, then the loop repeated, if there is one, from its
+ * latest wrap at least `loopAnchorLeadMs` before `nowMs` (from the first wrap if that is later).
+ */
+export function motionSegments(
+  motion: PlayheadMotion,
+  nowMs = Number.NEGATIVE_INFINITY,
+): MotionSegment[] {
   const first: MotionSegment = {
     startPerfMs: motion.startPerfMs,
-    durationMs: firstMs / motion.speed,
+    durationMs: Math.max(0, motion.firstEndMs - motion.holdMs) / motion.speed,
     fromMs: motion.holdMs,
     toMs: motion.firstEndMs,
     iterations: 1,
-    holdEnd: !motion.loop,
+    holdEnd: true,
   };
   const loop = motion.loop;
   if (!loop) return [first];
+  const passMs = (loop.endMs - loop.startMs) / motion.speed;
+  const wrapMs = firstWrapPerfMs(motion);
+  const passes = Math.max(0, Math.floor((nowMs - loopAnchorLeadMs - wrapMs) / passMs));
   return [
     first,
     {
-      startPerfMs: first.startPerfMs + first.durationMs,
-      durationMs: (loop.endMs - loop.startMs) / motion.speed,
+      startPerfMs: wrapMs + passes * passMs,
+      durationMs: passMs,
       fromMs: loop.startMs,
       toMs: loop.endMs,
       iterations: Number.POSITIVE_INFINITY,
       holdEnd: false,
     },
   ];
+}
+
+/**
+ * Whether a looping motion handed to the stage at `placedAtMs` has run `loopReanchorPasses` passes
+ * by `nowMs`, so the stage should start its loop piece again from a recent wrap.
+ */
+export function loopReanchorDue(
+  motion: PlayheadMotion | undefined,
+  placedAtMs: number,
+  nowMs: number,
+): boolean {
+  const loop = motion?.loop;
+  if (!motion || !loop) return false;
+  const passMs = (loop.endMs - loop.startMs) / motion.speed;
+  return nowMs - Math.max(placedAtMs, firstWrapPerfMs(motion)) >= loopReanchorPasses * passMs;
 }
 
 /** A refit moving the playhead by less than this (source ms) keeps the running animation. */

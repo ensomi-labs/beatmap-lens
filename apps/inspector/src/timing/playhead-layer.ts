@@ -20,10 +20,11 @@ export class PlayheadLayer {
     this.element.style.transform = translate(x);
   }
 
-  run(motion: PlayheadMotion, x: (timeMs: number) => number) {
+  /** Runs `motion` from now (page time `nowMs`): a loop's piece starts at a recent wrap. */
+  run(motion: PlayheadMotion, x: (timeMs: number) => number, nowMs = performance.now()) {
     this.cancel();
     this.element.style.transform = translate(x(motion.holdMs));
-    for (const segment of motionSegments(motion)) {
+    for (const segment of motionSegments(motion, nowMs)) {
       const animation = this.element.animate(
         [{ transform: translate(x(segment.fromMs)) }, { transform: translate(x(segment.toMs)) }],
         {

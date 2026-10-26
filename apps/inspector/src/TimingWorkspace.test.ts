@@ -42,9 +42,10 @@ vi.mock("./timing/audio-engine", () => ({
       return undefined;
     }
     sampleClock() {}
+    /** A new object on every call, as the engine plans one from the clock model each time. */
     motion(offsetMs: number) {
       engine.offsets.push(offsetMs);
-      return this.playing ? engine.motion : undefined;
+      return this.playing && engine.motion ? { ...engine.motion } : undefined;
     }
     shownAt(frameMs: number, offsetMs: number) {
       engine.offsets.push(offsetMs);
@@ -691,18 +692,54 @@ it("hands the stage the playhead's motion and refreshes the HUD on a timer, at m
     await nextTick();
   };
   await advance(25);
-  expect(stage.props["playhead-motion"]).toBe(motion);
+  const handed = stage.props["playhead-motion"];
+  expect(handed).toEqual(motion);
   expect(hud()).toContain("00:00.125");
   await advance(50);
   expect(hud()).toContain("00:00.125");
   // A refit that moves the playhead by a fraction of a millisecond keeps the running motion.
   engine.motion = { ...motion, startPerfMs: motion.startPerfMs + 0.01 };
   await advance(50);
-  expect(stage.props["playhead-motion"]).toBe(motion);
+  expect(stage.props["playhead-motion"]).toBe(handed);
   expect(hud()).toContain("00:00.225");
   // No animation-frame loop runs while playing.
   expect(frames).toHaveLength(0);
   key(" ");
   await nextTick();
   expect(stage.props["playhead-motion"]).toBeUndefined();
+});
+
+it("hands the stage a loop's motion again once its compositor piece has run 32 passes", async () => {
+  await opened();
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
+  onTestFinished(() => {
+    vi.useRealTimers();
+  });
+  key("l");
+  key(" ");
+  await vi.waitFor(() => expect(engine.plays).toBe(1));
+  // From the start of the play, a first pass of 50 ms, then a 50 ms loop.
+  engine.motion = {
+    startPerfMs: performance.now(),
+    holdMs: 200,
+    speed: 1,
+    firstEndMs: 250,
+    loop: { startMs: 200, endMs: 250 },
+  };
+  vi.advanceTimersByTime(25);
+  await nextTick();
+  const handed = stage.props["playhead-motion"];
+  expect(handed).toEqual(engine.motion);
+  // The same motion all along: kept until 32 passes after the first wrap (50 + 1600 ms).
+  vi.advanceTimersByTime(1600);
+  await nextTick();
+  expect(stage.props["playhead-motion"]).toBe(handed);
+  vi.advanceTimersByTime(50);
+  await nextTick();
+  const again = stage.props["playhead-motion"];
+  expect(again).not.toBe(handed);
+  expect(again).toEqual(engine.motion);
+  vi.advanceTimersByTime(1500);
+  await nextTick();
+  expect(stage.props["playhead-motion"]).toBe(again);
 });
