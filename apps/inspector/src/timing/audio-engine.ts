@@ -1,10 +1,12 @@
-import { clickTimes, heardSourceMs, type PlaybackAnchor } from "./output-clock";
+import { clickTimes, heardSourceMs, outputReached, type PlaybackAnchor } from "./output-clock";
 
 /** How far ahead a start is scheduled, so its context time is known exactly. */
 const scheduleLeadS = 0.03;
 /** Mark clicks are scheduled this far ahead, topped up at this interval. */
 const clickLookaheadS = 0.2;
 const clickIntervalMs = 25;
+/** A click due this soon may already be in the block being rendered; a change leaves it alone. */
+const clickKeepS = 0.01;
 
 /**
  * A 2 kHz tick at full level on its first sample, decaying with a 2 ms time constant over 12 ms,
@@ -13,7 +15,7 @@ const clickIntervalMs = 25;
 export function clickSamples(sampleRate: number): Float32Array<ArrayBuffer> {
   return Float32Array.from({ length: Math.round(sampleRate * 0.012) }, (_, index) => {
     const t = index / sampleRate;
-    return 0.5 * Math.cos(2 * Math.PI * 2000 * t) * Math.exp(-t / 0.002);
+    return 0.3 * Math.cos(2 * Math.PI * 2000 * t) * Math.exp(-t / 0.002);
   });
 }
 
@@ -161,19 +163,31 @@ export class TimingAudioEngine {
   }
 
   /**
+   * The source time heard at `nowMs` with no offset, for a tap; undefined when nothing plays or
+   * the output has not yet reached the start.
+   */
+  heardAt(nowMs: number): number | undefined {
+    const anchor = this.anchor;
+    if (!anchor || this.context.state !== "running") return undefined;
+    const stamp = this.context.getOutputTimestamp();
+    if (!outputReached(anchor, stamp, nowMs)) return undefined;
+    return heardSourceMs(anchor, stamp, nowMs, 0);
+  }
+
+  /**
    * Clicks at these source times while playing, or none for null. A change takes effect from now:
    * clicks not yet sounding are rescheduled, so a nudged or new mark is heard on the next pass.
    */
   setClicks(beatsMs: readonly number[] | null) {
     this.clickBeatsMs = beatsMs ? [...beatsMs] : null;
-    const now = this.context.currentTime;
+    const keepUntilS = this.context.currentTime + clickKeepS;
     this.clicks = this.clicks.filter((click) => {
-      if (click.atS <= now) return true;
+      if (click.atS <= keepUntilS) return true;
       click.node.stop();
       click.node.disconnect();
       return false;
     });
-    this.clickedUntilS = Math.min(this.clickedUntilS, now);
+    this.clickedUntilS = Math.min(this.clickedUntilS, keepUntilS);
     this.syncClicks();
   }
 

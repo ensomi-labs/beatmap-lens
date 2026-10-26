@@ -95,30 +95,34 @@ Open the printed address; it opens the session directly. Marks append to
 - On the spectrogram and waveform, a click selects the mark under it (or clears
   the selection) and a drag selects every mark in its range; with
   <kbd>Cmd</kbd> a click adds or removes one mark and a drag adds.
-  <kbd>Shift</kbd>+click places a beat, right-click an unbeat. <kbd>B</kbd> and
-  <kbd>N</kbd>, and the **Beat** button, place them at the playhead; while the
-  audio plays they place them at the time heard when the key went down. Marks
-  can be placed only inside the passage; the shaded context around it is for
-  listening.
+  <kbd>Shift</kbd>+click places a beat, right-click (or <kbd>Ctrl</kbd>+click) an
+  unbeat. <kbd>B</kbd> and <kbd>N</kbd>, and the **Beat** and **Unbeat** buttons,
+  place them at the playhead; while the audio plays they place them at the source
+  time heard when the key or button went down, without the playhead offset. A
+  press before the sound reaches the output is ignored, and held keys do not
+  repeat. Taps usually land some tens of ms early; refine them on the waveform.
+  Marks can be placed only inside the passage; the shaded context around it is
+  for listening.
 - <kbd>←</kbd>/<kbd>→</kbd> nudge the selected marks (or step the playhead) by
   1 ms, with <kbd>Shift</kbd> 0.1 ms; <kbd>,</kbd>/<kbd>.</kbd> by one sample;
   the −15 to +15 buttons by 2, 5 or 15 ms. Selected marks move together and stop
-  at the passage edge. <kbd>[</kbd>/<kbd>]</kbd> visit marks, <kbd>K</kbd> flips
+  at the passage edge. <kbd>[</kbd>/<kbd>]</kbd> visit the marks before and after the
+  selection, <kbd>K</kbd> flips
   beat and unbeat, <kbd>Delete</kbd> removes the selection,
   <kbd>Cmd/Ctrl+Z</kbd> undoes and <kbd>Cmd/Ctrl+Shift+Z</kbd> redoes.
 - **Click on my beats** (<kbd>C</kbd>, off by default) plays a short tick at
   each of the listener's own beat marks, scheduled on the audio clock, so a
-  mark can be checked by ear; proposals are never heard. Saves record whether
-  it was on.
+  mark can be checked by ear; proposals are never heard. A save records whether
+  any playback of the passage in the page had the clicks on.
 - <kbd>Space</kbd> plays or pauses, <kbd>Shift+Space</kbd> plays the loop region
   once, <kbd>L</kbd> loops it, <kbd>I</kbd>/<kbd>O</kbd> set its edges,
-  <kbd>Shift</kbd>+drag selects it and <kbd>X</kbd> loops 500 ms around the
-  selected mark. Every start plays at least 120 ms of the preceding audio first.
+  <kbd>Shift</kbd>+drag selects it and <kbd>X</kbd> loops from 500 ms before the
+  first selected mark to 500 ms after the last. Every start plays at least 120 ms of the preceding audio first.
   <kbd>Esc</kbd> stops at once.
 - Wheel pans, <kbd>Ctrl</kbd>+wheel or pinch zooms at the pointer, <kbd>+</kbd>,
   <kbd>−</kbd> and <kbd>0</kbd> zoom around the selected mark or the playhead,
   <kbd>Z</kbd> toggles 0.5 ms per pixel, and the overview strip jumps. Dragging the
-  ruler or proposal strip, or right-dragging the waveform, pans. <kbd>F</kbd>
+  ruler or proposal strip, or right- or <kbd>Ctrl</kbd>-dragging the waveform, pans. <kbd>F</kbd>
   toggles follow. **Hide passages** in the stage header gives the stage the
   passage list's width.
 - <kbd>1</kbd>–<kbd>9</kbd> switch proposals, <kbd>P</kbd> hides all of them and

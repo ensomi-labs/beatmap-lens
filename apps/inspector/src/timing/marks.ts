@@ -143,15 +143,18 @@ export function marksWithin(marks: Mark[], range: TimeRange): string[] {
     .map((mark) => mark.id);
 }
 
-/** The next (`1`) or previous (`-1`) mark from the selection, or from `fromMs` without one. */
+/**
+ * The next (`1`) mark after the selection's last mark or the previous (`-1`) one before its first,
+ * or the next or previous from `fromMs` without a selection.
+ */
 export function adjacentMark(
   state: MarksState,
   direction: 1 | -1,
   fromMs: number,
 ): Mark | undefined {
-  const selected = selectedMark(state);
-  const index = selected ? state.marks.indexOf(selected) : -1;
-  if (selected) return state.marks[index + direction];
+  const chosen = selectedMarks(state);
+  const edge = direction === 1 ? chosen.at(-1) : chosen[0];
+  if (edge) return state.marks[state.marks.indexOf(edge) + direction];
   if (direction === 1) return state.marks.find((mark) => mark.time_ms > fromMs);
   return [...state.marks].reverse().find((mark) => mark.time_ms < fromMs);
 }

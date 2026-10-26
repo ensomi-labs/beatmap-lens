@@ -151,6 +151,12 @@ describe("several selected marks", () => {
     expect(next.past).toHaveLength(0);
   });
 
+  it("visits the marks beyond the selection's first and last", () => {
+    const chosen = selectMarks(state, ["c", "b"], "replace");
+    expect(adjacentMark(chosen, 1, 0)?.id).toBe("d");
+    expect(adjacentMark(chosen, -1, 0)?.id).toBe("a");
+  });
+
   it("finds the marks inside a range, ends included", () => {
     expect(marksWithin(state.marks, { startMs: 72_000, endMs: 73_000 })).toEqual(["b", "c"]);
     expect(marksWithin(state.marks, { startMs: 73_000.1, endMs: 84_000 })).toEqual([]);

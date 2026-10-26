@@ -59,8 +59,12 @@ const rulerHeight = 20;
 const stripRowHeight = 6;
 const marksHeight = 16;
 const overviewHeight = 28;
-/** A pointer that moves less than this (device pixels) clicks; more drags. */
-const dragThreshold = 4;
+/** A pointer that moves less than this many CSS pixels clicks; more drags. */
+const dragThresholdPx = 4;
+/** With Shift a press places a beat unless it clearly drags a loop region. */
+const shiftDragThresholdPx = 8;
+/** A click this close to a mark (CSS pixels, the glyph's half-width) hits it; marks this close share a glyph. */
+const markHitPx = 6;
 
 const host = ref<HTMLDivElement>();
 const base = ref<HTMLCanvasElement>();
@@ -224,10 +228,13 @@ watch(
 );
 // The overlay is drawn at once, not in a later frame. During playback the playhead changes in
 // every animation frame; a redraw requested from there runs a frame late, and one cancelled and
-// requested again on every change never runs at all while the audio plays.
+// requested again on every change never runs at all while the audio plays. While a base frame is
+// pending (the view moved), the overlay is drawn with it, so the two layers never disagree.
 watch(
   () => [props.playheadMs, hoverX.value, pendingLoop.value, pendingSelection.value, props.view],
-  () => drawOverlay(),
+  () => {
+    if (!baseFrame) drawOverlay();
+  },
   { flush: "post" },
 );
 watch(spectrogram, () => columnCache.clear());
@@ -299,6 +306,7 @@ function drawBase() {
   if (left > 0) context.fillRect(0, shadeTop, Math.min(left, canvas.width), shadeHeight);
   if (right < canvas.width) context.fillRect(Math.max(0, right), shadeTop, canvas.width, shadeHeight);
   drawOverview(context);
+  drawOverlay();
 }
 
 /** The grey ramp as packed RGBA words (little-endian canvas memory: 0xAABBGGRR). */
@@ -503,7 +511,7 @@ function drawMarks(context: CanvasRenderingContext2D) {
     if (mark.kind === "unbeat")
       dashedVline(context, x, lineTop, lineHeight, lineWidth, 4 * dpr, 3 * dpr);
     else vline(context, x, lineTop, lineHeight, lineWidth);
-    if (x - groupX < dragThreshold * dpr) {
+    if (x - groupX < markHitPx * dpr) {
       groupCount++;
       continue;
     }
@@ -635,6 +643,8 @@ let press:
       shift: boolean;
       /** Cmd (or the Windows key): toggle or add to the selection instead of replacing it. */
       meta: boolean;
+      /** The time under the press, so a view that jumps during the drag does not move it. */
+      timeMs: number;
       view: TimeView;
       dragging: boolean;
     }
@@ -661,6 +671,7 @@ function onPointerDown(event: PointerEvent) {
     secondary: event.button === 2 || (event.button === 0 && event.ctrlKey),
     shift: event.shiftKey,
     meta: event.metaKey,
+    timeMs: xToMs(props.view, x),
     view: props.view,
     dragging: false,
   };
@@ -672,12 +683,11 @@ function onPointerMove(event: PointerEvent) {
   hoverX.value = x;
   if (!press) return;
   const dx = x - press.x;
-  if (!press.dragging && Math.abs(dx) * size.value.dpr < dragThreshold) return;
+  const threshold = press.shift ? shiftDragThresholdPx : dragThresholdPx;
+  if (!press.dragging && Math.abs(dx) < threshold) return;
   press.dragging = true;
-  const range = {
-    startMs: Math.min(xToMs(press.view, press.x), xToMs(press.view, x)),
-    endMs: Math.max(xToMs(press.view, press.x), xToMs(press.view, x)),
-  };
+  const timeMs = xToMs(props.view, x);
+  const range = { startMs: Math.min(press.timeMs, timeMs), endMs: Math.max(press.timeMs, timeMs) };
   if (press.lane === "overview") {
     jumpTo(xToMs(overviewView.value, x));
   } else if (press.shift) {
@@ -695,8 +705,13 @@ function onPointerUp(event: PointerEvent) {
   if (!current) return;
   if (current.dragging) {
     if (pendingLoop.value) emit("loop-region", pendingLoop.value);
-    if (pendingSelection.value)
-      emit("select", marksWithin(props.marks, pendingSelection.value), current.meta ? "add" : "replace");
+    if (pendingSelection.value) {
+      // A mark whose glyph the band touches counts, as it would for a click.
+      const reachMs = markHitPx * props.view.msPerPx;
+      const { startMs, endMs } = pendingSelection.value;
+      const ids = marksWithin(props.marks, { startMs: startMs - reachMs, endMs: endMs + reachMs });
+      emit("select", ids, current.meta ? "add" : "replace");
+    }
     pendingLoop.value = undefined;
     pendingSelection.value = undefined;
     return;
@@ -719,7 +734,7 @@ function onPointerUp(event: PointerEvent) {
     else emit("seek", timeMs);
     return;
   }
-  const toleranceMs = (dragThreshold / size.value.dpr) * props.view.msPerPx;
+  const toleranceMs = markHitPx * props.view.msPerPx;
   let near: Mark | undefined;
   for (const mark of props.marks) {
     const distance = Math.abs(mark.time_ms - timeMs);

@@ -80,6 +80,16 @@ export function clickTimes(
   return times;
 }
 
+/**
+ * Whether the output has reached the anchor's start by `nowMs`, so that `heardSourceMs` gives a
+ * time actually heard rather than the start position it holds before then.
+ */
+export function outputReached(anchor: PlaybackAnchor, stamp: OutputStamp, nowMs: number): boolean {
+  const { contextTime = 0, performanceTime = 0 } = stamp;
+  if (!(contextTime > 0 && performanceTime > 0)) return false;
+  return contextTime + (nowMs - performanceTime) / 1000 > anchor.startCtxS;
+}
+
 export function wrapLoop(rawMs: number, loop: { startMs: number; endMs: number }): number {
   if (rawMs < loop.endMs) return rawMs;
   return loop.startMs + ((rawMs - loop.endMs) % (loop.endMs - loop.startMs));

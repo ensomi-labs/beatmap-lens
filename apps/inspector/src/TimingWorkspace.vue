@@ -66,6 +66,28 @@ const deviceRates = [44_100, 48_000, 88_200, 96_000] as const;
 /** `Z` toggles between fitting the passage and this many ms per device pixel. */
 const fineMsPerDevicePx = 0.5;
 const markLoopMs = 500;
+/** Keys whose action a held key must not repeat. */
+const singleShotKeys = new Set([
+  " ",
+  "enter",
+  "escape",
+  "b",
+  "n",
+  "c",
+  "k",
+  "x",
+  "l",
+  "i",
+  "o",
+  "f",
+  "z",
+  "p",
+  "0",
+  "delete",
+  "backspace",
+  "home",
+  "end",
+]);
 /** Milliseconds the nudge buttons move the selected marks. */
 const nudgeStepsMs = [-15, -5, -2, 2, 5, 15] as const;
 
@@ -87,6 +109,8 @@ interface Draft {
   state: MarksState;
   saved: Mark[];
   saveId: string | null;
+  /** Some playback of this passage in this page ran with clicks on the listener's beats. */
+  clicksHeard: boolean;
 }
 
 const preferences = ref<TimingPreferences>({
@@ -456,6 +480,7 @@ async function select(index: number) {
         state: marksState(saved),
         saved,
         saveId: result.saved?.save_id ?? null,
+        clicksHeard: false,
       });
       triggerRef(drafts);
     }
@@ -623,6 +648,7 @@ async function start(fromMs: number, endMs: number, loop: boolean) {
     if (!started) return;
     latencies.value = engine.latencies();
     playing.value = true;
+    if (preferences.value.markClicks) noteClicksHeard();
     cancelAnimationFrame(frame);
     frame = requestAnimationFrame(tick);
   } catch (cause) {
@@ -708,13 +734,15 @@ function setLoopEdge(edge: "startMs" | "endMs") {
   setLoopRegion({ ...loopRegion.value, [edge]: playheadMs.value });
 }
 
+/** X loops from 500 ms before the first selected mark to 500 ms after the last. */
 function loopAroundSelected() {
-  const mark = selected.value;
-  if (!mark) return;
+  const first = selection.value[0];
+  const last = selection.value.at(-1);
+  if (!first || !last) return;
   stop();
   loopRegion.value = {
-    startMs: clampToBounds(mark.time_ms - markLoopMs),
-    endMs: clampToBounds(mark.time_ms + markLoopMs),
+    startMs: clampToBounds(first.time_ms - markLoopMs),
+    endMs: clampToBounds(last.time_ms + markLoopMs),
   };
   looping.value = true;
   playheadMs.value = loopRegion.value.startMs;
@@ -738,6 +766,16 @@ function setLoudnessMatch(value: boolean) {
 
 function setMarkClicks(value: boolean) {
   setPreference("markClicks", value);
+  if (value && playing.value) noteClicksHeard();
+}
+
+/** Saves record whether the listener heard clicks on this passage, not the toggle at save time. */
+function noteClicksHeard() {
+  const row = passage.value;
+  const current = draft.value;
+  if (!row || !current || current.clicksHeard) return;
+  drafts.value.set(row.id, { ...current, clicksHeard: true });
+  triggerRef(drafts);
 }
 
 function setPlayheadOffset(value: number) {
@@ -812,14 +850,29 @@ function place(kind: MarkKind, timeMs: number, method: MarkMethod) {
 }
 
 /**
- * B and N. While the audio plays, the mark goes at the source time heard when the key went down
- * (the output clock at the event's time stamp, without the playhead offset, which corrects only
- * the drawn bar), so it is not up to a frame late; stopped, it goes at the playhead.
+ * B and N, and the Beat and Unbeat buttons. While the audio plays, the mark goes at the source
+ * time heard when the key or button went down (the output clock at the event's time stamp, without
+ * the playhead offset, which corrects only the drawn bar), so it is not up to a frame late. A tap
+ * before the sound has reached the output is ignored rather than put at the start. Stopped, the
+ * mark goes at the playhead.
  */
-function placeAtPlayhead(kind: MarkKind, eventTimeMs?: number) {
-  const heard = playing.value ? engine?.position(0, eventTimeMs) : undefined;
-  if (heard !== undefined) place(kind, heard, "key-playing");
-  else place(kind, playheadMs.value, "key-playhead");
+function placeAtPlayhead(kind: MarkKind, eventTimeMs = performance.now()) {
+  if (playing.value || engine?.starting) {
+    const heard = engine?.heardAt(eventTimeMs);
+    if (heard !== undefined) place(kind, heard, "key-playing");
+    return;
+  }
+  place(kind, playheadMs.value, "key-playhead");
+}
+
+/**
+ * The mark buttons act when pressed, timed by the press, because `click` comes on release; a
+ * click from the keyboard (detail 0) still places.
+ */
+function onMarkButton(kind: MarkKind, event: MouseEvent) {
+  if (event.type === "pointerdown") {
+    if (event.button === 0) placeAtPlayhead(kind, event.timeStamp);
+  } else if (event.detail === 0) placeAtPlayhead(kind, event.timeStamp);
 }
 
 function selectById(id: string | null) {
@@ -875,7 +928,7 @@ function playbackSetup(): PlaybackSetup {
     loudness_applied_db: loudnessAppliedDb.value,
     playhead_offset_ms: preferences.value.playheadOffsetMs,
     preroll_ms: preferences.value.prerollMs,
-    mark_clicks: preferences.value.markClicks,
+    mark_clicks: Boolean(draft.value?.clicksHeard),
     device_rate_hz: preferences.value.deviceRateHz,
     base_latency_ms: measured.base_latency_ms,
     output_latency_ms: measured.output_latency_ms,
@@ -1047,6 +1100,11 @@ function handleKeydown(event: KeyboardEvent) {
     return;
   }
   if (isTypingTarget(event.target)) return;
+  // A held key repeats only where that means something: nudges, zoom and visiting marks.
+  if (event.repeat && (singleShotKeys.has(key.toLowerCase()) || /^[1-9]$/.test(key))) {
+    event.preventDefault();
+    return;
+  }
   if (event.metaKey || event.ctrlKey) {
     const lower = key.toLowerCase();
     if (lower !== "z") return;
@@ -1328,6 +1386,9 @@ function handleKeydown(event: KeyboardEvent) {
                 }}
               </span>
               <span>{{ rate }}×</span>
+              <span v-if="preferences.passagesHidden && passage.hint" class="timing-hud-hint">
+                hint: {{ passage.hint }}
+              </span>
               <span v-if="silenceMs !== undefined" class="timing-warning">
                 silence at {{ formatSourceTime(silenceMs) }}; an EQ app may soften the next onset
               </span>
@@ -1425,7 +1486,8 @@ function handleKeydown(event: KeyboardEvent) {
                 :disabled="audioState !== 'ready'"
                 aria-keyshortcuts="B"
                 title="Place a beat at the playhead, or where it is heard while playing (B)"
-                @click="placeAtPlayhead('beat', $event.timeStamp)"
+                @pointerdown="onMarkButton('beat', $event)"
+                @click="onMarkButton('beat', $event)"
               >
                 Beat <kbd>B</kbd>
               </button>
@@ -1664,7 +1726,8 @@ function handleKeydown(event: KeyboardEvent) {
                 type="button"
                 class="button button--quiet"
                 aria-keyshortcuts="B"
-                @click="placeAtPlayhead('beat', $event.timeStamp)"
+                @pointerdown="onMarkButton('beat', $event)"
+                @click="onMarkButton('beat', $event)"
               >
                 Beat at playhead <kbd>B</kbd>
               </button>
@@ -1672,7 +1735,8 @@ function handleKeydown(event: KeyboardEvent) {
                 type="button"
                 class="button button--quiet"
                 aria-keyshortcuts="N"
-                @click="placeAtPlayhead('unbeat', $event.timeStamp)"
+                @pointerdown="onMarkButton('unbeat', $event)"
+                @click="onMarkButton('unbeat', $event)"
               >
                 Unbeat at playhead <kbd>N</kbd>
               </button>
@@ -1748,7 +1812,13 @@ function handleKeydown(event: KeyboardEvent) {
             <p class="setup-note">
               Click or drag on the waveform selects marks; ⌘-click adds or removes one. Shift+click
               places a beat, right-click an unbeat. ←/→ nudge 1 ms (Shift 0.1 ms), , and . one
-              sample. [ and ] visit marks. Delete removes the selection.
+              sample. [ and ] visit marks. Delete removes the selection. Pan with the wheel, by
+              dragging the ruler, or with right- or Ctrl-drag.
+            </p>
+            <p class="setup-note">
+              While playing, B, N and the Beat buttons mark the moment of the press as heard, without
+              the playhead offset. Taps usually land some tens of ms early; refine them on the
+              waveform.
             </p>
           </section>
 
@@ -1875,6 +1945,12 @@ function handleKeydown(event: KeyboardEvent) {
 
 .timing-workspace.is-passages-hidden {
   grid-template-columns: minmax(0, 1fr) minmax(320px, 360px);
+}
+
+@media (max-width: 1160px) {
+  .timing-workspace.is-passages-hidden {
+    grid-template-columns: minmax(0, 1fr) clamp(270px, 28vw, 320px);
+  }
 }
 
 .timing-hud-toggle {

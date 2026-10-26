@@ -118,10 +118,10 @@ and the next event starts on a new line.
 | Field | Meaning |
 | --- | --- |
 | `playback.playhead_offset_ms` | The listener's moving-bar correction in wall-clock milliseconds, applied before the playback rate; positive moves the bar earlier. It affects only the drawn playhead, never a mark. |
-| `playback.mark_clicks` | `true` when a click sounded at each of the listener's own beat marks during playback. Absent from saves made before the option existed. |
+| `playback.mark_clicks` | `true` when any playback of this passage in the page, before this save, had clicks on the listener's own beat marks. Absent from saves made before the option existed. |
 | `playback.device_rate_hz` | The output device rate the listener stated, or `null`. A value other than `audio.sample_rate` means the system converts the rate after the page. |
 | `playback.*_latency_ms` | The browser's reported `baseLatency` and `outputLatency`, for spotting setup changes. |
 | `proposals_shown` | Anonymous keys only; names are joined from the key file afterwards. |
 | `marks[].zoom_ms_per_px` | Milliseconds per device pixel when the mark was placed. |
 | `marks[].blind` | `false` for a mark placed or edited after the passage's names were revealed. |
-| `marks[].method` | `click` (at the pointer), `key-playhead` (B or N at a stopped playhead) or `key-playing` (B or N while the audio plays, at the source time heard when the key went down, read from the output clock at the event's time stamp without the playhead offset). |
+| `marks[].method` | `click` (at the pointer), `key-playhead` (B or N, or the Beat and Unbeat buttons, at the playhead while stopped) or `key-playing` (the same while the audio plays, at the source time heard when the key or button went down, read from the output clock at the event's time stamp without the playhead offset). |

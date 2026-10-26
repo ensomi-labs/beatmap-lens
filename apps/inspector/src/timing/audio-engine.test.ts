@@ -159,3 +159,18 @@ it("schedules no clicks while they are off", async () => {
   await play;
   expect(audio.sources).toHaveLength(1);
 });
+
+it("gives a tap no heard time until the output has reached the start", async () => {
+  const engine = loaded();
+  expect(engine.heardAt(1000)).toBeUndefined();
+  const play = engine.play({ fromMs: 0, endMs: 1000, rate: 1, loop: null });
+  audio.resumes[0]?.();
+  await play;
+  // The stub's output timestamp is zero: output has not started.
+  expect(engine.heardAt(1000)).toBeUndefined();
+  const context = engine.context as unknown as { getOutputTimestamp: () => object };
+  // Output at context 0.05 s when the page clock read 1000 ms; the start is at 0.03 s.
+  context.getOutputTimestamp = () => ({ contextTime: 0.05, performanceTime: 1000 });
+  expect(engine.heardAt(1000)).toBeCloseTo(20, 9);
+  expect(engine.heardAt(970)).toBeUndefined();
+});

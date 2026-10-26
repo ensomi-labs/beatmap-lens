@@ -44,6 +44,10 @@ vi.mock("./timing/audio-engine", () => ({
       engine.positionTimes.push(nowMs);
       return this.playing ? engine.positionMs : undefined;
     }
+    heardAt(nowMs: number) {
+      engine.positionTimes.push(nowMs);
+      return this.playing ? engine.positionMs : undefined;
+    }
     setClicks(beats: number[] | null) {
       engine.clicks.push(beats);
     }
@@ -376,6 +380,8 @@ it("gives the keyboard back to the shortcuts after a rail control is used with t
     control.dispatchEvent(new Event("change", { bubbles: true }));
     expect(document.activeElement).not.toBe(control);
   }
+  // Playing: B goes where the output clock says the press was heard.
+  engine.positionMs = 150;
   key("b");
   await nextTick();
   expect(status()).toBe("Unsaved · 1 marks");
@@ -566,7 +572,6 @@ it("places B while playing at the time heard when the key went down, not at the 
   const press = new KeyboardEvent("keydown", { key: "b", bubbles: true });
   document.body.dispatchEvent(press);
   await nextTick();
-  expect(engine.offsets.at(-1)).toBe(0);
   expect(engine.positionTimes.at(-1)).toBe(press.timeStamp);
   expect(stage.props.marks).toMatchObject([{ time_ms: 456.789, method: "key-playing" }]);
   // Stopped, B goes at the playhead.
@@ -590,9 +595,18 @@ it("clicks on the listener's own beats when asked, and records that with the sav
   stageEmit("place", "beat", 600);
   await nextTick();
   expect(engine.clicks.at(-1)).toEqual([300, 600]);
+  // Toggled on but never heard: the save says so.
   key("Enter");
   await vi.waitFor(() => expect(server.saves).toHaveLength(1));
-  expect(server.saves[0]).toMatchObject({ playback: { mark_clicks: true } });
+  expect(server.saves[0]).toMatchObject({ playback: { mark_clicks: false } });
+  key(" ");
+  await vi.waitFor(() => expect(engine.plays).toBe(1));
+  key("Escape");
+  stageEmit("place", "beat", 700);
+  await nextTick();
+  key("Enter");
+  await vi.waitFor(() => expect(server.saves).toHaveLength(2));
+  expect(server.saves[1]).toMatchObject({ playback: { mark_clicks: true } });
   expect(JSON.parse(localStorage.getItem("lens-timing-preferences") ?? "{}")).toMatchObject({
     markClicks: true,
   });
@@ -612,4 +626,34 @@ it("hides the passage list for a wider stage and remembers it", async () => {
   button("Show passages").click();
   await nextTick();
   expect(rail()?.style.display).toBe("");
+});
+
+it("times the Beat button by its press, ignores the release, and still works from the keyboard", async () => {
+  await opened();
+  key(" ");
+  await vi.waitFor(() => expect(engine.plays).toBe(1));
+  engine.positionMs = 321.5;
+  const beat = button("Beat at playhead B");
+  const press = new PointerEvent("pointerdown", { button: 0, bubbles: true });
+  beat.dispatchEvent(press);
+  beat.dispatchEvent(new MouseEvent("click", { detail: 1, bubbles: true }));
+  await nextTick();
+  expect(stage.props.marks).toMatchObject([{ time_ms: 321.5, method: "key-playing" }]);
+  expect(engine.positionTimes.at(-1)).toBe(press.timeStamp);
+  key("Escape");
+  beat.dispatchEvent(new MouseEvent("click", { detail: 0, bubbles: true }));
+  await nextTick();
+  expect(markIds()).toHaveLength(2);
+});
+
+it("does not repeat a held B or C", async () => {
+  await opened();
+  key("b");
+  for (const name of ["b", "c"])
+    document.body.dispatchEvent(
+      new KeyboardEvent("keydown", { key: name, repeat: true, bubbles: true }),
+    );
+  await nextTick();
+  expect(markIds()).toHaveLength(1);
+  expect(engine.clicks.at(-1)).toBeNull();
 });

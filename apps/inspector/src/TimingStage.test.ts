@@ -41,6 +41,14 @@ function mark(id: string, time_ms: number): Mark {
   };
 }
 
+// Stable like the workspace's computed props, so a playhead change alone changes nothing else.
+const marks = [mark("a", 300), mark("b", 600)];
+const span = { startMs: 100, endMs: 900 };
+const bounds = { startMs: 0, endMs: 1000 };
+const view = { startMs: 0, msPerPx: 10 };
+const loopRegion = { startMs: 0, endMs: 0 };
+const proposals: never[] = [];
+
 const props = reactive({
   playheadMs: 100,
   selectedIds: [] as string[],
@@ -79,14 +87,14 @@ beforeEach(() => {
     render: () =>
       h(TimingStage, {
         buffer,
-        span: { startMs: 100, endMs: 900 },
-        bounds: { startMs: 0, endMs: 1000 },
-        view: { startMs: 0, msPerPx: 10 },
-        proposals: [],
-        marks: [mark("a", 300), mark("b", 600)],
+        span,
+        bounds,
+        view,
+        proposals,
+        marks,
         selectedIds: props.selectedIds,
         playheadMs: props.playheadMs,
-        loopRegion: { startMs: 0, endMs: 0 },
+        loopRegion,
         looping: false,
         onSelect: (...args: unknown[]) => events.push(["select", ...args]),
         onPlace: (...args: unknown[]) => events.push(["place", ...args]),
@@ -127,8 +135,13 @@ function drag(fromX: number, toX: number, init: PointerEventInit = {}) {
   pointer("pointerup", toX, 50, init);
 }
 
+function runFrames() {
+  for (const frame of frames.splice(0)) frame(0);
+}
+
 it("redraws the playhead on every change while the frames keep coming", async () => {
   await nextTick();
+  runFrames();
   // Playback moves the playhead from inside each animation frame; the drawing must not wait for
   // a frame requested from there, which used to be cancelled and requested again every time.
   for (const timeMs of [150, 200, 250, 300]) {
@@ -175,4 +188,37 @@ it("selects with a click or a drag and places a beat only with Shift", () => {
 it("keeps Shift+drag for the loop region", () => {
   drag(25, 65, { shiftKey: true });
   expect(events).toEqual([["loop", { startMs: 250, endMs: 650 }]]);
+});
+
+it("draws the overlay with a pending base frame, so the layers never disagree", async () => {
+  await nextTick();
+  runFrames();
+  props.selectedIds = ["a"];
+  await nextTick();
+  const before = overlayDraws;
+  props.playheadMs = 500;
+  await nextTick();
+  expect(overlayDraws).toBe(before);
+  runFrames();
+  expect(overlayDraws).toBe(before + 1);
+});
+
+it("on Retina, a click that wobbles a few pixels still clicks and a mark's glyph is hit", () => {
+  vi.stubGlobal("devicePixelRatio", 2);
+  window.dispatchEvent(new Event("resize"));
+  // 3 px of movement: a click on mark a, not a drag.
+  pointer("pointerdown", 33, 50);
+  pointer("pointermove", 36, 50);
+  pointer("pointerup", 36, 50);
+  // Shift with 6 px of movement still places a beat rather than a tiny loop.
+  pointer("pointerdown", 45, 50, { shiftKey: true });
+  pointer("pointermove", 51, 50, { shiftKey: true });
+  pointer("pointerup", 51, 50, { shiftKey: true });
+  // A band that ends just short of mark a still takes it, as its glyph is touched.
+  drag(22, 28);
+  expect(events).toEqual([
+    ["select", ["a"], "replace"],
+    ["place", "beat", 510],
+    ["select", ["a"], "replace"],
+  ]);
 });
