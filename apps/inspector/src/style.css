@@ -2987,9 +2987,11 @@ fieldset.toolbar-group,
 }
 
 /* Timing's counter has room for a fine-zoom digit and an eight-digit sample index, so it keeps
-   its width while the index grows during playback (the font's figures are all one width). */
+   its width while the index grows during playback (the font's figures are all one width). Ten
+   characters with their letter spacing are 10ch + 0.1em; the extra 0.1em keeps sub-pixel rounding
+   from widening the box when the fine-zoom digit appears. */
 .timing-counter .time-counter-main {
-  min-width: calc(10ch + 0.1em);
+  min-width: calc(10ch + 0.2em);
 }
 
 .timing-counter .time-counter-sub {
