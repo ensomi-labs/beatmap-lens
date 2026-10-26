@@ -608,7 +608,8 @@ function handleKeydown(event: KeyboardEvent) {
           <div v-if="excerpt" class="stage-toolbar">
             <div class="stage-identity">
               <strong>
-                Excerpt {{ excerptIndex + 1 }} of {{ pair?.excerpts.length }}
+                <span class="stage-identity-word">Excerpt </span
+                >{{ excerptIndex + 1 }} of {{ pair?.excerpts.length }}
               </strong>
               <span class="data">
                 {{ formatTime(excerpt.start_ms) }}–{{ formatTime(excerpt.end_ms) }}

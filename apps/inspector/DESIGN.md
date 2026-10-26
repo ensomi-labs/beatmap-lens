@@ -170,7 +170,9 @@ Every open workspace is a `WorkspaceFrame` (`src/layout/`):
   wraps.
 - Timing needs a window wider than 920 px and says so instead.
 - Below 1240 px the toolbar drops its optional items (identity, the duplicate Beat button), views'
-  bars drop their group labels, and the status bar drops optional facts.
+  bars drop their group labels, their time range and the word before the number ("02 of 6"), and
+  the status bar drops optional facts. A view's bar keeps its flags and its hint, truncated, with
+  the whole identity as its title; its height does not depend on the hint.
 - Controls keep at least 24 CSS px hit areas (WCAG 2.2 SC 2.5.8). Safe-area insets apply to the
   toolbar and status bar.
 

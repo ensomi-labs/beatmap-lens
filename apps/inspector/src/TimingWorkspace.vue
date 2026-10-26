@@ -255,6 +255,19 @@ const status = computed(() => {
   return { tone: "idle", text: "No marks saved" };
 });
 const marksFile = computed(() => opened.value?.marks_path.split(/[\\/]/).at(-1));
+/** The view bar's identity in full, for when a narrow stage truncates it. */
+const passageSummary = computed(() => {
+  const row = passage.value;
+  if (!row || !opened.value) return "";
+  return [
+    `Passage ${String(passageIndex.value + 1).padStart(2, "0")} of ${opened.value.passages.length}`,
+    `${formatSourceTime(row.start_ms)}–${formatSourceTime(row.end_ms)}`,
+    ...row.flags,
+    row.hint,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+});
 const conversion = computed(() => {
   const source = passage.value?.audio.sample_rate;
   const device = preferences.value.deviceRateHz;
@@ -1442,10 +1455,10 @@ function handleKeydown(event: KeyboardEvent) {
           <section class="timing-stage-column" aria-label="Timing stage">
             <header v-if="passage" class="timing-hud">
               <div class="stage-toolbar">
-                <div class="stage-identity">
+                <div class="stage-identity" :title="passageSummary">
                   <strong>
-                    Passage {{ String(passageIndex + 1).padStart(2, "0") }} of
-                    {{ opened.passages.length }}
+                    <span class="stage-identity-word">Passage </span
+                    >{{ String(passageIndex + 1).padStart(2, "0") }} of {{ opened.passages.length }}
                   </strong>
                   <span class="data">
                     {{ formatSourceTime(passage.start_ms) }}–{{ formatSourceTime(passage.end_ms) }}

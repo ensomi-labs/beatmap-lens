@@ -3143,11 +3143,13 @@ fieldset.toolbar-group,
   color: var(--warning);
 }
 
+/* Below 1240 px a view's bar keeps its identity, flags and hint, and drops the range (also in
+   the list beside it) and the word before the number. */
 @media (max-width: 1240px) {
   .status-optional,
   .stage-toolbar .toolbar-label,
   .stage-identity .data,
-  .stage-hint {
+  .stage-identity-word {
     display: none;
   }
 }
@@ -3266,7 +3268,11 @@ fieldset.toolbar-group,
   font-size: var(--text-2xs);
 }
 
-/* A view's own bar, directly above it: identity on the left, its controls after. */
+/*
+ * A view's own bar, directly above it: identity on the left, its controls after. The identity's
+ * basis is zero, so the bar keeps one height whatever the passage's hint; it shrinks, hint first,
+ * before the controls wrap.
+ */
 
 .stage-toolbar {
   display: flex;
@@ -3283,7 +3289,7 @@ fieldset.toolbar-group,
 .stage-identity {
   display: flex;
   min-width: 96px;
-  flex: 1 1 auto;
+  flex: 1 1 0;
   align-items: baseline;
   gap: 8px;
   overflow: hidden;
@@ -3300,6 +3306,7 @@ fieldset.toolbar-group,
 }
 
 .stage-flag {
+  flex: none;
   padding: 1px 5px;
   color: var(--ink-secondary);
   border-radius: 3px;
