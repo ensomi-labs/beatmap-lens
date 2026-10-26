@@ -21,6 +21,10 @@ import type {
   VerdictRecord,
 } from "./compare/contracts";
 import LongNoteTailControl from "./LongNoteTailControl.vue";
+import PanelSection from "./layout/PanelSection.vue";
+import type { PaneSpec } from "./layout/pane-layout";
+import type { MobilePanel } from "./layout/WorkspaceFrame.vue";
+import WorkspaceFrame from "./layout/WorkspaceFrame.vue";
 import WorkspaceModeSwitch from "./WorkspaceModeSwitch.vue";
 import type { WorkspaceMode } from "./workspace-mode";
 
@@ -38,6 +42,20 @@ const views = [
   { label: "B", key: "b", shown: [1] },
   { label: "Side by side", key: "s", shown: [0, 1] },
 ] as const;
+const excerptsPane: PaneSpec = {
+  id: "compare-excerpts",
+  label: "Excerpts",
+  defaultSize: 248,
+  min: 180,
+  max: 420,
+};
+const verdictPane: PaneSpec = {
+  id: "compare-details",
+  label: "Verdict and listening",
+  defaultSize: 300,
+  min: 248,
+  max: 480,
+};
 
 // Setup
 const openFrom = ref<"manifest" | "charts">("manifest");
@@ -64,7 +82,7 @@ const visualSpeed = ref(defaultVisualSpeed);
 const audioOffsetMs = ref(0);
 const audioVolume = ref(DEFAULT_AUDIO_VOLUME);
 const tailShortenMs = ref<number>(renderDefaults.scene.tailShortenMs);
-const mobilePanel = ref<"source" | "preview" | "details">("preview");
+const mobilePanel = ref<MobilePanel>("preview");
 const busy = ref(false);
 const saving = ref(false);
 const error = ref("");
@@ -342,22 +360,17 @@ function handleKeydown(event: KeyboardEvent) {
     tabindex="-1"
   >
     <header v-if="!opened" class="app-bar annotation-app-bar">
-      <div class="brand-lockup">
-        <span class="brand-mark" aria-hidden="true"></span>
-        <div>
-          <p class="brand-name">Beatmap Lens</p>
-          <p class="brand-edition">Blind comparison</p>
-        </div>
-      </div>
-      <div class="annotation-chart-context">
-        <span>Comparison</span>
-        <strong>Not opened</strong>
-      </div>
+      <span class="brand-glyph" aria-hidden="true" title="Beatmap Lens"></span>
+      <span class="sr-only">Beatmap Lens</span>
       <WorkspaceModeSwitch
         model-value="compare"
         :disabled="busy"
         @update:model-value="emit('change-mode', $event)"
       />
+      <div class="annotation-chart-context">
+        <span>Comparison</span>
+        <strong>Not opened</strong>
+      </div>
     </header>
 
     <section v-if="!opened" class="annotation-onboarding" aria-labelledby="compare-heading">
@@ -459,119 +472,191 @@ function handleKeydown(event: KeyboardEvent) {
       </form>
     </section>
 
-    <template v-else>
-      <nav class="mobile-view-switcher" aria-label="Comparison views">
-        <button
-          v-for="panel in (['source', 'preview', 'details'] as const)"
-          :key="panel"
-          class="mobile-view-button"
-          :class="{ 'is-active': mobilePanel === panel }"
-          type="button"
-          :aria-pressed="mobilePanel === panel"
-          @click="mobilePanel = panel"
-        >
-          {{ panel }}
-        </button>
-      </nav>
-
-      <div class="annotation-workspace">
-        <aside
-          class="annotation-rail annotation-source-rail"
-          :class="{ 'is-mobile-active': mobilePanel === 'source' }"
-          aria-labelledby="queue-heading"
-        >
-          <div class="active-workspace-identity">
-            <div class="brand-lockup">
-              <span class="brand-mark" aria-hidden="true"></span>
-              <div>
-                <p class="brand-name">Beatmap Lens</p>
-                <p class="brand-edition">Blind comparison</p>
-              </div>
-            </div>
-            <WorkspaceModeSwitch
-              model-value="compare"
-              :disabled="busy || saving"
-              @update:model-value="emit('change-mode', $event)"
-            />
-            <div class="active-dataset-identity">
-              <span>{{ verdictFile }}</span>
-              <strong>{{ pair?.title }}</strong>
-            </div>
+    <WorkspaceFrame
+      v-else
+      v-model:mobile-panel="mobilePanel"
+      class="compare-workspace"
+      layout-key="compare"
+      mode="compare"
+      :mode-disabled="busy || saving"
+      :left="excerptsPane"
+      :right="verdictPane"
+      mobile-label="Comparison views"
+      @change-mode="emit('change-mode', $event)"
+    >
+      <template #toolbar>
+        <div class="toolbar-identity toolbar-optional" :title="opened.verdict_path">
+          <strong>{{ pair?.title }}</strong>
+          <span>{{ verdictFile }}</span>
+        </div>
+        <span class="toolbar-divider" aria-hidden="true"></span>
+        <fieldset class="toolbar-group compare-transport" aria-label="Playback controls">
+          <button
+            class="tool-button tool-button--play"
+            type="button"
+            :disabled="busy || !blind"
+            :aria-pressed="playing"
+            aria-keyshortcuts="Space"
+            title="Loop the excerpt or pause (Space)"
+            @click="togglePlayback"
+          >
+            <svg viewBox="0 0 16 16" aria-hidden="true">
+              <path v-if="playing" d="M5.5 3.5v9M10.5 3.5v9" />
+              <path v-else class="tool-icon-fill" d="M5 3.3v9.4L12.6 8z" />
+            </svg>
+            {{ playing ? "Pause" : "Loop excerpt" }}
+          </button>
+          <button
+            class="tool-button"
+            type="button"
+            :disabled="busy || !blind"
+            title="Back to the start of the excerpt"
+            @click="seek(excerpt?.start_ms ?? 0)"
+          >
+            Restart
+          </button>
+        </fieldset>
+        <div class="time-counter" title="Playhead">
+          <span class="sr-only">Playhead</span>
+          <span class="time-counter-main">{{ formatTime(playheadMs) }}</span>
+          <span v-if="excerpt" class="time-counter-sub">
+            {{ formatTime(excerpt.start_ms) }}–{{ formatTime(excerpt.end_ms) }}
+          </span>
+        </div>
+        <fieldset class="toolbar-group" aria-label="View">
+          <div class="segmented">
+            <button
+              v-for="option in views"
+              :key="option.key"
+              type="button"
+              :aria-pressed="view === option.key"
+              :aria-keyshortcuts="option.key.toUpperCase()"
+              :title="`${option.label} (${option.key.toUpperCase()})`"
+              @click="view = option.key"
+            >
+              {{ option.label }}
+            </button>
           </div>
+        </fieldset>
+      </template>
 
-          <header class="annotation-rail-header">
-            <div>
-              <p class="section-kicker"><span class="section-number">01</span> Listening queue</p>
-              <h2 id="queue-heading">Excerpts</h2>
+      <template #toolbar-end>
+        <span class="health-status compare-status" :class="`health-status--${status.tone}`" aria-live="polite">
+          <span class="health-dot" aria-hidden="true"></span>
+          {{ status.text }}
+        </span>
+      </template>
+
+      <template #left>
+        <header class="pane-header">
+          <h2 id="queue-heading">Excerpts</h2>
+          <span class="pane-count">{{ judged }} / {{ queue.length }} judged</span>
+        </header>
+        <label v-if="opened.pairs.length > 1" class="field-stack compare-song">
+          <span>Song</span>
+          <select
+            :value="pairIndex"
+            :disabled="busy || saving"
+            @change="select(Number(($event.target as HTMLSelectElement).value), 0)"
+          >
+            <option v-for="(song, index) in opened.pairs" :key="index" :value="index">
+              {{ song.title }}
+            </option>
+          </select>
+        </label>
+        <nav class="task-list" aria-labelledby="queue-heading">
+          <button
+            v-for="(part, index) in pair?.excerpts"
+            :key="part.id"
+            class="task-row"
+            :class="{ 'is-active': index === excerptIndex }"
+            type="button"
+            :aria-current="index === excerptIndex ? 'step' : undefined"
+            :disabled="busy || saving"
+            @click="select(pairIndex, index)"
+          >
+            <span
+              class="task-status-mark"
+              :class="{ 'task-status-mark--complete': part.saved }"
+              aria-hidden="true"
+            ></span>
+            <span class="task-copy">
+              <strong>{{ formatTime(part.start_ms) }}–{{ formatTime(part.end_ms) }}</strong>
+              <span>{{ part.hint }}</span>
+            </span>
+            <span class="task-status-label">{{ part.saved ? "Judged" : "Pending" }}</span>
+          </button>
+        </nav>
+        <PanelSection v-if="pair" id="compare-pair" title="Pair">
+          <dl class="compact-facts">
+            <div><dt>Song</dt><dd>{{ pair.title }}</dd></div>
+            <div v-if="pair.difficulty_band !== undefined">
+              <dt>Band</dt><dd>{{ pair.difficulty_band }}</dd>
             </div>
-            <span class="rail-count">{{ judged }} / {{ queue.length }}</span>
-          </header>
+            <div v-if="pair.seed !== undefined"><dt>Seed</dt><dd>{{ pair.seed }}</dd></div>
+          </dl>
+        </PanelSection>
+        <footer class="pane-footer">
+          <button class="tool-button" type="button" :disabled="busy || saving" @click="close">
+            Open another comparison
+          </button>
+        </footer>
+      </template>
 
-          <label v-if="opened.pairs.length > 1" class="field-stack compare-song">
-            <span>Song</span>
-            <select
-              :value="pairIndex"
-              :disabled="busy || saving"
-              @change="select(Number(($event.target as HTMLSelectElement).value), 0)"
-            >
-              <option v-for="(song, index) in opened.pairs" :key="index" :value="index">
-                {{ song.title }}
-              </option>
-            </select>
-          </label>
-
-          <nav class="task-list" aria-label="Excerpts">
-            <button
-              v-for="(part, index) in pair?.excerpts"
-              :key="part.id"
-              class="task-row"
-              :class="{ 'is-active': index === excerptIndex }"
-              type="button"
-              :aria-current="index === excerptIndex ? 'step' : undefined"
-              :disabled="busy || saving"
-              @click="select(pairIndex, index)"
-            >
-              <span
-                class="task-status-mark"
-                :class="{ 'task-status-mark--complete': part.saved }"
-                aria-hidden="true"
-              ></span>
-              <span class="task-copy">
-                <strong>{{ formatTime(part.start_ms) }}–{{ formatTime(part.end_ms) }}</strong>
-                <span>{{ part.hint }}</span>
+      <template #main>
+        <section class="compare-view" aria-label="Charts A and B">
+          <div v-if="excerpt" class="stage-toolbar">
+            <div class="stage-identity">
+              <strong>
+                <span class="stage-identity-word">Excerpt </span
+                >{{ excerptIndex + 1 }} of {{ pair?.excerpts.length }}
+              </strong>
+              <span class="data">
+                {{ formatTime(excerpt.start_ms) }}–{{ formatTime(excerpt.end_ms) }}
               </span>
-              <span class="task-status-label">{{ part.saved ? "Judged" : "Pending" }}</span>
-            </button>
-          </nav>
-
-          <section v-if="pair" class="rail-section" aria-labelledby="pair-heading">
-            <h3 id="pair-heading">Pair</h3>
-            <dl class="compact-facts">
-              <div><dt>Song</dt><dd>{{ pair.title }}</dd></div>
-              <div v-if="pair.difficulty_band !== undefined">
-                <dt>Band</dt><dd>{{ pair.difficulty_band }}</dd>
+              <span v-if="excerpt.hint" class="stage-hint" :title="excerpt.hint">{{ excerpt.hint }}</span>
+            </div>
+            <fieldset class="toolbar-group" aria-label="Audio rate">
+              <span class="toolbar-label" aria-hidden="true">Audio rate</span>
+              <div class="segmented">
+                <button
+                  v-for="value in SUPPORTED_PLAYBACK_RATES"
+                  :key="value"
+                  type="button"
+                  :aria-pressed="rate === value"
+                  @click="setRate(value)"
+                >
+                  {{ value }}×
+                </button>
               </div>
-              <div v-if="pair.seed !== undefined"><dt>Seed</dt><dd>{{ pair.seed }}</dd></div>
-            </dl>
-          </section>
-
-          <section class="rail-section">
-            <button
-              class="button button--quiet"
-              type="button"
-              :disabled="busy || saving"
-              @click="close"
-            >
-              Open another comparison
-            </button>
-          </section>
-        </aside>
-
-        <section
-          class="annotation-stage"
-          :class="{ 'is-mobile-active': mobilePanel === 'preview' }"
-          aria-label="Charts A and B"
-        >
+            </fieldset>
+            <fieldset class="toolbar-group" aria-label="Visual speed">
+              <span class="toolbar-label" aria-hidden="true">Visual speed</span>
+              <div class="segmented">
+                <button
+                  v-for="value in visualSpeedPresets"
+                  :key="value"
+                  type="button"
+                  :aria-pressed="visualSpeed === value"
+                  @click="visualSpeed = value"
+                >
+                  {{ value }}
+                </button>
+              </div>
+            </fieldset>
+          </div>
+          <label v-if="excerpt" class="compare-scrub">
+            <span class="sr-only">Position in excerpt</span>
+            <input
+              type="range"
+              :min="excerpt.start_ms"
+              :max="excerpt.end_ms - 1"
+              step="1"
+              :value="playheadMs"
+              :disabled="busy"
+              @input="seek(Number(($event.target as HTMLInputElement).value))"
+            />
+          </label>
           <CompareStage
             v-if="blind"
             :charts="blind.charts"
@@ -583,232 +668,149 @@ function handleKeydown(event: KeyboardEvent) {
           />
           <div v-else-if="error" class="stage-message">
             <p class="inline-message inline-message--error" role="alert">{{ error }}</p>
-            <button
-              class="button button--quiet"
-              type="button"
-              @click="select(pairIndex, excerptIndex)"
-            >
+            <button class="tool-button" type="button" @click="select(pairIndex, excerptIndex)">
               Reload excerpt
             </button>
           </div>
           <div v-else class="stage-empty">Loading excerpt</div>
         </section>
+      </template>
 
-        <aside
-          class="annotation-rail annotation-details-rail"
-          :class="{ 'is-mobile-active': mobilePanel === 'details' }"
-          aria-labelledby="verdict-heading"
-        >
-          <section class="details-transport" aria-label="Playback">
-            <div class="details-transport-status">
-              <div>
-                <span>Playhead</span>
-                <strong>{{ formatTime(playheadMs) }}</strong>
-              </div>
-              <div class="details-transport-state">
-                <span v-if="excerpt">
-                  {{ formatTime(excerpt.start_ms) }}–{{ formatTime(excerpt.end_ms) }}
-                </span>
-                <span class="health-status" :class="`health-status--${status.tone}`" aria-live="polite">
-                  <span class="health-dot" aria-hidden="true"></span>
-                  {{ status.text }}
-                </span>
-              </div>
-            </div>
-
-            <fieldset class="transport-controls compare-transport" aria-label="Playback controls">
-              <button
-                class="transport-button transport-button--primary"
-                type="button"
-                :disabled="busy || !blind"
-                :aria-pressed="playing"
-                aria-keyshortcuts="Space"
-                @click="togglePlayback"
-              >
-                {{ playing ? "Pause" : "Loop excerpt" }}
-              </button>
-              <button
-                class="transport-button"
-                type="button"
-                :disabled="busy || !blind"
-                @click="seek(excerpt?.start_ms ?? 0)"
-              >
-                Restart
-              </button>
-            </fieldset>
-
-            <label v-if="excerpt" class="compare-scrub">
-              <span class="sr-only">Position in excerpt</span>
-              <input
-                type="range"
-                :min="excerpt.start_ms"
-                :max="excerpt.end_ms - 1"
-                step="1"
-                :value="playheadMs"
-                :disabled="busy"
-                @input="seek(Number(($event.target as HTMLInputElement).value))"
-              />
-            </label>
-
-            <div class="transport-tuning">
-              <div class="speed-controls">
-                <span>View</span>
-                <div class="speed-presets compare-views">
-                  <button
-                    v-for="option in views"
-                    :key="option.key"
-                    type="button"
-                    :class="{ 'is-active': view === option.key }"
-                    :aria-pressed="view === option.key"
-                    :aria-keyshortcuts="option.key.toUpperCase()"
-                    @click="view = option.key"
-                  >
-                    {{ option.label }}
-                  </button>
-                </div>
-              </div>
-              <div class="speed-controls">
-                <span>Audio rate</span>
-                <div class="speed-presets" :style="{ '--count': SUPPORTED_PLAYBACK_RATES.length }">
-                  <button
-                    v-for="value in SUPPORTED_PLAYBACK_RATES"
-                    :key="value"
-                    type="button"
-                    :class="{ 'is-active': rate === value }"
-                    :aria-pressed="rate === value"
-                    @click="setRate(value)"
-                  >
-                    {{ value }}×
-                  </button>
-                </div>
-              </div>
-              <div class="speed-controls">
-                <span>Visual speed</span>
-                <div class="speed-presets" :style="{ '--count': visualSpeedPresets.length }">
-                  <button
-                    v-for="value in visualSpeedPresets"
-                    :key="value"
-                    type="button"
-                    :class="{ 'is-active': visualSpeed === value }"
-                    :aria-pressed="visualSpeed === value"
-                    @click="visualSpeed = value"
-                  >
-                    {{ value }}
-                  </button>
-                </div>
-              </div>
-              <AudioOffsetControl
-                :model-value="audioOffsetMs"
-                :disabled="busy || !blind"
-                @update:model-value="setAudioOffset"
-              />
-              <AudioVolumeControl
-                :model-value="audioVolume"
-                :disabled="busy || !blind"
-                @update:model-value="setAudioVolume"
-              />
-              <LongNoteTailControl
-                :model-value="tailShortenMs"
-                :disabled="busy || !blind"
-                @update:model-value="setTailShortenMs"
-              />
-              <p class="setup-note">Space loops or pauses. A, B and S switch the view.</p>
-            </div>
-          </section>
-
-          <section class="editor-section" aria-labelledby="verdict-heading">
-            <div class="editor-section-heading">
-              <h3 id="verdict-heading">Which chart follows the music?</h3>
-            </div>
-            <p class="compare-hint">{{ excerpt?.hint }}</p>
-            <label class="field-stack">
-              <span>Note (optional)</span>
-              <textarea
-                v-model="note"
-                rows="3"
-                placeholder="A few words, if useful"
-                :disabled="busy || saving || Boolean(verdict)"
-              ></textarea>
-            </label>
-            <div class="compare-verdicts">
-              <button
-                v-for="choice in verdictChoices"
-                :key="choice.value"
-                class="button button--quiet"
-                :class="{ 'is-active': verdict?.verdict === choice.value }"
-                type="button"
-                :aria-pressed="verdict?.verdict === choice.value"
-                :disabled="busy || saving || !blind || Boolean(verdict)"
-                @click="save(choice.value)"
-              >
-                {{ choice.label }}
-              </button>
-            </div>
-            <p v-if="error && blind" class="inline-message inline-message--error" role="alert">
-              {{ error }}
-            </p>
-          </section>
-
-          <section v-if="verdict" class="editor-section" role="status" aria-labelledby="reveal-heading">
-            <div class="editor-section-heading">
-              <h3 id="reveal-heading">Saved · {{ verdictLabel }}</h3>
-            </div>
-            <dl class="compact-facts">
-              <div><dt>A</dt><dd>{{ verdict.shown_a.model }}</dd></div>
-              <div><dt>B</dt><dd>{{ verdict.shown_b.model }}</dd></div>
-            </dl>
+      <template #right>
+        <PanelSection id="compare-verdict" title="Which chart follows the music?" :collapsible="false">
+          <p v-if="excerpt?.hint" class="compare-hint">{{ excerpt.hint }}</p>
+          <label class="field-stack">
+            <span>Note (optional)</span>
+            <textarea
+              v-model="note"
+              rows="3"
+              placeholder="A few words, if useful"
+              :disabled="busy || saving || Boolean(verdict)"
+            ></textarea>
+          </label>
+          <div class="compare-verdicts">
             <button
-              v-if="nextUnjudged"
-              class="button button--primary compare-next"
+              v-for="choice in verdictChoices"
+              :key="choice.value"
+              class="tool-button compare-verdict"
               type="button"
-              :disabled="busy"
-              @click="select(nextUnjudged.songIndex, nextUnjudged.index)"
+              :aria-pressed="verdict?.verdict === choice.value"
+              :disabled="busy || saving || !blind || Boolean(verdict)"
+              @click="save(choice.value)"
             >
-              Next excerpt
+              {{ choice.label }}
             </button>
-            <p v-else class="setup-note">Every excerpt has a verdict.</p>
-          </section>
-
-          <p class="setup-note compare-output">
-            Verdicts append to <span>{{ opened.verdict_path }}</span>
+          </div>
+          <p v-if="error && blind" class="inline-message inline-message--error" role="alert">
+            {{ error }}
           </p>
-        </aside>
-      </div>
-    </template>
+        </PanelSection>
+
+        <PanelSection
+          v-if="verdict"
+          id="compare-reveal"
+          :title="`Saved · ${verdictLabel}`"
+          :collapsible="false"
+          role="status"
+        >
+          <dl class="compact-facts">
+            <div><dt>A</dt><dd>{{ verdict.shown_a.model }}</dd></div>
+            <div><dt>B</dt><dd>{{ verdict.shown_b.model }}</dd></div>
+          </dl>
+          <button
+            v-if="nextUnjudged"
+            class="tool-button tool-button--primary compare-next"
+            type="button"
+            :disabled="busy"
+            @click="select(nextUnjudged.songIndex, nextUnjudged.index)"
+          >
+            Next excerpt
+          </button>
+          <p v-else class="setup-note">Every excerpt has a verdict.</p>
+        </PanelSection>
+
+        <PanelSection id="compare-listening" title="Listening">
+          <AudioOffsetControl
+            :model-value="audioOffsetMs"
+            :disabled="busy || !blind"
+            @update:model-value="setAudioOffset"
+          />
+          <AudioVolumeControl
+            :model-value="audioVolume"
+            :disabled="busy || !blind"
+            @update:model-value="setAudioVolume"
+          />
+          <LongNoteTailControl
+            :model-value="tailShortenMs"
+            :disabled="busy || !blind"
+            @update:model-value="setTailShortenMs"
+          />
+          <p class="setup-note">
+            <kbd>Space</kbd> loops or pauses; <kbd>A</kbd>, <kbd>B</kbd> and <kbd>S</kbd> switch
+            the view.
+          </p>
+        </PanelSection>
+      </template>
+
+      <template #status>
+        <span class="status-item">Rate <b>{{ rate }}×</b></span>
+        <span class="status-item">Visual speed <b>{{ visualSpeed }}</b></span>
+        <span class="status-item">
+          View <b>{{ views.find((option) => option.key === view)?.label }}</b>
+        </span>
+        <span class="status-item">Judged <b>{{ judged }} / {{ queue.length }}</b></span>
+        <span class="status-item status-item--end status-item--path" :title="opened.verdict_path">
+          Verdicts append to {{ opened.verdict_path }}
+        </span>
+      </template>
+    </WorkspaceFrame>
   </main>
 </template>
 
 <style scoped>
-.compare-song {
-  padding: 12px 14px;
-  border-bottom: 1px solid var(--line);
+.compare-view {
+  display: flex;
+  min-height: 0;
+  flex: 1 1 auto;
+  flex-direction: column;
+  background: var(--well);
 }
 
-.details-transport .compare-transport {
-  grid-template-columns: 2fr 1fr;
+.compare-song {
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--seam);
+}
+
+.compare-transport {
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.compare-status {
+  font-size: var(--text-xs);
+}
+
+.compare-scrub {
+  display: block;
+  flex: 0 0 auto;
+  padding: 0 8px;
+  border-bottom: 1px solid var(--seam);
+  background: var(--surface-1);
 }
 
 .compare-scrub input {
+  display: block;
   width: 100%;
+  height: 18px;
   margin: 0;
-  accent-color: var(--signal);
-}
-
-.details-transport .speed-controls {
-  grid-template-columns: 72px minmax(0, 1fr);
-}
-
-.details-transport .speed-presets {
-  grid-template-columns: repeat(var(--count), minmax(0, 1fr));
-}
-
-.details-transport .compare-views {
-  grid-template-columns: 1fr 1fr 2fr;
+  accent-color: var(--signal-fill);
 }
 
 .compare-hint {
-  margin: 0 0 14px;
-  font-size: 0.82rem;
+  margin: 0;
+  color: var(--ink-secondary);
+  font-size: var(--text-sm);
   line-height: 1.5;
   text-wrap: pretty;
 }
@@ -816,26 +818,15 @@ function handleKeydown(event: KeyboardEvent) {
 .compare-verdicts {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px;
-  margin-top: 14px;
+  gap: 4px;
 }
 
-.compare-verdicts .button,
+.compare-verdict,
 .compare-next {
-  min-height: 40px;
+  min-height: var(--control-h-lg);
 }
 
 .compare-next {
   width: 100%;
-  margin-top: 12px;
-}
-
-.compare-output {
-  padding: 16px;
-}
-
-.compare-output span {
-  font-family: var(--font-data);
-  overflow-wrap: anywhere;
 }
 </style>

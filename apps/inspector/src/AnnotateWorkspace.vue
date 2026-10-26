@@ -132,6 +132,10 @@ import {
 } from "./annotation/timeline-view-range";
 import FallingNoteViewport from "./FallingNoteViewport.vue";
 import LongNoteTailControl from "./LongNoteTailControl.vue";
+import PanelSection from "./layout/PanelSection.vue";
+import type { PaneSpec } from "./layout/pane-layout";
+import type { MobilePanel } from "./layout/WorkspaceFrame.vue";
+import WorkspaceFrame from "./layout/WorkspaceFrame.vue";
 import WorkspaceModeSwitch from "./WorkspaceModeSwitch.vue";
 import {
   createWorkspaceLifecycleState,
@@ -141,7 +145,20 @@ import {
 } from "./workspace-lifecycle";
 import type { WorkspaceMode } from "./workspace-mode";
 
-type MobilePanel = "source" | "preview" | "details";
+const queuePane: PaneSpec = {
+  id: "annotate-queue",
+  label: "Task queue",
+  defaultSize: 260,
+  min: 180,
+  max: 440,
+};
+const judgmentPane: PaneSpec = {
+  id: "annotate-judgment",
+  label: "Playback and judgment",
+  defaultSize: 340,
+  min: 280,
+  max: 560,
+};
 type SaveState = "idle" | "saving" | "saved" | "conflict" | "error";
 type TimelineDragKind = Exclude<TimelineGestureKind, "noop" | "pan-viewport">;
 
@@ -2707,24 +2724,17 @@ function errorMessage(error: unknown): string {
     tabindex="-1"
   >
     <header v-if="!directory" class="app-bar annotation-app-bar">
-      <div class="brand-lockup">
-        <span class="brand-mark" aria-hidden="true"></span>
-        <div>
-          <p class="brand-name">Beatmap Lens</p>
-          <p class="brand-edition">Section annotation</p>
-        </div>
-      </div>
-
-      <div class="annotation-chart-context">
-        <span>{{ futureDataset?.manifest.name ?? "Local dataset" }}</span>
-        <strong>{{ currentChartLabel }}</strong>
-      </div>
-
+      <span class="brand-glyph" aria-hidden="true" title="Beatmap Lens"></span>
+      <span class="sr-only">Beatmap Lens</span>
       <WorkspaceModeSwitch
         model-value="annotate"
         :disabled="operationLocked || draftCleanupBlocked"
         @update:model-value="changeWorkspaceMode"
       />
+      <div class="annotation-chart-context">
+        <span>{{ futureDataset?.manifest.name ?? "Local dataset" }}</span>
+        <strong>{{ currentChartLabel }}</strong>
+      </div>
 
       <div class="annotation-toolbar-status">
         <span v-if="directory" class="queue-progress">
@@ -2880,804 +2890,780 @@ function errorMessage(error: unknown): string {
       </form>
     </section>
 
-    <template v-else>
-      <nav class="mobile-view-switcher" aria-label="Annotation workspace views">
-        <button
-          v-for="panel in (['source', 'preview', 'details'] as const)"
-          :key="panel"
-          class="mobile-view-button"
-          :class="{ 'is-active': activeMobilePanel === panel }"
-          type="button"
-          :aria-pressed="activeMobilePanel === panel"
-          @click="activeMobilePanel = panel"
-        >
-          {{ panel }}
-        </button>
-      </nav>
-
-      <div
-        class="annotation-workspace"
-        :class="{
-          'has-session': session,
-          'is-preview-active': activeMobilePanel === 'preview',
-        }"
-      >
-        <aside
-          class="annotation-rail annotation-source-rail"
-          :class="{ 'is-mobile-active': activeMobilePanel === 'source' }"
-          aria-labelledby="queue-heading"
-        >
-          <div class="active-workspace-identity">
-            <div class="brand-lockup">
-              <span class="brand-mark" aria-hidden="true"></span>
-              <div>
-                <p class="brand-name">Beatmap Lens</p>
-                <p class="brand-edition">Section annotation</p>
-              </div>
-            </div>
-            <WorkspaceModeSwitch
-              model-value="annotate"
-              :disabled="operationLocked || draftCleanupBlocked"
-              @update:model-value="changeWorkspaceMode"
-            />
-            <div class="active-dataset-identity">
-              <span>{{ directory?.manifest.name ?? "Local dataset" }}</span>
-              <strong>{{ currentChartLabel }}</strong>
-            </div>
-          </div>
-
-          <header class="annotation-rail-header">
-            <div>
-              <p class="section-kicker"><span class="section-number">01</span> Task queue</p>
-              <h2 id="queue-heading">Catalog charts</h2>
-            </div>
-            <span class="rail-count">{{ queue.length }}</span>
-          </header>
-
-          <nav class="task-list" aria-label="Catalog tasks">
+    <WorkspaceFrame
+      v-else
+      v-model:mobile-panel="activeMobilePanel"
+      class="annotate-workspace"
+      layout-key="annotate"
+      mode="annotate"
+      :mode-disabled="operationLocked || draftCleanupBlocked"
+      :left="queuePane"
+      :right="judgmentPane"
+      mobile-label="Annotation workspace views"
+      @change-mode="changeWorkspaceMode"
+    >
+      <template #toolbar>
+        <div class="toolbar-identity toolbar-optional">
+          <strong>{{ currentChartLabel }}</strong>
+          <span>{{ directory?.manifest.name ?? "Local dataset" }}</span>
+        </div>
+        <template v-if="session">
+          <span class="toolbar-divider" aria-hidden="true"></span>
+          <fieldset class="toolbar-group annotate-transport" aria-label="Playback controls">
             <button
-              v-for="task in queue"
-              :key="task.id"
-              class="task-row"
-              :class="{ 'is-active': task.id === activeTaskId }"
+              class="tool-button tool-button--play"
               type="button"
-              :disabled="task.status === 'missing-source' || operationLocked || draftCleanupBlocked"
-              @click="openTask(task)"
+              :disabled="editorLocked"
+              :aria-pressed="playbackState.playing"
+              aria-keyshortcuts="Space"
+              title="Play or pause (Space)"
+              @click="togglePlayback"
             >
-              <span class="task-status-mark" :class="`task-status-mark--${task.status}`" aria-hidden="true"></span>
-              <span class="task-copy">
-                <strong>{{ task.source?.title ?? task.displayName }}</strong>
-                <span>{{ task.source?.difficulty ?? task.error ?? task.displayName }}</span>
-              </span>
-              <span class="task-status-label">{{ statusLabel(task.status) }}</span>
+              <svg viewBox="0 0 16 16" aria-hidden="true">
+                <path v-if="playbackState.playing" d="M5.5 3.5v9M10.5 3.5v9" />
+                <path v-else class="tool-icon-fill" d="M5 3.3v9.4L12.6 8z" />
+              </svg>
+              {{ playbackState.playing ? "Pause" : "Play" }}
             </button>
-          </nav>
+            <button
+              class="tool-button"
+              type="button"
+              :disabled="editorLocked || !parsedRange"
+              aria-keyshortcuts="Shift+Space"
+              title="Play the selection once (Shift+Space)"
+              @click="playSelectionOnce"
+            >Selection</button>
+            <button
+              class="tool-button"
+              type="button"
+              :disabled="editorLocked || !parsedRange"
+              :aria-pressed="playbackState.looping"
+              aria-keyshortcuts="L"
+              title="Loop the selection (L)"
+              @click="toggleSelectionLoop"
+            >
+              <svg viewBox="0 0 16 16" aria-hidden="true">
+                <path d="M3 8a4 4 0 0 1 4-4h5M10.5 2.2 12.5 4l-2 1.8M13 8a4 4 0 0 1-4 4H4M5.5 13.8 3.5 12l2-1.8" />
+              </svg>
+              Loop
+            </button>
+            <button
+              class="tool-button"
+              type="button"
+              :disabled="editorLocked"
+              :aria-pressed="musicEnabled"
+              title="Hear the music with the chart"
+              @click="toggleMusic"
+            >Music {{ musicEnabled ? "on" : "off" }}</button>
+          </fieldset>
+          <div class="time-counter" title="Playhead">
+            <span class="sr-only">Playhead</span>
+            <span class="time-counter-main">{{ formatTime(playheadMs) }}</span>
+            <span class="time-counter-sub">/ {{ formatTime(session.chartEndMs) }}</span>
+          </div>
+        </template>
+      </template>
 
-          <section v-if="activeTask" class="rail-section" aria-labelledby="hints-heading">
-            <h3 id="hints-heading">Catalog hints</h3>
-            <div class="suggestion-list">
-              <span v-for="tag in activeTask.task.categories" :key="tag" class="tag-chip tag-chip--hint">
-                {{ tag }}
-              </span>
-            </div>
-          </section>
+      <template #toolbar-end>
+        <span class="queue-progress toolbar-optional">
+          {{ progress.complete }} / {{ progress.total }} complete
+        </span>
+        <span class="health-status annotate-save" :class="`health-status--${saveTone}`" aria-live="polite">
+          <span class="health-dot" aria-hidden="true"></span>
+          {{ saveMessage }}
+        </span>
+      </template>
 
-          <section v-if="session" class="rail-section" aria-labelledby="facts-heading">
-            <h3 id="facts-heading">Chart facts</h3>
-            <dl class="compact-facts">
-              <div><dt>Keys</dt><dd>{{ session.source.keyCount }}K</dd></div>
-              <div><dt>Notes</dt><dd>{{ session.source.noteCount }}</dd></div>
-              <div><dt>Duration</dt><dd>{{ formatTime(session.chartEndMs) }}</dd></div>
-              <div><dt>Creator</dt><dd>{{ session.source.creator }}</dd></div>
-            </dl>
-          </section>
+      <template #left>
+        <header class="pane-header">
+          <h2 id="queue-heading">Catalog charts</h2>
+          <span class="pane-count">{{ queue.length }}</span>
+        </header>
+        <nav class="task-list" aria-label="Catalog tasks">
+          <button
+            v-for="task in queue"
+            :key="task.id"
+            class="task-row"
+            :class="{ 'is-active': task.id === activeTaskId }"
+            type="button"
+            :disabled="task.status === 'missing-source' || operationLocked || draftCleanupBlocked"
+            @click="openTask(task)"
+          >
+            <span class="task-status-mark" :class="`task-status-mark--${task.status}`" aria-hidden="true"></span>
+            <span class="task-copy">
+              <strong>{{ task.source?.title ?? task.displayName }}</strong>
+              <span>{{ task.source?.difficulty ?? task.error ?? task.displayName }}</span>
+            </span>
+            <span class="task-status-label">{{ statusLabel(task.status) }}</span>
+          </button>
+        </nav>
+        <PanelSection v-if="activeTask" id="annotate-hints" title="Catalog hints">
+          <div class="suggestion-list">
+            <span v-for="tag in activeTask.task.categories" :key="tag" class="tag-chip tag-chip--hint">
+              {{ tag }}
+            </span>
+          </div>
+        </PanelSection>
+        <PanelSection v-if="session" id="annotate-facts" title="Chart facts">
+          <dl class="compact-facts">
+            <div><dt>Keys</dt><dd>{{ session.source.keyCount }}K</dd></div>
+            <div><dt>Notes</dt><dd>{{ session.source.noteCount }}</dd></div>
+            <div><dt>Duration</dt><dd>{{ formatTime(session.chartEndMs) }}</dd></div>
+            <div><dt>Creator</dt><dd>{{ session.source.creator }}</dd></div>
+          </dl>
+        </PanelSection>
+        <details v-if="session" class="source-details">
+          <summary>Read-only source</summary>
+          <pre>{{ session.sourceText }}</pre>
+        </details>
+      </template>
 
-          <details v-if="session" class="source-details">
-            <summary>Read-only source</summary>
-            <pre>{{ session.sourceText }}</pre>
-          </details>
-        </aside>
-
+      <template #main>
         <section
-          class="annotation-stage"
-          :class="{ 'is-mobile-active': activeMobilePanel === 'preview' }"
+          class="annotation-stage annotate-stage"
+          :class="{ 'has-session': session }"
           aria-labelledby="stage-heading"
         >
-          <header v-if="!session" class="annotation-stage-header">
-            <div>
-              <p class="section-kicker"><span class="section-number">02</span> Section evidence</p>
+          <header v-if="!session" class="stage-toolbar">
+            <div class="stage-identity">
               <h1 id="stage-heading">{{ readonlyTask?.source?.title ?? "Select a chart" }}</h1>
-              <p v-if="readonlyTask?.source" class="chart-byline">
-                <strong>{{ readonlyTask.source.artist }}</strong>
-                <span aria-hidden="true">·</span>
-                {{ readonlyTask.source.difficulty }}
-              </p>
+              <span v-if="readonlyTask?.source">
+                {{ readonlyTask.source.artist }} · {{ readonlyTask.source.difficulty }}
+              </span>
             </div>
           </header>
-
-          <div v-if="taskError" class="stage-message inline-message--error" role="alert">
-            {{ taskError }}
-          </div>
-          <div v-else-if="taskLoading" class="stage-message">Loading exact source bytes</div>
-          <div v-else-if="readonlyTask" class="stage-message readonly-task-panel">
-            <span class="readonly-badge">Read-only</span>
-            <strong>Annotation contract v{{ readonlyTask.future?.version ?? "?" }}</strong>
-            <p>
-              This sidecar was written by a newer Inspector. Its source identity and revision are
-              visible, but editing is disabled so the newer contract cannot be overwritten.
-            </p>
-            <dl class="compact-facts">
-              <div><dt>Revision</dt><dd>{{ readonlyTask.future?.revision ?? "Unknown" }}</dd></div>
-              <div><dt>Source SHA</dt><dd>{{ readonlyTask.source?.sha256.slice(0, 12) }}</dd></div>
-            </dl>
-            <button
-              v-if="readonlyDraftPresent"
-              class="button button--quiet"
-              type="button"
-              :disabled="operationLocked"
-              @click="discardReadonlyDraft"
-            >
-              Discard incompatible local draft
-            </button>
-          </div>
-          <div v-else-if="session" class="interactive-stage-shell">
-            <FallingNoteViewport
-              :annotation-bands="annotationBands"
-              :candidate-note-ids="candidateNoteIds"
-              :chart-artist="session.source.artist"
-              :chart-difficulty="session.source.difficulty"
+          <h1 v-else id="stage-heading" class="sr-only">{{ session.source.title }}</h1>
+          <div class="annotate-view">
+            <div v-if="taskError" class="stage-message inline-message--error" role="alert">
+              {{ taskError }}
+            </div>
+            <div v-else-if="taskLoading" class="stage-message">Loading exact source bytes</div>
+            <div v-else-if="readonlyTask" class="stage-message readonly-task-panel">
+              <span class="readonly-badge">Read-only</span>
+              <strong>Annotation contract v{{ readonlyTask.future?.version ?? "?" }}</strong>
+              <p>
+                This sidecar was written by a newer Inspector. Its source identity and revision are
+                visible, but editing is disabled so the newer contract cannot be overwritten.
+              </p>
+              <dl class="compact-facts">
+                <div><dt>Revision</dt><dd>{{ readonlyTask.future?.revision ?? "Unknown" }}</dd></div>
+                <div><dt>Source SHA</dt><dd>{{ readonlyTask.source?.sha256.slice(0, 12) }}</dd></div>
+              </dl>
+              <button
+                v-if="readonlyDraftPresent"
+                class="button button--quiet"
+                type="button"
+                :disabled="operationLocked"
+                @click="discardReadonlyDraft"
+              >
+                Discard incompatible local draft
+              </button>
+            </div>
+            <div v-else-if="session" class="interactive-stage-shell">
+              <FallingNoteViewport
+                :annotation-bands="annotationBands"
+                :candidate-note-ids="candidateNoteIds"
+                :chart-artist="session.source.artist"
+                :chart-difficulty="session.source.difficulty"
+                :chart-end-ms="session.chartEndMs"
+                :chart-title="session.source.title"
+                :frame-p95-ms="frameP95Ms"
+                :key-count="session.source.keyCount"
+                :locked="operationLocked || draftCleanupBlocked"
+                :playhead-ms="playheadMs"
+                :selected-note-ids="selectedNoteIds"
+                :size="viewportSize"
+                :visual-speed="visualSpeed"
+                v-bind="{
+                  ...(viewportFrame ? { frame: viewportFrame } : {}),
+                  ...(viewportInstrumentation ? { instrumentation: viewportInstrumentation } : {}),
+                  ...(selectionBand ? { selectionBand } : {}),
+                }"
+                @annotation-seek="seekAnnotation"
+                @gesture-active="setChildGestureActive"
+                @note-toggle="toggleSceneNote"
+                @range-cancel="cancelRangeGesture"
+                @range-commit="commitViewportRangeGesture"
+                @range-preview="previewViewportRangeGesture"
+                @range-start="beginViewportRangeGesture"
+                @resize="resizeViewport"
+                @seek="seekPlayhead"
+                @viewport-navigate="navigateMainViewport"
+              />
+            </div>
+            <div v-else class="stage-empty">
+              Choose a resolvable chart from the task queue.
+            </div>
+            <AnnotationTimeline
+              v-if="session"
+              :chart="session.chart"
               :chart-end-ms="session.chartEndMs"
-              :chart-title="session.source.title"
-              :frame-p95-ms="frameP95Ms"
-              :key-count="session.source.keyCount"
-              :locked="operationLocked || draftCleanupBlocked"
+              :disabled="operationLocked || draftCleanupBlocked"
+              :main-viewport-range="timelineViewport ?? timelineViewRange"
               :playhead-ms="playheadMs"
-              :selected-note-ids="selectedNoteIds"
-              :size="viewportSize"
-              :visual-speed="visualSpeed"
-              v-bind="{
-                ...(viewportFrame ? { frame: viewportFrame } : {}),
-                ...(viewportInstrumentation ? { instrumentation: viewportInstrumentation } : {}),
-                ...(selectionBand ? { selectionBand } : {}),
-              }"
+              :saved-annotations="annotationList"
+              :view-range="timelineViewRange"
+              v-bind="displayedRange ? { selection: displayedRange } : {}"
               @annotation-seek="seekAnnotation"
               @gesture-active="setChildGestureActive"
-              @note-toggle="toggleSceneNote"
               @range-cancel="cancelRangeGesture"
-              @range-commit="commitViewportRangeGesture"
-              @range-preview="previewViewportRangeGesture"
-              @range-start="beginViewportRangeGesture"
-              @resize="resizeViewport"
+              @range-commit="commitTimelineRangeGesture"
+              @range-preview="previewTimelineRangeGesture"
+              @range-start="beginTimelineRangeGesture"
               @seek="seekPlayhead"
-              @viewport-navigate="navigateMainViewport"
+              @view-range-change="updateTimelineViewRange"
+              @viewport-pan="panMainViewport"
             />
           </div>
-          <div v-else class="stage-empty">
-            Choose a resolvable chart from the task queue.
-          </div>
         </section>
+      </template>
 
-        <AnnotationTimeline
+      <template #right>
+        <PanelSection v-if="session" id="annotate-playback" title="Playback">
+          <div class="speed-controls">
+            <span>Visual speed</span>
+            <div class="speed-presets">
+              <button
+                v-for="speed in visualSpeedPresets"
+                :key="speed"
+                type="button"
+                :class="{ 'is-active': visualSpeed === speed }"
+                :disabled="editorLocked"
+                @click="selectVisualSpeed(speed)"
+              >{{ speed }}</button>
+            </div>
+            <label class="speed-custom">
+              <span>Custom</span>
+              <input
+                v-model="visualSpeedDraft"
+                type="number"
+                :min="minimumVisualSpeed"
+                :max="maximumVisualSpeed"
+                step="1"
+                :disabled="editorLocked"
+                aria-label="Custom visual speed in pixels per second"
+                @change="applyVisualSpeed"
+                @keydown.enter.prevent="applyVisualSpeed"
+              />
+              <small>px/s</small>
+            </label>
+          </div>
+
+          <AudioOffsetControl
+            :model-value="audioOffsetMs"
+            :disabled="editorLocked"
+            @update:model-value="setAudioOffset"
+          />
+
+          <AudioVolumeControl
+            :model-value="audioVolume"
+            :disabled="editorLocked"
+            @update:model-value="setAudioVolume"
+          />
+
+          <LongNoteTailControl
+            :model-value="tailShortenMs"
+            :disabled="editorLocked"
+            @update:model-value="setTailShortenMs"
+          />
+
+          <div class="timeline-zoom-control">
+            <div class="transport-control-label">
+              <span>Timeline lens</span>
+              <small>Pinch or Control + wheel at the timeline</small>
+            </div>
+            <div class="timeline-zoom-buttons">
+              <button type="button" :disabled="editorLocked" aria-label="Zoom timeline in" @click="zoomTimeline(1)" @keydown="handleTimelineControlKeydown">Zoom in</button>
+              <button type="button" :disabled="editorLocked" aria-label="Zoom timeline out" @click="zoomTimeline(-1)" @keydown="handleTimelineControlKeydown">Zoom out</button>
+              <button type="button" :disabled="editorLocked" aria-label="Fit the whole chart in the timeline" @click="fitTimeline" @keydown="handleTimelineControlKeydown">Fit</button>
+            </div>
+          </div>
+          <small v-if="visualSpeedError" class="field-error" role="alert">{{ visualSpeedError }}</small>
+        </PanelSection>
+
+        <header class="pane-header annotate-editor-header">
+          <h2 id="selection-heading">
+            {{ editingAnnotationId ? "Edit annotation" : "Selection editor" }}
+          </h2>
+          <span class="pane-count">{{ annotationList.length }} saved</span>
+        </header>
+        <fieldset
           v-if="session"
-          :chart="session.chart"
-          :chart-end-ms="session.chartEndMs"
-          :disabled="operationLocked || draftCleanupBlocked"
-          :main-viewport-range="timelineViewport ?? timelineViewRange"
-          :playhead-ms="playheadMs"
-          :saved-annotations="annotationList"
-          :view-range="timelineViewRange"
-          v-bind="displayedRange ? { selection: displayedRange } : {}"
-          @annotation-seek="seekAnnotation"
-          @gesture-active="setChildGestureActive"
-          @range-cancel="cancelRangeGesture"
-          @range-commit="commitTimelineRangeGesture"
-          @range-preview="previewTimelineRangeGesture"
-          @range-start="beginTimelineRangeGesture"
-          @seek="seekPlayhead"
-          @view-range-change="updateTimelineViewRange"
-          @viewport-pan="panMainViewport"
-        />
-
-        <aside
-          class="annotation-rail annotation-details-rail"
-          :class="{ 'is-mobile-active': activeMobilePanel === 'details' }"
-          aria-labelledby="selection-heading"
+          class="annotation-editor"
+          :disabled="editorLocked"
         >
-          <section v-if="session" class="details-transport" aria-label="Playback and timeline controls">
-            <div class="details-transport-status">
-              <div>
-                <span>Playhead</span>
-                <strong>{{ formatTime(playheadMs) }}</strong>
-              </div>
-              <div class="details-transport-state">
-                <span>{{ progress.complete }} / {{ progress.total }} complete</span>
-                <span class="health-status" :class="`health-status--${saveTone}`" aria-live="polite">
-                  <span class="health-dot" aria-hidden="true"></span>
-                  {{ saveMessage }}
-                </span>
-              </div>
+          <section class="editor-section" aria-labelledby="range-heading">
+            <div class="editor-section-heading">
+              <h3 id="range-heading">Range</h3>
+              <span>[start, end)</span>
             </div>
-
-            <fieldset class="transport-controls" aria-label="Playback controls">
-              <button
-                class="transport-button transport-button--primary"
-                type="button"
-                :disabled="editorLocked"
-                :aria-pressed="playbackState.playing"
-                @click="togglePlayback"
-              >
-                {{ playbackState.playing ? "Pause" : "Play" }}
-                <kbd>Space</kbd>
-              </button>
-              <button
-                class="transport-button"
-                type="button"
-                :disabled="editorLocked || !parsedRange"
-                @click="playSelectionOnce"
-              >Selection <kbd>⇧Space</kbd></button>
-              <button
-                class="transport-button"
-                :class="{ 'is-active': playbackState.looping }"
-                type="button"
-                :disabled="editorLocked || !parsedRange"
-                :aria-pressed="playbackState.looping"
-                @click="toggleSelectionLoop"
-              >Loop <kbd>L</kbd></button>
-              <button
-                class="transport-button"
-                :class="{ 'is-active': musicEnabled }"
-                type="button"
-                :disabled="editorLocked"
-                :aria-pressed="musicEnabled"
-                @click="toggleMusic"
-              >Music {{ musicEnabled ? "on" : "off" }}</button>
-            </fieldset>
-
-            <div class="transport-tuning">
-              <div class="speed-controls">
-                <span>Visual speed</span>
-                <div class="speed-presets">
-                  <button
-                    v-for="speed in visualSpeedPresets"
-                    :key="speed"
-                    type="button"
-                    :class="{ 'is-active': visualSpeed === speed }"
-                    :disabled="editorLocked"
-                    @click="selectVisualSpeed(speed)"
-                  >{{ speed }}</button>
-                </div>
-                <label class="speed-custom">
-                  <span>Custom</span>
-                  <input
-                    v-model="visualSpeedDraft"
-                    type="number"
-                    :min="minimumVisualSpeed"
-                    :max="maximumVisualSpeed"
-                    step="1"
-                    :disabled="editorLocked"
-                    aria-label="Custom visual speed in pixels per second"
-                    @change="applyVisualSpeed"
-                    @keydown.enter.prevent="applyVisualSpeed"
-                  />
-                  <small>px/s</small>
-                </label>
-              </div>
-
-              <AudioOffsetControl
-                :model-value="audioOffsetMs"
-                :disabled="editorLocked"
-                @update:model-value="setAudioOffset"
-              />
-
-              <AudioVolumeControl
-                :model-value="audioVolume"
-                :disabled="editorLocked"
-                @update:model-value="setAudioVolume"
-              />
-
-              <LongNoteTailControl
-                :model-value="tailShortenMs"
-                :disabled="editorLocked"
-                @update:model-value="setTailShortenMs"
-              />
-
-              <div class="timeline-zoom-control">
-                <div class="transport-control-label">
-                  <span>Timeline lens</span>
-                  <small>Pinch or Control + wheel at the timeline</small>
-                </div>
-                <div class="timeline-zoom-buttons">
-                  <button type="button" :disabled="editorLocked" aria-label="Zoom timeline in" @click="zoomTimeline(1)" @keydown="handleTimelineControlKeydown">Zoom in</button>
-                  <button type="button" :disabled="editorLocked" aria-label="Zoom timeline out" @click="zoomTimeline(-1)" @keydown="handleTimelineControlKeydown">Zoom out</button>
-                  <button type="button" :disabled="editorLocked" aria-label="Fit the whole chart in the timeline" @click="fitTimeline" @keydown="handleTimelineControlKeydown">Fit</button>
-                </div>
-              </div>
+            <div class="range-inputs">
+              <label>
+                <span>Start ms</span>
+                <input
+                  v-model="draftStart"
+                  inputmode="decimal"
+                  @focus="beginRangeEdit"
+                  @keydown.enter.prevent="finishRangeEdit"
+                  @blur="finishRangeEdit"
+                />
+              </label>
+              <label>
+                <span>End ms</span>
+                <input
+                  v-model="draftEnd"
+                  inputmode="decimal"
+                  @focus="beginRangeEdit"
+                  @keydown.enter.prevent="finishRangeEdit"
+                  @blur="finishRangeEdit"
+                />
+              </label>
             </div>
+            <p v-if="rangeError" class="field-error" role="alert">{{ rangeError }}</p>
+          </section>
 
-            <div class="details-transport-meta">
-              <small class="audio-status" :class="`audio-status--${audioStatus.kind}`" role="status">
-                {{ audioStatusText }}
-              </small>
-              <small v-if="visualSpeedError" role="alert">{{ visualSpeedError }}</small>
+          <section class="editor-section" aria-labelledby="notes-heading">
+            <div class="editor-section-heading">
+              <h3 id="notes-heading">Range notes</h3>
+              <span>{{ selectedCount }} / {{ candidateNotes.length }} selected</span>
+            </div>
+            <div class="candidate-note-list">
+              <label v-for="note in pagedRangeNotes" :key="note.id" class="candidate-note-row">
+                <input
+                  type="checkbox"
+                  :checked="selectedNoteIds.has(note.id)"
+                  @change="toggleNote(note)"
+                />
+                <span>C{{ note.column + 1 }}</span>
+                <strong>{{ formatMs(note.startMs) }}</strong>
+                <small>{{ note.kind === "long" ? `LN to ${formatMs(note.endMs)}` : "rice" }}</small>
+              </label>
+            </div>
+            <div v-if="rangeNotePageCount > 1" class="range-note-pagination">
+              <button
+                type="button"
+                :disabled="rangeNotePage === 0"
+                @click="rangeNotePage--"
+              >Previous</button>
+              <span>Page {{ rangeNotePage + 1 }} / {{ rangeNotePageCount }}</span>
+              <button
+                type="button"
+                :disabled="rangeNotePage + 1 >= rangeNotePageCount"
+                @click="rangeNotePage++"
+              >Next</button>
             </div>
           </section>
 
-          <header class="annotation-rail-header">
-            <div>
-              <p class="section-kicker"><span class="section-number">03</span> Gold judgment</p>
-              <h2 id="selection-heading">
-                {{ editingAnnotationId ? "Edit annotation" : "Selection editor" }}
-              </h2>
+          <section class="editor-section" aria-labelledby="tags-heading">
+            <div class="editor-section-heading">
+              <h3 id="tags-heading">Tags and salience</h3>
+              <span>2 strong / 1 weak</span>
             </div>
-            <span class="rail-count">{{ annotationList.length }}</span>
-          </header>
+            <p class="salience-rubric" lang="en">
+              2 means dominant and diagnostic. 1 means supporting, mixed, partial, or transitional.
+            </p>
+            <input
+              v-model="tagQuery"
+              class="tag-search"
+              type="search"
+              placeholder="Find an active tag"
+            />
+            <button
+              v-if="canCreateCustomTag"
+              class="custom-tag-button"
+              type="button"
+              @click="beginCustomTagActivation"
+            >Create and activate <strong>{{ customTagId }}</strong></button>
+            <ul v-if="activeTags.length" class="tag-option-list" aria-label="Active Foundation tags">
+              <li v-for="tag in activeTags" :key="tag.id">
+                <button class="tag-option" type="button" @click="addTag(tag)">
+                  <span class="status-dot status-dot--active" aria-hidden="true"></span>
+                  <strong>{{ tag.displayName }}</strong>
+                  <small>{{ tag.id }}</small>
+                </button>
+              </li>
+            </ul>
+            <p v-else class="empty-copy">
+              This Foundation has no matching active tags. Create one with a definition and an
+              inclusion cue before adding it to gold.
+            </p>
 
-          <fieldset
-            v-if="session"
-            class="annotation-editor"
-            :disabled="editorLocked"
-          >
-            <section class="editor-section" aria-labelledby="range-heading">
-              <div class="editor-section-heading">
-                <h3 id="range-heading">Range</h3>
-                <span>[start, end)</span>
-              </div>
-              <div class="range-inputs">
-                <label>
-                  <span>Start ms</span>
-                  <input
-                    v-model="draftStart"
-                    inputmode="decimal"
-                    @focus="beginRangeEdit"
-                    @keydown.enter.prevent="finishRangeEdit"
-                    @blur="finishRangeEdit"
-                  />
-                </label>
-                <label>
-                  <span>End ms</span>
-                  <input
-                    v-model="draftEnd"
-                    inputmode="decimal"
-                    @focus="beginRangeEdit"
-                    @keydown.enter.prevent="finishRangeEdit"
-                    @blur="finishRangeEdit"
-                  />
-                </label>
-              </div>
-              <p v-if="rangeError" class="field-error" role="alert">{{ rangeError }}</p>
-            </section>
-
-            <section class="editor-section" aria-labelledby="notes-heading">
-              <div class="editor-section-heading">
-                <h3 id="notes-heading">Range notes</h3>
-                <span>{{ selectedCount }} / {{ candidateNotes.length }} selected</span>
-              </div>
-              <div class="candidate-note-list">
-                <label v-for="note in pagedRangeNotes" :key="note.id" class="candidate-note-row">
-                  <input
-                    type="checkbox"
-                    :checked="selectedNoteIds.has(note.id)"
-                    @change="toggleNote(note)"
-                  />
-                  <span>C{{ note.column + 1 }}</span>
-                  <strong>{{ formatMs(note.startMs) }}</strong>
-                  <small>{{ note.kind === "long" ? `LN to ${formatMs(note.endMs)}` : "rice" }}</small>
-                </label>
-              </div>
-              <div v-if="rangeNotePageCount > 1" class="range-note-pagination">
+            <div v-if="suggestedTags.length" class="catalog-suggestion-group">
+              <span>Catalog suggestions</span>
+              <div class="suggestion-list">
                 <button
+                  v-for="suggestion in suggestedTags"
+                  :key="suggestion.tagId"
+                  class="tag-chip tag-chip--button"
                   type="button"
-                  :disabled="rangeNotePage === 0"
-                  @click="rangeNotePage--"
-                >Previous</button>
-                <span>Page {{ rangeNotePage + 1 }} / {{ rangeNotePageCount }}</span>
-                <button
-                  type="button"
-                  :disabled="rangeNotePage + 1 >= rangeNotePageCount"
-                  @click="rangeNotePage++"
-                >Next</button>
-              </div>
-            </section>
-
-            <section class="editor-section" aria-labelledby="tags-heading">
-              <div class="editor-section-heading">
-                <h3 id="tags-heading">Tags and salience</h3>
-                <span>2 strong / 1 weak</span>
-              </div>
-              <p class="salience-rubric" lang="en">
-                2 means dominant and diagnostic. 1 means supporting, mixed, partial, or transitional.
-              </p>
-              <input
-                v-model="tagQuery"
-                class="tag-search"
-                type="search"
-                placeholder="Find an active tag"
-              />
-              <button
-                v-if="canCreateCustomTag"
-                class="custom-tag-button"
-                type="button"
-                @click="beginCustomTagActivation"
-              >Create and activate <strong>{{ customTagId }}</strong></button>
-              <ul v-if="activeTags.length" class="tag-option-list" aria-label="Active Foundation tags">
-                <li v-for="tag in activeTags" :key="tag.id">
-                  <button class="tag-option" type="button" @click="addTag(tag)">
-                    <span class="status-dot status-dot--active" aria-hidden="true"></span>
-                    <strong>{{ tag.displayName }}</strong>
-                    <small>{{ tag.id }}</small>
-                  </button>
-                </li>
-              </ul>
-              <p v-else class="empty-copy">
-                This Foundation has no matching active tags. Create one with a definition and an
-                inclusion cue before adding it to gold.
-              </p>
-
-              <div v-if="suggestedTags.length" class="catalog-suggestion-group">
-                <span>Catalog suggestions</span>
-                <div class="suggestion-list">
-                  <button
-                    v-for="suggestion in suggestedTags"
-                    :key="suggestion.tagId"
-                    class="tag-chip tag-chip--button"
-                    type="button"
-                    :disabled="suggestion.tag?.status === 'retired'"
-                    :title="suggestion.tag?.status === 'active' ? 'Add active tag' : suggestion.tag?.status === 'retired' ? 'Retired tags cannot be reused' : 'Create this suggestion as an active tag'"
-                    @click="useSuggestedTag(suggestion)"
-                  >
-                    {{ suggestion.displayName }} · {{ suggestion.tag?.status ?? "define" }}
-                  </button>
-                </div>
-              </div>
-
-              <form v-if="activationTag" class="activation-form" @submit.prevent="activateTag">
-                <div class="activation-form-heading">
-                  <span>{{ activationIsCustom ? "Create custom active tag" : "Define catalog suggestion" }}</span>
-                  <strong>{{ activationTagId }}</strong>
-                </div>
-                <div class="activation-identity">
-                  <label class="field-stack">
-                    <span>Canonical ID</span>
-                    <input
-                      v-model="activationTagId"
-                      required
-                    />
-                  </label>
-                  <label class="field-stack">
-                    <span>Display name</span>
-                    <input v-model="activationDisplayName" required />
-                  </label>
-                </div>
-                <label class="field-stack">
-                  <span>Definition</span>
-                  <textarea v-model="activationDefinition" rows="3" required></textarea>
-                </label>
-                <label class="field-stack">
-                  <span>Inclusion cues · one per line</span>
-                  <textarea v-model="activationInclusionCues" rows="3" required></textarea>
-                </label>
-                <label class="field-stack">
-                  <span>Exclusion cues · optional, one per line</span>
-                  <textarea v-model="activationExclusionCues" rows="2"></textarea>
-                </label>
-                <label class="field-stack">
-                  <span>Aliases · optional, one per line</span>
-                  <textarea v-model="activationAliases" rows="2"></textarea>
-                </label>
-                <label class="field-stack">
-                  <span>Salience clarification · optional</span>
-                  <textarea v-model="activationSalienceClarification" rows="2"></textarea>
-                </label>
-                <p v-if="activationError" class="field-error" role="alert">{{ activationError }}</p>
-                <div class="activation-actions">
-                  <button class="button button--quiet" type="button" @click="cancelTagActivation">
-                    Cancel
-                  </button>
-                  <button class="button button--primary" type="submit" :disabled="activationBusy">
-                    {{ activationBusy ? "Saving Foundation" : "Create active tag and add" }}
-                  </button>
-                </div>
-              </form>
-
-              <div class="selected-label-list">
-                <div
-                  v-for="label in draftLabels"
-                  :key="label.tagId"
-                  class="selected-label-row"
-                  :class="{ 'is-focused': focusedTagId === label.tagId }"
-                  @focusin="focusedTagId = label.tagId"
+                  :disabled="suggestion.tag?.status === 'retired'"
+                  :title="suggestion.tag?.status === 'active' ? 'Add active tag' : suggestion.tag?.status === 'retired' ? 'Retired tags cannot be reused' : 'Create this suggestion as an active tag'"
+                  @click="useSuggestedTag(suggestion)"
                 >
-                  <strong>{{ label.tagId }}</strong>
-                  <div class="salience-switch" :aria-label="`${label.tagId} salience`">
-                    <button
-                      v-for="value in ([2, 1] as const)"
-                      :key="value"
-                      type="button"
-                      :class="{ 'is-active': label.salience === value }"
-                      :aria-pressed="label.salience === value"
-                      @click="setSalience(label.tagId, value)"
-                    >
-                      {{ value }} {{ value === 2 ? "强" : "弱" }}
-                    </button>
-                  </div>
-                  <button class="icon-button" type="button" :aria-label="`Remove ${label.tagId}`" @click="removeTag(label.tagId)">
-                    ×
-                  </button>
-                </div>
+                  {{ suggestion.displayName }} · {{ suggestion.tag?.status ?? "define" }}
+                </button>
               </div>
-              <div class="exemplar-role-editor">
-                <div class="editor-section-heading">
-                  <h3>Exemplar roles</h3>
-                  <span>Gold-owned · optional</span>
-                </div>
-                <p class="salience-rubric">
-                  Strong and weak roles require the matching label. Counterexamples require an
-                  active tag that is absent from this gold.
-                </p>
-                <form class="exemplar-role-composer" @submit.prevent="addExemplarRole">
-                  <label>
-                    <span>Kind</span>
-                    <select v-model="exemplarKind" @change="syncExemplarTag">
-                      <option value="strong">Strong</option>
-                      <option value="weak">Weak</option>
-                      <option value="counterexample">Counterexample</option>
-                    </select>
-                  </label>
-                  <label>
-                    <span>Active tag</span>
-                    <select v-model="exemplarTagId" :disabled="!exemplarTagOptions.length">
-                      <option v-for="tag in exemplarTagOptions" :key="tag.id" :value="tag.id">
-                        {{ tag.id }}
-                      </option>
-                    </select>
-                  </label>
-                  <button class="button button--quiet" type="submit" :disabled="!exemplarTagId">
-                    Add role
-                  </button>
-                </form>
-                <div v-if="draftExemplarRoles.length" class="exemplar-role-list">
-                  <div v-for="role in draftExemplarRoles" :key="role.tagId" class="exemplar-role-row">
-                    <strong>{{ role.tagId }}</strong>
-                    <select
-                      :value="role.kind"
-                      :aria-label="`${role.tagId} exemplar kind`"
-                      @change="handleExemplarRoleKindChange(role.tagId, $event)"
-                    >
-                      <option v-for="kind in exemplarKindsForTag(role.tagId)" :key="kind" :value="kind">
-                        {{ kind }}
-                      </option>
-                    </select>
-                    <button
-                      class="icon-button"
-                      type="button"
-                      :aria-label="`Remove ${role.tagId} exemplar role`"
-                      @click="removeExemplarRole(role.tagId)"
-                    >×</button>
-                  </div>
-                </div>
-              </div>
-              <div v-if="overlapWarnings.length" class="overlap-warning" role="status">
-                <strong>Same-tag overlap</strong>
-                <span v-for="warning in overlapWarnings" :key="`${warning.leftAnnotationId}:${warning.rightAnnotationId}:${warning.tagId}`">
-                  {{ warning.tagId }} · {{ formatTime(warning.overlap.startMs) }}–{{ formatTime(warning.overlap.endMs) }}
-                </span>
-                <small>Valid and non-blocking. Review the neighboring gold sections.</small>
-              </div>
-            </section>
+            </div>
 
-            <section class="editor-section" aria-labelledby="foundation-heading">
-              <div class="editor-section-heading">
-                <h3 id="foundation-heading">Judgment Foundation</h3>
-                <span>r{{ session.foundation.revision }} · {{ directory?.manifest.currentFoundation.sha256.slice(0, 10) }}</span>
+            <form v-if="activationTag" class="activation-form" @submit.prevent="activateTag">
+              <div class="activation-form-heading">
+                <span>{{ activationIsCustom ? "Create custom active tag" : "Define catalog suggestion" }}</span>
+                <strong>{{ activationTagId }}</strong>
               </div>
-              <details class="foundation-panel" @toggle="loadFoundationDetails">
-                <summary>
-                  <strong>{{ session.foundation.tags.filter((tag) => tag.status === "active").length }} active</strong>
-                  <span>{{ session.foundation.tags.filter((tag) => tag.status === "retired").length }} retired</span>
-                </summary>
-                <dl class="foundation-policy-grid">
-                  <div><dt>Coordinates</dt><dd>source ms · half-open</dd></div>
-                  <div><dt>Dataset</dt><dd>positive-only · overlap allowed</dd></div>
-                  <div><dt>Evidence</dt><dd>explicit notes · multi-label</dd></div>
-                  <div><dt>Audio</dt><dd>optional context only</dd></div>
-                </dl>
-                <p class="foundation-detail-status" role="status">
-                  {{ foundationDetailsBusy ? "Loading canonical exemplar roles" : foundationDetailsMessage }}
-                </p>
-                <div class="foundation-tag-details">
-                  <details
-                    v-for="tag in session.foundation.tags.filter((entry) => entry.status === 'active')"
-                    :key="tag.id"
-                  >
-                    <summary><strong>{{ tag.id }}</strong><span>{{ exemplarViewsForTag(tag.id).length }} roles</span></summary>
-                    <p>{{ tag.definition }}</p>
-                    <div class="foundation-cue-list">
-                      <span>Include</span>
-                      <ul><li v-for="cue in tag.inclusionCues" :key="cue">{{ cue }}</li></ul>
-                    </div>
-                    <div v-if="tag.exclusionCues?.length" class="foundation-cue-list">
-                      <span>Exclude</span>
-                      <ul><li v-for="cue in tag.exclusionCues" :key="cue">{{ cue }}</li></ul>
-                    </div>
-                    <small v-if="tag.aliases.length">Aliases · {{ tag.aliases.join(", ") }}</small>
-                    <small v-if="tag.salienceClarification">Salience · {{ tag.salienceClarification }}</small>
-                    <ol v-if="exemplarViewsForTag(tag.id).length" class="foundation-exemplar-list">
-                      <li v-for="entry in exemplarViewsForTag(tag.id)" :key="`${entry.annotationId}:${entry.tagId}`">
-                        <strong>{{ entry.kind }}</strong>
-                        <span>{{ entry.sourceLabel }}</span>
-                        <small>{{ formatTime(entry.range.startMs) }}–{{ formatTime(entry.range.endMs) }}</small>
-                      </li>
-                    </ol>
-                  </details>
-                </div>
-              </details>
-            </section>
-
-            <section class="editor-section">
+              <div class="activation-identity">
+                <label class="field-stack">
+                  <span>Canonical ID</span>
+                  <input
+                    v-model="activationTagId"
+                    required
+                  />
+                </label>
+                <label class="field-stack">
+                  <span>Display name</span>
+                  <input v-model="activationDisplayName" required />
+                </label>
+              </div>
               <label class="field-stack">
-                <span>Judgment note, optional</span>
+                <span>Definition</span>
+                <textarea v-model="activationDefinition" rows="3" required></textarea>
+              </label>
+              <label class="field-stack">
+                <span>Inclusion cues · one per line</span>
+                <textarea v-model="activationInclusionCues" rows="3" required></textarea>
+              </label>
+              <label class="field-stack">
+                <span>Exclusion cues · optional, one per line</span>
+                <textarea v-model="activationExclusionCues" rows="2"></textarea>
+              </label>
+              <label class="field-stack">
+                <span>Aliases · optional, one per line</span>
+                <textarea v-model="activationAliases" rows="2"></textarea>
+              </label>
+              <label class="field-stack">
+                <span>Salience clarification · optional</span>
+                <textarea v-model="activationSalienceClarification" rows="2"></textarea>
+              </label>
+              <p v-if="activationError" class="field-error" role="alert">{{ activationError }}</p>
+              <div class="activation-actions">
+                <button class="button button--quiet" type="button" @click="cancelTagActivation">
+                  Cancel
+                </button>
+                <button class="button button--primary" type="submit" :disabled="activationBusy">
+                  {{ activationBusy ? "Saving Foundation" : "Create active tag and add" }}
+                </button>
+              </div>
+            </form>
+
+            <div class="selected-label-list">
+              <div
+                v-for="label in draftLabels"
+                :key="label.tagId"
+                class="selected-label-row"
+                :class="{ 'is-focused': focusedTagId === label.tagId }"
+                @focusin="focusedTagId = label.tagId"
+              >
+                <strong>{{ label.tagId }}</strong>
+                <div class="salience-switch" :aria-label="`${label.tagId} salience`">
+                  <button
+                    v-for="value in ([2, 1] as const)"
+                    :key="value"
+                    type="button"
+                    :class="{ 'is-active': label.salience === value }"
+                    :aria-pressed="label.salience === value"
+                    @click="setSalience(label.tagId, value)"
+                  >
+                    {{ value }} {{ value === 2 ? "强" : "弱" }}
+                  </button>
+                </div>
+                <button class="icon-button" type="button" :aria-label="`Remove ${label.tagId}`" @click="removeTag(label.tagId)">
+                  ×
+                </button>
+              </div>
+            </div>
+            <div class="exemplar-role-editor">
+              <div class="editor-section-heading">
+                <h3>Exemplar roles</h3>
+                <span>Gold-owned · optional</span>
+              </div>
+              <p class="salience-rubric">
+                Strong and weak roles require the matching label. Counterexamples require an
+                active tag that is absent from this gold.
+              </p>
+              <form class="exemplar-role-composer" @submit.prevent="addExemplarRole">
+                <label>
+                  <span>Kind</span>
+                  <select v-model="exemplarKind" @change="syncExemplarTag">
+                    <option value="strong">Strong</option>
+                    <option value="weak">Weak</option>
+                    <option value="counterexample">Counterexample</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Active tag</span>
+                  <select v-model="exemplarTagId" :disabled="!exemplarTagOptions.length">
+                    <option v-for="tag in exemplarTagOptions" :key="tag.id" :value="tag.id">
+                      {{ tag.id }}
+                    </option>
+                  </select>
+                </label>
+                <button class="button button--quiet" type="submit" :disabled="!exemplarTagId">
+                  Add role
+                </button>
+              </form>
+              <div v-if="draftExemplarRoles.length" class="exemplar-role-list">
+                <div v-for="role in draftExemplarRoles" :key="role.tagId" class="exemplar-role-row">
+                  <strong>{{ role.tagId }}</strong>
+                  <select
+                    :value="role.kind"
+                    :aria-label="`${role.tagId} exemplar kind`"
+                    @change="handleExemplarRoleKindChange(role.tagId, $event)"
+                  >
+                    <option v-for="kind in exemplarKindsForTag(role.tagId)" :key="kind" :value="kind">
+                      {{ kind }}
+                    </option>
+                  </select>
+                  <button
+                    class="icon-button"
+                    type="button"
+                    :aria-label="`Remove ${role.tagId} exemplar role`"
+                    @click="removeExemplarRole(role.tagId)"
+                  >×</button>
+                </div>
+              </div>
+            </div>
+            <div v-if="overlapWarnings.length" class="overlap-warning" role="status">
+              <strong>Same-tag overlap</strong>
+              <span v-for="warning in overlapWarnings" :key="`${warning.leftAnnotationId}:${warning.rightAnnotationId}:${warning.tagId}`">
+                {{ warning.tagId }} · {{ formatTime(warning.overlap.startMs) }}–{{ formatTime(warning.overlap.endMs) }}
+              </span>
+              <small>Valid and non-blocking. Review the neighboring gold sections.</small>
+            </div>
+          </section>
+
+          <section class="editor-section" aria-labelledby="foundation-heading">
+            <div class="editor-section-heading">
+              <h3 id="foundation-heading">Judgment Foundation</h3>
+              <span>r{{ session.foundation.revision }} · {{ directory?.manifest.currentFoundation.sha256.slice(0, 10) }}</span>
+            </div>
+            <details class="foundation-panel" @toggle="loadFoundationDetails">
+              <summary>
+                <strong>{{ session.foundation.tags.filter((tag) => tag.status === "active").length }} active</strong>
+                <span>{{ session.foundation.tags.filter((tag) => tag.status === "retired").length }} retired</span>
+              </summary>
+              <dl class="foundation-policy-grid">
+                <div><dt>Coordinates</dt><dd>source ms · half-open</dd></div>
+                <div><dt>Dataset</dt><dd>positive-only · overlap allowed</dd></div>
+                <div><dt>Evidence</dt><dd>explicit notes · multi-label</dd></div>
+                <div><dt>Audio</dt><dd>optional context only</dd></div>
+              </dl>
+              <p class="foundation-detail-status" role="status">
+                {{ foundationDetailsBusy ? "Loading canonical exemplar roles" : foundationDetailsMessage }}
+              </p>
+              <div class="foundation-tag-details">
+                <details
+                  v-for="tag in session.foundation.tags.filter((entry) => entry.status === 'active')"
+                  :key="tag.id"
+                >
+                  <summary><strong>{{ tag.id }}</strong><span>{{ exemplarViewsForTag(tag.id).length }} roles</span></summary>
+                  <p>{{ tag.definition }}</p>
+                  <div class="foundation-cue-list">
+                    <span>Include</span>
+                    <ul><li v-for="cue in tag.inclusionCues" :key="cue">{{ cue }}</li></ul>
+                  </div>
+                  <div v-if="tag.exclusionCues?.length" class="foundation-cue-list">
+                    <span>Exclude</span>
+                    <ul><li v-for="cue in tag.exclusionCues" :key="cue">{{ cue }}</li></ul>
+                  </div>
+                  <small v-if="tag.aliases.length">Aliases · {{ tag.aliases.join(", ") }}</small>
+                  <small v-if="tag.salienceClarification">Salience · {{ tag.salienceClarification }}</small>
+                  <ol v-if="exemplarViewsForTag(tag.id).length" class="foundation-exemplar-list">
+                    <li v-for="entry in exemplarViewsForTag(tag.id)" :key="`${entry.annotationId}:${entry.tagId}`">
+                      <strong>{{ entry.kind }}</strong>
+                      <span>{{ entry.sourceLabel }}</span>
+                      <small>{{ formatTime(entry.range.startMs) }}–{{ formatTime(entry.range.endMs) }}</small>
+                    </li>
+                  </ol>
+                </details>
+              </div>
+            </details>
+          </section>
+
+          <section class="editor-section">
+            <label class="field-stack">
+              <span>Judgment note, optional</span>
+              <textarea
+                v-model="judgmentNote"
+                rows="3"
+                @focus="beginTextEdit"
+                @input="markDraft()"
+                @blur="finishTextEdit"
+              ></textarea>
+            </label>
+            <div class="commit-actions">
+              <button
+                v-if="draftRecoveryVisible"
+                class="button button--quiet discard-button"
+                type="button"
+                :disabled="operationLocked"
+                @click="discardDraft"
+              >
+                Discard draft
+              </button>
+              <button
+                class="button button--primary commit-button"
+                type="button"
+                :disabled="operationLocked || draftCleanupBlocked"
+                @click="commitAnnotation"
+              >
+                {{ editingAnnotationId ? "Update gold" : "Commit gold" }}
+                <span class="button-shortcut" aria-hidden="true">↵</span>
+              </button>
+            </div>
+          </section>
+
+          <section class="editor-section existing-section" aria-labelledby="existing-heading">
+            <div class="editor-section-heading">
+              <h3 id="existing-heading">Existing annotations</h3>
+              <span>Gold</span>
+            </div>
+            <div v-if="annotationList.length" class="annotation-list">
+              <article v-for="annotation in annotationList" :key="annotation.id" class="annotation-row">
+                <button class="annotation-seek" type="button" @click="seekAnnotation(annotation)">
+                  <strong>{{ formatTime(annotation.range.startMs) }}</strong>
+                  <span>{{ formatTime(annotation.range.endMs) }}</span>
+                </button>
+                <div class="annotation-labels">
+                  <span v-for="label in annotation.labels" :key="label.tagId">
+                    {{ label.tagId }} {{ label.salience }}
+                  </span>
+                  <span
+                    v-for="role in annotation.exemplarRoles"
+                    :key="`role-${role.tagId}`"
+                    class="annotation-role"
+                  >{{ role.tagId }} · {{ role.kind }}</span>
+                </div>
+                <div class="annotation-row-actions">
+                  <button type="button" @click="playAnnotation(annotation)">Play</button>
+                  <button type="button" @click="editAnnotation(annotation)">Edit</button>
+                  <button type="button" @click="deleteAnnotation(annotation)">Delete</button>
+                </div>
+              </article>
+            </div>
+            <p v-else class="empty-copy">No gold sections saved for this chart.</p>
+          </section>
+
+          <section class="editor-section" aria-labelledby="review-notes-heading">
+            <div class="editor-section-heading">
+              <h3 id="review-notes-heading">Review notes</h3>
+              <span>{{ openReviewNoteCount }} open</span>
+            </div>
+            <form class="review-note-form" @submit.prevent="addReviewNote">
+              <label class="field-stack">
+                <span>Expert observation · excluded from releases</span>
                 <textarea
-                  v-model="judgmentNote"
+                  v-model="reviewNoteText"
                   rows="3"
-                  @focus="beginTextEdit"
-                  @input="markDraft()"
-                  @blur="finishTextEdit"
+                  required
+                  @input="markReviewNoteDraft"
                 ></textarea>
               </label>
-              <div class="commit-actions">
-                <button
-                  v-if="draftRecoveryVisible"
-                  class="button button--quiet discard-button"
-                  type="button"
-                  :disabled="operationLocked"
-                  @click="discardDraft"
-                >
-                  Discard draft
-                </button>
-                <button
-                  class="button button--primary commit-button"
-                  type="button"
-                  :disabled="operationLocked || draftCleanupBlocked"
-                  @click="commitAnnotation"
-                >
-                  {{ editingAnnotationId ? "Update gold" : "Commit gold" }}
-                  <span class="button-shortcut" aria-hidden="true">↵</span>
-                </button>
-              </div>
-            </section>
+              <label class="review-note-selection">
+                <input
+                  v-model="reviewNoteIncludeSelection"
+                  type="checkbox"
+                  @change="markReviewNoteDraft"
+                />
+                <span>Attach current valid range and selected notes</span>
+              </label>
+              <button class="button button--quiet" type="submit">Add review note</button>
+            </form>
+            <div v-if="reviewNotes.length" class="review-note-list">
+              <article v-for="note in reviewNotes" :key="note.id" class="review-note-row">
+                <div>
+                  <strong>{{ note.state }}</strong>
+                  <span v-if="note.range">{{ formatTime(note.range.startMs) }}–{{ formatTime(note.range.endMs) }}</span>
+                </div>
+                <p>{{ note.text }}</p>
+                <div class="review-note-actions">
+                  <button v-if="note.range" type="button" @click="seekReviewNote(note.id)">Seek</button>
+                  <button v-if="note.state === 'open'" type="button" @click="resolveReviewNote(note.id)">Resolve</button>
+                </div>
+              </article>
+            </div>
+            <p v-if="qualityMessage" class="quality-message" role="status">{{ qualityMessage }}</p>
+          </section>
 
-            <section class="editor-section existing-section" aria-labelledby="existing-heading">
-              <div class="editor-section-heading">
-                <h3 id="existing-heading">Existing annotations</h3>
-                <span>Gold</span>
-              </div>
-              <div v-if="annotationList.length" class="annotation-list">
-                <article v-for="annotation in annotationList" :key="annotation.id" class="annotation-row">
-                  <button class="annotation-seek" type="button" @click="seekAnnotation(annotation)">
-                    <strong>{{ formatTime(annotation.range.startMs) }}</strong>
-                    <span>{{ formatTime(annotation.range.endMs) }}</span>
-                  </button>
-                  <div class="annotation-labels">
-                    <span v-for="label in annotation.labels" :key="label.tagId">
-                      {{ label.tagId }} {{ label.salience }}
-                    </span>
-                    <span
-                      v-for="role in annotation.exemplarRoles"
-                      :key="`role-${role.tagId}`"
-                      class="annotation-role"
-                    >{{ role.tagId }} · {{ role.kind }}</span>
-                  </div>
-                  <div class="annotation-row-actions">
-                    <button type="button" @click="playAnnotation(annotation)">Play</button>
-                    <button type="button" @click="editAnnotation(annotation)">Edit</button>
-                    <button type="button" @click="deleteAnnotation(annotation)">Delete</button>
-                  </div>
-                </article>
-              </div>
-              <p v-else class="empty-copy">No gold sections saved for this chart.</p>
-            </section>
+          <section class="editor-section completion-section" aria-labelledby="completion-heading">
+            <div class="editor-section-heading">
+              <h3 id="completion-heading">Chart review</h3>
+              <span>{{ session.document.reviewState }}</span>
+            </div>
+            <p class="empty-copy">
+              Completion requires no draft, no open review note, and no pending silver prediction.
+            </p>
+            <div class="completion-facts">
+              <span :class="{ 'is-clear': !hasUncommittedDraft }">Draft · {{ hasUncommittedDraft ? "open" : "clear" }}</span>
+              <span :class="{ 'is-clear': !openReviewNoteCount }">Notes · {{ openReviewNoteCount }}</span>
+              <span :class="{ 'is-clear': !pendingPredictionCount }">
+                Silver · {{ pendingPredictionCount }}
+              </span>
+            </div>
+            <button
+              class="button button--primary completion-button"
+              type="button"
+              :disabled="session.document.reviewState === 'complete'"
+              @click="markChartComplete"
+            >{{ session.document.reviewState === "complete" ? "Chart complete" : "Mark chart complete" }}</button>
+          </section>
 
-            <section class="editor-section" aria-labelledby="review-notes-heading">
-              <div class="editor-section-heading">
-                <h3 id="review-notes-heading">Review notes</h3>
-                <span>{{ openReviewNoteCount }} open</span>
-              </div>
-              <form class="review-note-form" @submit.prevent="addReviewNote">
-                <label class="field-stack">
-                  <span>Expert observation · excluded from releases</span>
-                  <textarea
-                    v-model="reviewNoteText"
-                    rows="3"
-                    required
-                    @input="markReviewNoteDraft"
-                  ></textarea>
-                </label>
-                <label class="review-note-selection">
-                  <input
-                    v-model="reviewNoteIncludeSelection"
-                    type="checkbox"
-                    @change="markReviewNoteDraft"
-                  />
-                  <span>Attach current valid range and selected notes</span>
-                </label>
-                <button class="button button--quiet" type="submit">Add review note</button>
-              </form>
-              <div v-if="reviewNotes.length" class="review-note-list">
-                <article v-for="note in reviewNotes" :key="note.id" class="review-note-row">
-                  <div>
-                    <strong>{{ note.state }}</strong>
-                    <span v-if="note.range">{{ formatTime(note.range.startMs) }}–{{ formatTime(note.range.endMs) }}</span>
-                  </div>
-                  <p>{{ note.text }}</p>
-                  <div class="review-note-actions">
-                    <button v-if="note.range" type="button" @click="seekReviewNote(note.id)">Seek</button>
-                    <button v-if="note.state === 'open'" type="button" @click="resolveReviewNote(note.id)">Resolve</button>
-                  </div>
-                </article>
-              </div>
-              <p v-if="qualityMessage" class="quality-message" role="status">{{ qualityMessage }}</p>
-            </section>
-
-            <section class="editor-section completion-section" aria-labelledby="completion-heading">
-              <div class="editor-section-heading">
-                <h3 id="completion-heading">Chart review</h3>
-                <span>{{ session.document.reviewState }}</span>
-              </div>
-              <p class="empty-copy">
-                Completion requires no draft, no open review note, and no pending silver prediction.
-              </p>
-              <div class="completion-facts">
-                <span :class="{ 'is-clear': !hasUncommittedDraft }">Draft · {{ hasUncommittedDraft ? "open" : "clear" }}</span>
-                <span :class="{ 'is-clear': !openReviewNoteCount }">Notes · {{ openReviewNoteCount }}</span>
-                <span :class="{ 'is-clear': !pendingPredictionCount }">
-                  Silver · {{ pendingPredictionCount }}
-                </span>
+          <section class="editor-section release-section" aria-labelledby="release-heading">
+            <div class="editor-section-heading">
+              <h3 id="release-heading">Gold release</h3>
+              <span>Canonical complete charts only</span>
+            </div>
+            <button class="button button--quiet release-preview-button" type="button" @click="previewGoldRelease">
+              Build release preview
+            </button>
+            <p v-if="releaseMessage" class="quality-message" role="status">{{ releaseMessage }}</p>
+            <div v-if="releasePreview" class="release-preview">
+              <dl>
+                <div><dt>Documents</dt><dd>{{ releasePreview.manifest.documentCount }}</dd></div>
+                <div><dt>Sections</dt><dd>{{ releasePreview.manifest.annotationCount }}</dd></div>
+                <div><dt>Salience 2 / 1</dt><dd>{{ releasePreview.manifest.salienceCounts["2"] }} / {{ releasePreview.manifest.salienceCounts["1"] }}</dd></div>
+                <div><dt>Median / p90</dt><dd>{{ formatMs(releasePreview.manifest.durationDistribution.medianMs) }} / {{ formatMs(releasePreview.manifest.durationDistribution.p90Ms) }} ms</dd></div>
+                <div><dt>Foundations</dt><dd>{{ releasePreview.manifest.foundationDigests.length }}</dd></div>
+              </dl>
+              <div v-if="releaseTagCounts.length" class="release-tags">
+                <span v-for="[tagId, count] in releaseTagCounts" :key="tagId">{{ tagId }} · {{ count }}</span>
               </div>
               <button
-                class="button button--primary completion-button"
+                class="button button--primary"
                 type="button"
-                :disabled="session.document.reviewState === 'complete'"
-                @click="markChartComplete"
-              >{{ session.document.reviewState === "complete" ? "Chart complete" : "Mark chart complete" }}</button>
-            </section>
-
-            <section class="editor-section release-section" aria-labelledby="release-heading">
-              <div class="editor-section-heading">
-                <h3 id="release-heading">Gold release</h3>
-                <span>Canonical complete charts only</span>
-              </div>
-              <button class="button button--quiet release-preview-button" type="button" @click="previewGoldRelease">
-                Build release preview
+                @click="confirmGoldRelease"
+              >
+                Confirm and write export
               </button>
-              <p v-if="releaseMessage" class="quality-message" role="status">{{ releaseMessage }}</p>
-              <div v-if="releasePreview" class="release-preview">
-                <dl>
-                  <div><dt>Documents</dt><dd>{{ releasePreview.manifest.documentCount }}</dd></div>
-                  <div><dt>Sections</dt><dd>{{ releasePreview.manifest.annotationCount }}</dd></div>
-                  <div><dt>Salience 2 / 1</dt><dd>{{ releasePreview.manifest.salienceCounts["2"] }} / {{ releasePreview.manifest.salienceCounts["1"] }}</dd></div>
-                  <div><dt>Median / p90</dt><dd>{{ formatMs(releasePreview.manifest.durationDistribution.medianMs) }} / {{ formatMs(releasePreview.manifest.durationDistribution.p90Ms) }} ms</dd></div>
-                  <div><dt>Foundations</dt><dd>{{ releasePreview.manifest.foundationDigests.length }}</dd></div>
-                </dl>
-                <div v-if="releaseTagCounts.length" class="release-tags">
-                  <span v-for="[tagId, count] in releaseTagCounts" :key="tagId">{{ tagId }} · {{ count }}</span>
-                </div>
-                <button
-                  class="button button--primary"
-                  type="button"
-                  @click="confirmGoldRelease"
-                >
-                  Confirm and write export
-                </button>
-              </div>
-            </section>
-          </fieldset>
-          <div v-else-if="readonlyTask" class="rail-empty readonly-rail-copy">
-            This future-version annotation is inspectable only. Choose another chart to continue
-            gold editing.
-          </div>
-          <div v-else class="rail-empty">Select a chart to begin.</div>
-        </aside>
-      </div>
-    </template>
+            </div>
+          </section>
+        </fieldset>
+        <div v-else-if="readonlyTask" class="rail-empty readonly-rail-copy">
+          This future-version annotation is inspectable only. Choose another chart to continue
+          gold editing.
+        </div>
+        <div v-else class="rail-empty">Select a chart to begin.</div>
+      </template>
+
+      <template #status>
+        <span v-if="session" class="status-item audio-status" :class="`audio-status--${audioStatus.kind}`" role="status">
+          {{ audioStatusText }}
+        </span>
+        <span v-if="session" class="status-item">Visual speed <b>{{ visualSpeed }} px/s</b></span>
+        <span v-if="session" class="status-item status-optional">Offset <b>{{ audioOffsetMs }} ms</b></span>
+        <span class="status-item">Progress <b>{{ progress.complete }} / {{ progress.total }}</b></span>
+        <span class="status-item status-item--end status-item--path">
+          {{ directory?.manifest.name ?? "Local dataset" }}
+        </span>
+      </template>
+    </WorkspaceFrame>
   </main>
 </template>

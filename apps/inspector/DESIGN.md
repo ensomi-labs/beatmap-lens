@@ -1,153 +1,196 @@
 # Beatmap Lens Inspector design language
 
-- Version: v1.4
-- Status: 已审批
-- Approved: 2026-08-05
+- Version: v2.0
+- Status: proposed; replaces the theme and layout of v1.4 (approved 2026-08-05). The interaction
+  rules of v1.4 that this version keeps are marked as kept.
+- Research behind it: the commons research note `inspector-daw-ui-20261026` (professional audio
+  tools' conventions, the Inspector before the change, and the reasons for each decision).
 
 ## 1. Visual theme and atmosphere
 
-The Inspector is a precision paper lab: a high-key workspace with quiet white surfaces,
-graphite typography, and a small cobalt signal color. The application chrome stays restrained so
-the dark beatmap render can become the single rich visual anchor when it is present.
+The Inspector is a dark audio workstation for charts: a few grey levels that separate the data from
+the chrome, one blue accent for state, and saturated colour kept for data (proposals, notes, the
+playhead). The data view is the darkest and largest region; chrome gets lighter the closer it is to
+the hand. Every open workspace shares one frame, so moving between modes keeps the toolbar, panes
+and status bar in the same places.
 
-The interface is precise, calm, and kinetic. It should feel like a focused inspection instrument,
-not a generic analytics dashboard or a collection of cards.
+The interface is dense, precise and quiet. It should feel like Logic, Pro Tools or REAPER in a
+browser, not a dashboard or a collection of cards.
 
-## 2. Color palette and roles
+## 2. Colour palette and roles
+
+Strata, darkest first. Data views sit in the well; panes, headers and controls step up.
 
 | Token | Value | Role |
 | --- | --- | --- |
-| Canvas | `oklch(96% 0.008 255)` | Cool paper surrounding the work surface |
-| Surface | `oklch(100% 0 0)` | Primary workspace |
-| Surface quiet | `oklch(97.5% 0.006 255)` | Editor and inset controls |
-| Ink | `oklch(21% 0.018 255)` | Primary text and primary action |
-| Ink secondary | `oklch(43% 0.018 255)` | Supporting labels |
-| Ink muted | `oklch(59% 0.014 255)` | Tertiary metadata |
-| Signal | `oklch(57% 0.21 258)` | Focus, selected states, and active status |
-| Success | `oklch(59% 0.15 153)` | Ready pipeline state |
-| Warning | `oklch(69% 0.16 76)` | Diagnostics present |
-| Danger | `oklch(60% 0.2 27)` | Pipeline failure |
+| `--seam` | `oklch(14% 0.012 255)` (`#06090e`) | 1 px boundaries between regions, segmented wells |
+| `--well` | `oklch(20.5% 0.02 249)` (`#101820`) | Data views: Timing's stage, falling notes, Compare, Inspect's render |
+| `--field` | `oklch(19% 0.012 255)` | Text fields, the time counter, lists inset in a pane |
+| `--surface-1` | `oklch(23.5% 0.013 255)` | Side panes, the vertical timeline |
+| `--surface-2` | `oklch(26.5% 0.014 255)` | Toolbar, status bar, pane and section headers, a view's own bar |
+| `--surface-3` | `oklch(31.5% 0.014 255)` | Controls (buttons, segments) |
+| `--ink` | `oklch(93% 0.006 255)` | Primary text and values |
+| `--ink-secondary` | `oklch(78% 0.01 255)` | Labels, control text |
+| `--ink-muted` | `oklch(64% 0.012 255)` | Units, captions, counts; never on a control |
+| `--signal` | `oklch(72% 0.14 255)` (`#65a7fa`) | Focus, selection outline, accent text |
+| `--signal-fill` | `oklch(52% 0.16 258)` (`#2466c3`) | Filled "on" states: pressed segments, primary actions |
+| `--success` | `oklch(76% 0.15 153)` | Ready, saved; `--success-fill` while playing |
+| `--warning` | `oklch(83% 0.14 80)` | Diagnostics, notices that need a look |
+| `--danger` | `oklch(72% 0.17 25)` | Errors; the playhead |
 
-Neutrals carry a faint cool tint. Signal color is used as status ink, never as a decorative wash.
+Colour has roles. The accent marks focus, selection and toggles that are on. Play is green while
+it plays. Amber warns and red is an error or the playhead. On a data view, hue belongs to the data:
+Timing's proposal palette (`src/timing/palette.ts`, which leaves out red, white and grey) and the
+listener's own marks in white. A selected Timing mark is white, heavier and cased in the seam
+colour, with a faint accent wash either side of its line (as a selection drag) and an accent plate
+behind its glyph; the line itself is never a palette colour.
+
+Measured contrast on `--surface-1`: ink 13.6:1, secondary 8.4:1, muted 5.0:1, signal 6.7:1; white
+on `--signal-fill` 5.6:1. Muted ink on a control would be 3.9:1, so controls use secondary ink.
 
 ## 3. Typography rules
 
-- Interface text uses the native sans stack for fast, familiar controls and compact reading.
-- `Azeret Mono Variable` is reserved for the product mark, indexes, source, statuses, and numbers.
-- Display title: 30px, weight 650, line-height 1.08, letter-spacing `-0.022em`.
-- Section title: 13px, weight 650, line-height 1.25.
-- Body: 13px to 14px, weight 450 to 550, line-height 1.5.
-- Data: 11px to 13px, weight 520 to 650, tabular numerals.
-- Headings use balanced wrapping. Descriptions use pretty wrapping. Code keeps natural wrapping.
+- Interface text uses the native sans stack; `Azeret Mono Variable` carries numbers, times,
+  sample indexes, identifiers and file paths, always with tabular figures.
+- Sizes in px: 10 (units, captions, key hints), 11 (labels, rows, toolbar and status text),
+  12 (body), 13 (reading text, section titles in a view), 15 (the time counter).
+- Weights 450 to 650. Headings in panes are 11 px, weight 650, secondary ink.
+- No rem fractions; use the `--text-*` tokens.
 
 ## 4. Component styling
 
-- Buttons use a fixed 10px radius and a 40px minimum hit area. Primary buttons are graphite,
-  quiet buttons are white with a layered hairline shadow. Hover changes color and shadow; press
-  scales to `0.96` with an interruptible transition.
-- The workspace is one continuous surface. Internal regions use structural 1px dividers instead of
-  becoming separate cards.
-- Textareas use a quiet inset surface and 14px radius. The surrounding 8px gutter produces a 22px
-  concentric outer relationship.
-- Statuses pair a small color dot with text. Color is never the only indicator.
-- Inspect, onboarding, and read-only beatmap previews are inset rich surfaces with an 8px gutter,
-  22px outer radius, and 14px inner radius. The active Annotate evidence view is the deliberate
-  exception: its falling-note viewport is flush, full browser height, and separated from adjacent
-  rails by structural 1px dividers.
-- The active vertical timeline uses a low-contrast selection fill with no visible resize handles,
-  caps, or heavy outline. Transparent 40px hit zones preserve precision, while selection start and
-  end labels use tabular numerals and `mm:ss.s` display precision.
+- **Tool button** (`.tool-button`): 24 px tall, 4 px radius, `--surface-3` with a 1 px dark ring,
+  11 px weight 600. Pressed (`aria-pressed="true"`) uses the accent's soft fill and outline;
+  primary uses `--signal-fill`; Play while playing uses `--success-fill`. Icons are 14 px strokes.
+  A key hint sits inside as `<kbd>` at 10 px.
+- **Segmented** (`.segmented`): one seam-coloured well with 22 px segments; the chosen one is filled
+  with `--signal-fill`. Used for rate, zoom, view and nudge steps.
+- **Fields**: 26 px, `--field` with a 1 px `--field-edge` ring, focus ring in `--signal`.
+- **Time counter** (`.time-counter`): a recessed 30 px box with the main time at 15 px and a
+  secondary value (sample index, range) at 10 px; `contain: layout paint`, so the per-frame update
+  never relays out the toolbar.
+- **Panel section** (`PanelSection.vue`): a 28 px header in `--surface-2` whose title is a disclosure
+  button (the APG accordion); the browser remembers which sections are open. A section a save may
+  need to focus is not collapsible.
+- **Rows**: lists use 24 to 26 px rows divided by 1 px lines; the selected row has the accent's soft
+  fill and a 2 px accent bar on its leading edge.
+- **Notice bar**: a full-width strip under a view's bar, amber for warnings, red for errors, with a
+  dot and text, and at its end the tool buttons that act on it (Timing's Reopen audio). A warning
+  about a setting in a side pane goes here, not only in the pane, which may be hidden or closed.
+- **Status**: a coloured dot plus text; colour is never the only indicator.
+- **Radii**: 3 to 6 px. No cards, no gradients, no glass.
 
 ## 5. Layout principles
 
-- Desktop: source column, flexible preview, optional details column.
-- The preview owns the most width and remains the main visual anchor.
-- Metadata appears in line-based rails with aligned labels and tabular values.
-- Spacing scale: 4, 8, 12, 16, 24, 32px. Dense rows use vertical space sparingly and columns get
-  the larger gaps.
-- An active Annotate session uses a `100dvh` grid in this order: source rail, falling-note viewport,
-  vertical timeline, details rail. The falling-note SVG and timeline share the exact top and bottom
-  edges of the browser viewport; neither an app bar, stage header, nor bottom transport subtracts
-  from their height.
-- The active timeline touches the viewport's right edge through a 1px divider. It is 64px wide on
-  desktop, 56px below 1160px, and 48px in mobile Preview.
-- Timeline time runs upward: the bottom is song start at `0ms`, the top is song end at
-  `chartEndMs`. Density, playhead, viewport window, saved ranges, selection geometry, pointer
-  mapping, and labels all use this reversed Y-axis rather than a CSS rotation.
-- Active-session chrome is redistributed instead of stacked vertically: identity and mode live in
-  the source rail, save and transport controls live in a sticky details section, and chart identity
-  plus playhead live in passive viewport HUD chips.
-- Section Review keeps five compact horizontal assessment sliders together in the details rail.
-  Each slider has three discrete positions: Absent, Supporting, and Prominent. Unreviewed and
-  Unresolved stay visibly distinct from those positions. One section action submits all assessed
-  dimensions; per-tag evidence is expandable below, and choosing it preserves the whole draft.
-- Each section label has an independent High confidence checkbox beside its slider.
-  New drafts start unchecked (Low); historical omissions remain unchecked and their
-  saved history identifies confidence as unspecified. Confidence-only edits use the same single section save and
-  append-only history. Changing assessment, scope, tag or playback rate resets draft
-  confidence to Low; evidence-only edits do not redefine label certainty.
-- Connected Review provides a Golden set view with label, strength, and chart filters.
-  Its read-only source previews pair current High-confidence judgments with human
-  comments and Foundation criteria. A link beside section sliders opens references
-  in another tab so the active human draft remains in place.
-- Connected chart review exposes saved history and its version selector in the source rail.
-  A version identifies skill name, revision, and content hash; identical bytes do not hide named
-  revisions. Earlier human records remain inspectable and editable through append-only revisions.
+Every open workspace is a `WorkspaceFrame` (`src/layout/`):
+
+| Region | Size | Holds |
+| --- | --- | --- |
+| Toolbar | 40 px | Product glyph and mode tabs; the document's identity; transport; time counter; global state and the primary document action; panel toggles at the trailing edge |
+| Left pane | resizable | Lists: passages, task queue, excerpts, source text, files |
+| Main view | the rest | A view's own bar (identity, view-local controls), notices, then the data view in the well |
+| Right pane | resizable | An inspector of collapsible sections |
+| Status bar | 24 px | Passive facts that do not change while playing: zoom, rate, loop, offset, file |
+
+- The main view cannot be hidden. Side panes are hidden from the toolbar toggles, by Enter on their
+  boundary, or by dragging the boundary 56 px past the narrowest width.
+- Pane widths (CSS px, default, min to max; at most 38 % of the window, a limit the boundary's
+  widest width and reported value follow, so no key press or drag goes unseen):
+
+  | Mode | Left | Right |
+  | --- | --- | --- |
+  | Timing | Passages 232, 168–420 | Marks and settings 320, 268–520 |
+  | Annotate | Task queue 260, 180–440 | Playback and judgment 340, 280–560 |
+  | Review | Files and queue 260, 200–460 | Section judgments 380, 300–600 |
+  | Compare | Excerpts 248, 180–420 | Verdict and listening 300, 248–480 |
+  | Inspect | Source 420, 240–720 | Details 300, 220–480 |
+
+- Widths and hidden states are stored per workspace in `localStorage` under `lens-layout:<mode>`,
+  read and written inside `try`/`catch`; Timing's passage list keeps its `passagesHidden`
+  preference.
+- Spacing is on a 4 px grid: 4 and 8 px inside panes, 8 and 12 px between groups. Regions are
+  separated by 1 px seams, not by gutters.
+- Annotate's main view is the falling-note view with the vertical timeline at its right edge, both
+  the full height between toolbar and status bar. The timeline is 64 px wide (56 px below 1160 px,
+  48 px in narrow windows). Kept from v1.4: time runs upward on the timeline (bottom is `0ms`, top
+  is `chartEndMs`); density, playhead, viewport window, saved ranges, selection and pointer mapping
+  all use that reversed axis without a CSS rotation.
+- Kept from v1.4: Section Review keeps five horizontal assessment sliders (Absent, Supporting,
+  Prominent, with Unreviewed and Unresolved distinct) and an independent High confidence checkbox
+  per label; one section action submits all assessed dimensions; per-tag evidence expands below.
+  Connected Review offers the golden set with label, strength and chart filters, and saved history
+  with its version selector.
+- Workspaces that are not open yet (onboarding forms) keep a two-column intro and form under a bar
+  laid out like the toolbar.
 
 ## 6. Depth and elevation
 
-- Canvas to workspace is a 4% lightness step. The full-width workspace stays flat and continuous.
-- Elevated controls use three layers: a translucent 1px ring, a short contact shadow, and a soft
-  ambient shadow.
-- Borders are reserved for dividers and table-like rows. There are no decorative card borders.
-- The rendered SVG gets a 10% inset outline so its dark edge remains crisp against the white shell.
+- Depth is lightness, not shadow: each stratum is a fixed step lighter than the one below it.
+- Controls have one ring (`--shadow-control`: a 1 px dark outline and a faint top highlight).
+- Borders are 1 px seams between regions and 1 px lines between rows. No decorative borders.
 
-## 7. Do and do not
+## 7. Interaction rules
 
-- Do keep the application shell white and the beatmap itself visually rich.
-- Do use monospaced type only for technical identity and changing data.
-- Do keep state transitions short, interruptible, and transform or opacity based.
-- Do preserve the editor, keyboard shortcut, error state, facts, and full pipeline detail.
-- Do align numeric values on a stable right edge.
-- Do route active timeline gestures by their start target: dragging a selection highlight moves the
-  selection, while dragging the timeline background or viewport window navigates the main view.
-- Do support macOS Three Finger Drag through that same selection pointer-drag path. The browser does
-  not expose a reliable trackpad finger count, so mouse drag remains the equivalent accessible path.
-- Do keep ordinary two-finger wheel gestures free of timeline state changes. Pinch or
-  `Control + wheel` zooms around the pointer time; `Shift + drag` creates a selection and
-  `Control + drag` adjusts its body or invisible edges.
-- Do make the timeline root keyboard-focusable with the standard visible focus treatment and an
-  accessible name that states "bottom is song start, top is song end." Zoom in, Zoom out, and Fit
-  are real labeled buttons; `+`, `-`, and `0` only act while the timeline or those controls have
-  focus. Selection start and end times must exist as accessible text, not only SVG paint.
-- Do not add gradients, glass surfaces, thick accent rails, or a grid of equal cards.
-- Do not use accent color for large backgrounds.
-- Do not hide ordinary overflow in a modal.
-- Do not animate layout properties or use `transition: all`.
+- **Boundaries** (`PaneSplitter.vue`) are the APG window splitter: a focusable `separator` whose
+  value is the pane width, with `aria-controls` naming the pane. Left and Right resize by 16 px
+  (Shift: 64 px), Home and End go to the narrowest and widest width, Enter hides and restores the
+  pane, double-click restores the default width. The 1 px seam has a 9 px grab area over the pane,
+  never the main view (beside a hidden pane it lies over the main view), and lights after a 200 ms
+  hover, at once on focus or while dragging. Drags resize at most once per frame.
+- A mouse press on a boundary does not take keyboard focus, so a workspace's window-wide shortcuts
+  (Timing's arrows and Enter) keep working after a drag.
+- Panel toggles are icon buttons named "Hide <pane>" / "Show <pane>" with `aria-expanded`.
+- Every control keeps a keyboard path, `aria-keyshortcuts` where a key exists, and a title naming
+  the key.
+- Timing keeps all of its behaviour: proposals are anonymous and never audible; names only after
+  a save and a reveal; Beat and Unbeat buttons are timed by their press; the marks list shows
+  0.001 ms and the sample index; the README's shortcuts and gestures are the contract.
+- Text fields keep the keys typed into them, so a workspace's window-wide shortcuts never fire
+  from a field; Esc gives the keys back, and an IME's Enter and Esc stay with the composition.
+  Timing's inspector puts Notes (this passage, the whole session) after Marks; notes are optional
+  and no key opens them.
+- On Timing's stage the middle button and Option+click locate the playhead (the listener's own
+  binding: left, right, Shift and Cmd already belong to marks). While playing, the target is the
+  hover line drawn dashed in the playhead red, and the release restarts playback once.
+- Nothing that updates during playback may change layout: the toolbar counter is the only text
+  that changes per frame besides the stage, and it is contained.
+- Kept from v1.4: active timeline gestures are routed by their start target; Shift+drag creates a
+  selection and Control+drag adjusts it; pinch or Control+wheel zooms at the pointer; ordinary
+  two-finger wheel never changes timeline state; `+`, `-` and `0` act only while the timeline or its
+  zoom buttons have focus; selection start and end exist as accessible text.
 
-## 8. Responsive behavior
+## 8. Do and do not
 
-- Above 920px, source, preview, and optional details are visible as columns.
-- At 920px and below, a compact three-view switch shows Source, Preview, or Details in the same
-  workspace position so the preview is never pushed below a long editor.
-- In an active mobile Annotate Preview, the view switch is a fixed overlay and does not consume
-  layout height. The falling-note viewport plus 48px timeline remain `100dvh`; any compact transport
-  overlays the preview without resizing the SVG or covering the judgment line.
-- At 375px, controls retain 40px hit areas, the chart title remains readable, and metadata becomes a
-  two-column rail.
-- Safe-area insets apply to the outer app shell.
+- Do keep the data view the darkest, largest region and the only place with saturated colour.
+- Do put a view's own controls (rate, zoom, follow, visual speed) in the bar directly above it,
+  and passive facts in the status bar.
+- Do use monospaced type only for numbers, times and identifiers.
+- Do keep transitions short and on colour, opacity or transform; never animate layout or use
+  `transition: all`.
+- Do not use the accent for large backgrounds or as a data colour.
+- Do not add cards, gradients, glass, thick accent rails or rounded containers inside panes.
+- Do not add per-frame reactive work during playback.
 
-## 9. Agent prompt guide
+## 9. Responsive behavior
 
-- "Add an Inspector control on white `oklch(100% 0 0)`, 40px tall, 10px radius, 13px weight 600,
-  graphite `oklch(21% 0.018 255)`, with an interruptible `scale(.96)` press state."
-- "Add an inset technical panel with an 8px quiet gutter `oklch(97.5% 0.006 255)`, 22px outer
-  radius, 14px inner radius, and no decorative border."
-- "Add a metric row with a left-aligned native-sans label at 11px and a right-aligned Azeret Mono
-  value at 12px using tabular numerals and a 1px structural divider."
-- "Add a status using a semantic color dot plus text, with ready `oklch(59% 0.15 153)`, warning
-  `oklch(69% 0.16 76)`, and danger `oklch(60% 0.2 27)`."
-- "Build the active Annotate shell as a flat `100dvh` grid: source rail, flexible dark falling-note
-  viewport, 64px vertical timeline, details rail. Use 1px dividers, no vertical preview gutter, no
-  bottom layout strip, passive HUD over the viewport, and a low-contrast handle-free selection
-  highlight on a bottom-start/top-end timeline."
+- At 920 px and below the frame shows one region at a time, chosen by a Source, Preview and
+  Details switch under the toolbar; boundaries and panel toggles are not shown, and the toolbar
+  wraps.
+- Timing needs a window wider than 920 px and says so instead.
+- Below 1240 px the toolbar drops its optional items (identity, the duplicate Beat button), views'
+  bars drop their group labels, their time range and the word before the number ("02 of 6"), and
+  the status bar drops optional facts. A view's bar keeps its flags and its hint, truncated, with
+  the whole identity as its title; its height does not depend on the hint.
+- Controls keep at least 24 CSS px hit areas (WCAG 2.2 SC 2.5.8). Safe-area insets apply to the
+  toolbar and status bar.
+
+## 10. Agent prompt guide
+
+- "Add a toolbar control: `.tool-button`, 24 px, `--surface-3`, 11 px weight 600, `aria-pressed`
+  for a toggle, a `<kbd>` hint and a title naming its key."
+- "Add an inspector section: `<PanelSection id title>` in the right pane; rows of
+  `.prop-row` (label left, value right in Azeret Mono with tabular figures)."
+- "Add a passive fact to the status bar: `<span class="status-item">Label <b>value</b></span>`;
+  mark it `status-optional` if it may drop below 1240 px."
+- "Add a workspace: `<WorkspaceFrame layout-key mode :left :right>` with `#toolbar`,
+  `#toolbar-end`, `#left`, `#main`, `#right` and `#status` slots and `PaneSpec`s for its panes."

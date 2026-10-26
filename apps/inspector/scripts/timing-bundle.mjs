@@ -59,7 +59,8 @@ await writeFile(
   join(out, "README.txt"),
   "Beatmap Lens Inspector, timing mode. Needs Node 22.18+ or 24+, nothing else.\n\n" +
     "  node server/timing-server.ts --session /path/to/session.timing.json --port 4177\n\n" +
-    "Open the printed address. Marks append to <session>.timing.marks.jsonl beside the session.\n",
+    "Open the printed address. Marks append to <session>.timing.marks.jsonl and the session note\n" +
+    "to <session>.timing.notes.jsonl, beside the session.\n",
 );
 process.stdout.write(
   `Timing bundle written to ${out}\n${files.map((file) => `  ${relative(app, file)}`).join("\n")}\n  dist/\n`,

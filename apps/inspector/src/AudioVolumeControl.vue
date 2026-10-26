@@ -23,7 +23,7 @@ const emit = defineEmits<{ "update:modelValue": [value: number] }>();
 <style scoped>
 .audio-volume-control {
   display: grid;
-  gap: 4px;
+  gap: 0;
   min-width: 0;
 }
 
@@ -31,17 +31,22 @@ const emit = defineEmits<{ "update:modelValue": [value: number] }>();
   display: flex;
   justify-content: space-between;
   align-items: center;
-  font-size: 12px;
+  color: var(--ink-secondary);
+  font-size: var(--text-xs);
 }
 
 .audio-volume-control output {
+  color: var(--ink-muted);
+  font-family: var(--font-data);
+  font-size: var(--text-2xs);
   font-variant-numeric: tabular-nums;
 }
 
 .audio-volume-control input {
   width: 100%;
-  min-height: 40px;
+  min-height: var(--control-h-sm);
   margin: 0;
   padding: 0;
+  accent-color: var(--signal-fill);
 }
 </style>

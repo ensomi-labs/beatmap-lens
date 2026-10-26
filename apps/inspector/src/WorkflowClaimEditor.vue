@@ -172,22 +172,22 @@ function copyTransitionNotes(): void {
 </template>
 
 <style scoped>
-.claim-fields { display: grid; gap: 16px; min-width: 0; padding: 0; border: 0; }
-legend { padding: 0 0 8px; font-size: 14px; font-weight: 650; }
-.claim-definition { margin: 0; color: var(--ink-secondary); font-size: 12px; line-height: 1.6; }
+.claim-fields { display: grid; gap: 8px; min-width: 0; margin: 0; padding: 0; border: 0; }
+legend { padding: 0 0 4px; font-size: var(--text-md); font-weight: 650; }
+.claim-definition { margin: 0; color: var(--ink-secondary); font-size: var(--text-xs); line-height: 1.5; }
 .claim-range { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-.claim-field-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; }
-label { display: grid; gap: 4px; min-width: 0; font-size: 12px; }
-input, select, textarea { width: 100%; min-width: 0; min-height: 40px; padding: 8px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-quiet); color: var(--ink); font: inherit; }
+.claim-field-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: var(--text-xs); }
+label { display: grid; gap: 3px; min-width: 0; color: var(--ink-muted); font-size: var(--text-xs); }
+input, select, textarea { width: 100%; min-width: 0; min-height: var(--control-h); padding: 3px 6px; border: 0; border-radius: var(--radius-control); background: var(--field); box-shadow: inset 0 0 0 1px var(--field-edge); color: var(--ink); font: inherit; font-size: var(--text-xs); }
 textarea { resize: vertical; }
-button { min-height: 40px; padding: 8px; border: 0; border-radius: 10px; background: var(--surface-quiet); color: var(--ink); cursor: pointer; }
-button:active { transform: scale(.96); }
+button { min-height: var(--control-h); padding: 3px 8px; border: 0; border-radius: var(--radius-control); background: var(--surface-3); box-shadow: var(--shadow-control); color: var(--ink-secondary); cursor: pointer; font-size: var(--text-xs); font-weight: 600; }
+button:active { background: var(--surface-2); }
 button:disabled { opacity: .45; cursor: default; }
 .claim-witness-list { display: flex; flex-wrap: wrap; gap: 4px; max-height: 150px; overflow: auto; margin-top: 8px; }
-.claim-witness-list button { font-family: var(--font-data); font-size: 10px; }
-details { padding-top: 12px; border-top: 1px solid var(--line); }
-details > label, details > p { margin-top: 12px; }
-summary { min-height: 40px; cursor: pointer; font-size: 12px; }
-.claim-transition { display: grid; gap: 12px; margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--line); }
-.claim-transition small { color: var(--ink-secondary); font-family: var(--font-data); font-size: 11px; }
+.claim-witness-list button { font-family: var(--font-data); font-size: var(--text-2xs); }
+details { padding-top: 6px; border-top: 1px solid var(--line); }
+details > label, details > p { margin-top: 6px; }
+summary { min-height: var(--header-h); color: var(--ink-secondary); cursor: pointer; font-size: var(--text-xs); font-weight: 650; line-height: var(--header-h); }
+.claim-transition { display: grid; gap: 6px; margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--line); }
+.claim-transition small { color: var(--ink-secondary); font-family: var(--font-data); font-size: var(--text-2xs); }
 </style>

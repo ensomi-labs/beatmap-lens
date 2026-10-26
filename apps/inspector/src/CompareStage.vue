@@ -147,7 +147,7 @@ const envelopePaths = computed(() => {
   grid-template-columns: repeat(var(--panes), minmax(0, 1fr)) 76px;
   gap: 1px;
   min-height: 0;
-  background: rgb(255 255 255 / 0.1);
+  background: var(--seam);
 }
 
 .compare-pane,
@@ -155,11 +155,11 @@ const envelopePaths = computed(() => {
   position: relative;
   min-width: 0;
   min-height: 0;
-  background: #101820;
+  background: var(--well);
 }
 
 .compare-envelope {
-  background: #0c131a;
+  background: oklch(17% 0.016 249);
 }
 
 svg {
@@ -196,13 +196,13 @@ svg {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 6px 8px;
+  padding: 3px 6px;
   color: rgb(231 240 248 / 0.86);
   border: 1px solid rgb(255 255 255 / 0.11);
-  border-radius: 8px;
+  border-radius: 4px;
   background: rgb(10 17 24 / 0.86);
   font-family: var(--font-data);
-  font-size: 0.56rem;
+  font-size: var(--text-2xs);
   font-variant-numeric: tabular-nums;
   pointer-events: none;
   white-space: nowrap;
@@ -211,9 +211,9 @@ svg {
 .compare-chip--label {
   top: 10px;
   left: 10px;
-  min-width: 28px;
+  min-width: 24px;
   justify-content: center;
-  font-size: 0.72rem;
+  font-size: var(--text-xs);
   font-weight: 650;
 }
 
@@ -257,13 +257,8 @@ svg {
     right: 66px;
   }
 
-  .compare-chip--label {
-    top: max(64px, calc(env(safe-area-inset-top) + 56px));
-  }
-
   .compare-chip--legend {
-    padding: 5px;
-    font-size: 0.48rem;
+    padding: 3px;
   }
 }
 </style>

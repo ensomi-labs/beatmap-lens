@@ -33,6 +33,16 @@ The mode switch moves between five workspaces:
 | **Compare** | Judge two generated charts of the same song by listening, without knowing which model made which. |
 | **Timing** | Mark beats and non-beats in passages of the source audio, with blind timing proposals drawn over it. |
 
+Every open workspace shares one frame: a toolbar (mode tabs, the open document,
+transport, time counter, state), a main view, side panes and a status bar. Drag the
+boundary beside a side pane to resize it, or focus it with <kbd>Tab</kbd> and use
+<kbd>←</kbd>/<kbd>→</kbd> (<kbd>Shift</kbd>: larger steps), <kbd>Home</kbd>/<kbd>End</kbd>
+for the narrowest and widest width and <kbd>Enter</kbd> to hide or restore the pane; a
+double-click restores its default width. The panel buttons at the right end of the
+toolbar hide and show the side panes. The browser remembers widths, hidden panes and
+collapsed inspector sections per workspace. At 920 px and narrower, **Source**,
+**Preview** and **Details** switch between the regions instead.
+
 `/compare` and `/timing` open Compare and Timing directly. The connected Review inbox at `/review` is served
 by `pnpm review:workspace` instead; see [agent–human review](../../docs/annotation/agent-workflow.md).
 
@@ -90,41 +100,92 @@ The server checks the session, its PCM files and its identity key file before
 it listens, and stops with one line naming a missing file.
 
 Open the printed address; it opens the session directly. Marks append to
-`<session>.timing.marks.jsonl` beside the session.
+`<session>.timing.marks.jsonl` beside the session, and the session note to
+`<session>.timing.notes.jsonl`.
 
-- Click on the spectrogram or waveform places a beat, right-click an unbeat;
-  <kbd>B</kbd> and <kbd>N</kbd> place them at the playhead. A click near a mark
-  selects it. Marks can be placed only inside the passage; the shaded context
-  around it is for listening.
-- <kbd>←</kbd>/<kbd>→</kbd> nudge the selected mark (or step the playhead) by
-  1 ms, with <kbd>Shift</kbd> 0.1 ms; <kbd>,</kbd>/<kbd>.</kbd> by one sample.
-  <kbd>[</kbd>/<kbd>]</kbd> visit marks, <kbd>K</kbd> flips beat and unbeat,
-  <kbd>Delete</kbd> removes, <kbd>Cmd/Ctrl+Z</kbd> undoes and
-  <kbd>Cmd/Ctrl+Shift+Z</kbd> redoes.
+- On the spectrogram and waveform, a click selects the mark under it (or clears
+  the selection) and a drag selects every mark in its range; with
+  <kbd>Cmd</kbd> a click adds or removes one mark and a drag adds.
+  <kbd>Shift</kbd>+click places a beat, right-click (or <kbd>Ctrl</kbd>+click) an
+  unbeat. <kbd>B</kbd> and <kbd>N</kbd>, and the **Beat** and **Unbeat** buttons,
+  place them at the playhead; while the audio plays they place them at the source
+  time heard when the key or button went down, without the playhead offset. A
+  press before the sound reaches the output is ignored, and held keys do not
+  repeat. Taps usually land some tens of ms early; refine them on the waveform.
+  Marks can be placed only inside the passage; the shaded context around it is
+  for listening.
+- The middle mouse button, or <kbd>Option</kbd>+click, anywhere on the stage puts
+  the playhead where it is released; on the overview strip at the time there,
+  and the view centres on it. Stopped, the playhead follows a middle drag and
+  nothing plays. While playing, a dashed red line marks the target and the
+  release restarts playback there once, with the pre-roll (inside the loop
+  region when looping, as <kbd>Space</kbd> does); a start still waiting for the
+  audio restarts at the new point. It never selects, places, pans or clears,
+  whatever other keys are held, and <kbd>Esc</kbd> cancels the drag. The view
+  does not move.
+- <kbd>←</kbd>/<kbd>→</kbd> nudge the selected marks (or step the playhead) by
+  1 ms, with <kbd>Shift</kbd> 0.1 ms; <kbd>,</kbd>/<kbd>.</kbd> by one sample;
+  the −15 to +15 buttons by 2, 5 or 15 ms. Selected marks move together and stop
+  at the passage edge. <kbd>[</kbd>/<kbd>]</kbd> visit the marks before and after the
+  selection, <kbd>K</kbd> flips
+  beat and unbeat, <kbd>Delete</kbd> removes the selection,
+  <kbd>Cmd/Ctrl+Z</kbd> undoes and <kbd>Cmd/Ctrl+Shift+Z</kbd> redoes.
+- **Click on my beats** (<kbd>C</kbd>, off by default) plays a short tick at
+  each of the listener's own beat marks, scheduled on the audio clock, so a
+  mark can be checked by ear; proposals are never heard. A save records whether
+  any playback of the passage in the page had the clicks on.
 - <kbd>Space</kbd> plays or pauses, <kbd>Shift+Space</kbd> plays the loop region
   once, <kbd>L</kbd> loops it, <kbd>I</kbd>/<kbd>O</kbd> set its edges,
-  <kbd>Shift</kbd>+drag selects it and <kbd>X</kbd> loops 500 ms around the
-  selected mark. Every start plays at least 120 ms of the preceding audio first.
+  <kbd>Shift</kbd>+drag selects it and <kbd>X</kbd> loops from 500 ms before the
+  first selected mark to 500 ms after the last. Every start plays at least 120 ms of the preceding audio first.
   <kbd>Esc</kbd> stops at once.
 - Wheel pans, <kbd>Ctrl</kbd>+wheel or pinch zooms at the pointer, <kbd>+</kbd>,
   <kbd>−</kbd> and <kbd>0</kbd> zoom around the selected mark or the playhead,
-  <kbd>Z</kbd> toggles 0.5 ms per pixel, and the overview strip jumps. <kbd>F</kbd>
-  toggles follow.
+  <kbd>Z</kbd> toggles 0.5 ms per pixel, and the overview strip jumps. Dragging the
+  ruler or proposal strip, or right- or <kbd>Ctrl</kbd>-dragging the waveform, pans. <kbd>F</kbd>
+  toggles follow. **Hide passages** at the right end of the toolbar (or
+  <kbd>Enter</kbd> on the boundary beside the list) gives the stage the passage
+  list's width; the boundaries beside both side panes resize them.
+- **Notes**, in their own section, are optional: one field for the passage and one
+  for the whole session. A passage is one listening in Timing, so "this passage"
+  is the note about that listening. No key opens a note, and a note is never tied
+  to a mark or a time. Keys typed in a note stay there, an IME's Enter and Esc
+  included; <kbd>Esc</kbd> gives the keys back to marking. The passage note is
+  saved with the marks, inside that passage's save: changing it makes the passage
+  unsaved, as a mark does, and a reveal waits for the save. A passage note changed
+  after the reveal is recorded as not blind. The session note is saved by **Save
+  session note** or with any save, to its own file; it is never written to the
+  marks file.
 - <kbd>1</kbd>–<kbd>9</kbd> switch proposals, <kbd>P</kbd> hides all of them and
-  brings them back. <kbd>Cmd/Ctrl+S</kbd> or <kbd>Enter</kbd> saves; the first save
-  needs the playback setup line (headphones, EQ app state, device rate) and the
-  **Output device rate** field. Both are remembered by the browser.
+  brings them back. <kbd>Cmd/Ctrl+S</kbd> or <kbd>Enter</kbd> saves, and nothing has
+  to be filled in first. The playback setup line (headphones, EQ app state,
+  volume) is carried from the latest save in the session's folder, or from what
+  this browser last had typed if that is newer; edit it when the headphones or
+  the EQ change. The **Output device rate** is detected from the browser's
+  default output while stopped (at open, after a device change, on Reopen audio
+  and before each save); choose a rate only to override it. The app never names
+  the output device and never asks for the microphone. Each save records where
+  the setup line and the rate came from, and "not stated" when nothing was known.
 
 The moving playhead follows the audio output clock and the playhead offset,
-which corrects delay the browser cannot see. It shows which beat is sounding to
-about one display frame; place and check marks on the still waveform. After an
-output device or rate change, choose **Reopen audio after a device change** (or
-the current passage again) and check the offset. The offset can be typed while
+which corrects delay the browser cannot see. It runs on its own compositor
+layer from each frame's time stamp, so a busy page holds it for about a frame
+at most instead of freezing it; the engine and its measurements are described
+in [Timing engine latency](../../docs/inspector/timing-latency.md). It shows
+which beat is sounding to about one display frame; place and check marks on the
+still waveform. After an output device or rate change, the stage header says so
+until the offset is set again, with **Reopen audio** and **Check offset** (the
+latter shows the offset under Output and sync); the status bar's offset reads
+"check" meanwhile. **Reopen audio after a device change** in Output and sync, or
+choosing the current passage again, also reopens the audio. The offset can be typed while
 the audio plays; <kbd>Enter</kbd>, <kbd>Tab</kbd> or leaving the field applies
 it, and −1/+1 step it (<kbd>Shift</kbd>: 10 ms). The stage header warns when the
-stated output device rate differs from the recording's, when the recording rate
-changes from the previous passage, and when the stated rate changed since the
-audio opened. Save and reveal errors appear there too.
+output device rate differs from the recording's, when a chosen rate differs from
+the detected one, when the recording rate changes from the previous passage, and
+when the rate in force changed since the audio opened. Save and reveal errors appear there too. The toolbar shows the
+playhead with its sample index, the save state and **Save marks**; the status bar
+shows zoom, follow, loop region, rate, the recording's rate and channels, rate
+conversion, the playhead offset and the marks file.
 
 ## Code map
 
@@ -132,14 +193,17 @@ audio opened. Save and reveal errors appear there too.
 | --- | --- |
 | `src/App.vue` | Picks the workspace from the URL and the mode switch |
 | `src/*Workspace.vue` | One component per workspace |
+| `src/layout/` | The frame every workspace shares: toolbar, resizable side panes, inspector sections, status bar |
 | `src/annotation/` | Annotation contracts, dataset storage, playback clocks, scene buffering |
 | `src/compare/` | Comparison contracts, excerpt proposals, audio envelope |
-| `src/timing/` | Timing formats, time axis, marks, spectrogram, audio engine and output clock |
+| `src/timing/` | Timing formats, time axis, marks, spectrogram, and the Timing engine: clock model, transport, display and input paths, audio engine, playhead layer |
+| `benchmarks/timing/` | The Timing engine latency harness (lab experiments, app scenarios, analysis) |
 | `server/local-service.ts` | Localhost-only request guard and helpers shared by both services |
 | `server/local-files.ts` | Full-path dataset, catalog and corpus access for Annotate |
 | `server/comparisons.ts` | Blind comparison sessions and verdict files for Compare |
 | `server/timing.ts` | Blind timing sessions, PCM serving, marks files and guarded reveal |
 | `server/timing-server.ts` | The plain-Node server for a timing bundle |
+| `scripts/ui-shots/` | Synthetic inputs, screenshots and browser checks of every mode (Playwright supplied by the caller) |
 | `server/review-workspace.mjs` | The connected Review service behind `/review` |
 
 Run `pnpm check` from the repository root before merging; the

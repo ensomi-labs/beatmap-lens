@@ -2,7 +2,7 @@
 
 import { renderDefaults } from "beatmap-lens";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createApp, h, nextTick, shallowRef } from "vue";
+import { type ComponentPublicInstance, createApp, h, nextTick, shallowRef } from "vue";
 import { AudioPlaybackController } from "./annotation/audio-playback";
 import type { PlaybackRate } from "./annotation/playback-rate";
 import type { SessionPreferences } from "./annotation/session-store";
@@ -1939,6 +1939,47 @@ describe("ReviewWorkspace mounted workflow", () => {
     await settleUnratedDimensions(container);
     expect(button(container, "Submit section review").disabled).toBe(true);
     expect(container.querySelector(".review-handoff")?.textContent).toContain("Task base: stale");
+  });
+});
+
+describe("ReviewWorkspace render scopes", () => {
+  it("re-renders only the Source time field of the right pane as the playhead moves", async () => {
+    const f = await workspaceFixture(true);
+    if (!f.handoff) throw new Error("Missing handoff.");
+    const initial = await f.read();
+    if (!initial) throw new Error("Missing review.");
+    const imported = await f.directory.importHandoff(f.sourceBytes, initial.version, f.handoff);
+    const container = document.createElement("div");
+    document.body.append(container);
+    const app = createApp(ReviewWorkspace, {
+      remoteSource: { ...imported.stored, sourceBytes: Array.from(f.sourceBytes) },
+      openClaim: { handoffId: f.handoff.handoffId, claimId: "claim-a" },
+    });
+    // Counts renders of the right pane's region, whose first node sits directly in the pane.
+    let rightPaneRenders = 0;
+    app.mixin({
+      beforeUpdate(this: ComponentPublicInstance) {
+        const first = this.$el as Node | null;
+        if (first?.parentElement?.classList.contains("frame-pane--right")) rightPaneRenders++;
+      },
+    });
+    app.config.errorHandler = (error) => appErrors.push(error);
+    apps.push(app);
+    app.mount(container);
+    await vi.waitFor(() =>
+      expect(container.querySelectorAll('.section-sliders input[type="range"]')).toHaveLength(9),
+    );
+    await idle(container);
+    const before = rightPaneRenders;
+    for (const timeMs of ["300", "600", "900", "1200"]) {
+      await setValue(control(container, "Source time"), timeMs, "input");
+      // The toolbar counter follows it.
+      expect(container.querySelector(".frame-toolbar .time-counter-main")?.textContent).toBe(
+        `00:0${(Number(timeMs) / 1000).toFixed(1)}`,
+      );
+    }
+    expect(control(container, "Source time").value).toBe("1200");
+    expect(rightPaneRenders).toBe(before);
   });
 });
 

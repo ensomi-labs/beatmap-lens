@@ -1,23 +1,40 @@
 // @vitest-environment happy-dom
-import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { createApp, defineComponent, h, nextTick } from "vue";
 import TimingWorkspace from "./TimingWorkspace.vue";
 import { timingJson, timingRequest } from "./timing/client";
-import { type BlindPassageRow, type OpenTiming, staleSessionError } from "./timing/contracts";
+import {
+  type BlindPassageRow,
+  type LastSetup,
+  type OpenTiming,
+  staleSessionError,
+} from "./timing/contracts";
+import type { PlayheadMotion } from "./timing/display";
 
 vi.mock("./timing/client", () => ({ timingJson: vi.fn(), timingRequest: vi.fn() }));
+const { motionAt } = await vi.hoisted(() => import("./timing/display"));
 const engine = vi.hoisted(() => ({
   plays: 0,
+  /** Where each play was asked to start, pre-roll included. */
+  starts: [] as number[],
+  /** While set, a play waits for it, as for a suspended context. */
+  resume: undefined as Promise<void> | undefined,
   loudness: [] as number[],
   positionMs: undefined as number | undefined,
+  motion: undefined as PlayheadMotion | undefined,
   offsets: [] as number[],
+  positionTimes: [] as (number | undefined)[],
+  clicks: [] as (number[] | null)[],
+  instance: undefined as { onEnded: ((positionMs: number) => void) | undefined } | undefined,
 }));
 vi.mock("./timing/audio-engine", () => ({
   TimingAudioEngine: class {
     readonly sampleRate: number;
     playing = false;
+    onEnded: ((positionMs: number) => void) | undefined;
     constructor(sampleRate: number) {
       this.sampleRate = sampleRate;
+      engine.instance = this;
     }
     load(channels: Float32Array[], frames: number) {
       return {
@@ -28,18 +45,45 @@ vi.mock("./timing/audio-engine", () => ({
       };
     }
     starting = false;
-    async play() {
+    token = 0;
+    async play(options: { fromMs: number }) {
       engine.plays++;
+      engine.starts.push(options.fromMs);
+      const token = ++this.token;
+      if (engine.resume) {
+        this.starting = true;
+        await engine.resume;
+        if (token !== this.token) return false;
+        this.starting = false;
+      }
       this.playing = true;
       return true;
     }
     stop() {
+      this.token++;
+      this.starting = false;
       this.playing = false;
       return undefined;
     }
-    position(offsetMs: number) {
+    sampleClock() {}
+    /** A new object on every call, as the engine plans one from the clock model each time. */
+    motion(offsetMs: number) {
       engine.offsets.push(offsetMs);
-      return engine.positionMs;
+      return this.playing && engine.motion ? { ...engine.motion } : undefined;
+    }
+    /** The motion at the frame time when one is set (it carries the offset), or `positionMs`. */
+    shownAt(frameMs: number, offsetMs: number) {
+      engine.offsets.push(offsetMs);
+      engine.positionTimes.push(frameMs);
+      if (!this.playing) return undefined;
+      return engine.motion ? motionAt(engine.motion, frameMs) : engine.positionMs;
+    }
+    heardAt(nowMs: number) {
+      engine.positionTimes.push(nowMs);
+      return this.playing ? engine.positionMs : undefined;
+    }
+    setClicks(beats: number[] | null) {
+      engine.clicks.push(beats);
     }
     setVolume() {}
     setLoudnessDb(db: number) {
@@ -51,11 +95,16 @@ vi.mock("./timing/audio-engine", () => ({
     async close() {}
   },
 }));
+const stage = vi.hoisted(() => ({ props: {} as Record<string, unknown> }));
 vi.mock("./TimingStage.vue", () => ({
   default: defineComponent({
-    setup(_, { expose }) {
+    inheritAttrs: false,
+    setup(_, { attrs, expose }) {
       expose({ cancelDrag: () => false });
-      return () => h("div", { class: "stage-stub" });
+      return () => {
+        stage.props = attrs;
+        return h("div", { class: "stage-stub" });
+      };
     },
   }),
 }));
@@ -67,7 +116,79 @@ const server = vi.hoisted(() => ({
   colours: [3, 5],
   rates: [44_100, 44_100],
   saves: [] as Record<string, unknown>[],
+  /** What the folder held before this test's saves. */
+  lastSetup: { setup: null, device_rate: null } as LastSetup,
+  notes: [] as Record<string, unknown>[],
+  /** Serve saved snapshots to a page opened later, as the service replays the marks file. */
+  replaySaves: false,
 }));
+
+/** As the service finds it at open: the latest save's setup and rate, else what was there. */
+function lastSetup(): LastSetup {
+  const found = { ...server.lastSetup };
+  server.saves.forEach((save, index) => {
+    const from = { session_id: "session-01", save_id: `save-${index + 1}`, time: saveTime };
+    const playback = save.playback as { device_rate_hz: number | null };
+    if (typeof save.setup === "string" && save.setup.trim())
+      found.setup = { text: save.setup.trim(), from };
+    if (playback.device_rate_hz) found.device_rate = { hz: playback.device_rate_hz, from };
+  });
+  return found;
+}
+
+const saveTime = "2026-10-25T01:00:00.000Z";
+
+/** The latest session note sent, as the service serves it at open. */
+function sessionNote() {
+  const note = server.notes.at(-1);
+  if (!note) return null;
+  const { text, edited, revealed_passages } = note as {
+    text: string;
+    edited: string | null;
+    revealed_passages: string[];
+  };
+  return {
+    id: `note-${server.notes.length}`,
+    time: saveTime,
+    text: text.trim(),
+    edited,
+    revealed_passages,
+  };
+}
+
+/** A passage's latest save, as the service serves it to the page. */
+function savedSnapshot(passageIndex: number) {
+  const index = server.saves.map((save) => save.passage_index).lastIndexOf(passageIndex);
+  const save = server.saves[index];
+  if (!save) return null;
+  const note = save.note as { text: string } | null;
+  return {
+    save_id: `save-${index + 1}`,
+    time: saveTime,
+    setup: save.setup,
+    marks: save.marks,
+    note: note ? { ...note, text: note.text.trim() } : null,
+  };
+}
+
+/** A default AudioContext that reports `hz`, counting the contexts made and closed. */
+function stubAudioContext(hz: number) {
+  const contexts = { made: 0, closed: 0, options: [] as unknown[] };
+  vi.stubGlobal(
+    "AudioContext",
+    class {
+      readonly sampleRate = hz;
+      constructor(...options: unknown[]) {
+        contexts.made++;
+        contexts.options.push(...options);
+      }
+      async close() {
+        contexts.closed++;
+      }
+    },
+  );
+  return contexts;
+}
 
 function row(id: string, saved: boolean, sample_rate: number, loudness = -6): BlindPassageRow {
   return {
@@ -102,8 +223,21 @@ beforeEach(() => {
     colours: [3, 5],
     rates: [44_100, 44_100],
     saves: [],
+    lastSetup: { setup: null, device_rate: null },
+    notes: [],
+    replaySaves: false,
   });
-  Object.assign(engine, { plays: 0, loudness: [], positionMs: undefined, offsets: [] });
+  Object.assign(engine, {
+    plays: 0,
+    starts: [],
+    resume: undefined,
+    loudness: [],
+    positionMs: undefined,
+    motion: undefined,
+    offsets: [],
+    positionTimes: [],
+    clicks: [],
+  });
   localStorage.setItem(
     "lens-timing-preferences",
     JSON.stringify({ setup: "DT 270 PRO · 44.1 kHz device", deviceRateHz: 44_100 }),
@@ -120,6 +254,9 @@ beforeEach(() => {
         id: "session-01",
         clock: "osu",
         marks_path: "/s/session-01.timing.marks.jsonl",
+        last_setup: lastSetup(),
+        notes_path: "/s/session-01.timing.notes.jsonl",
+        session_note: sessionNote(),
         passages: [
           row("passage-01", true, server.rates[0] as number, -4.2),
           row("passage-02", false, server.rates[1] as number, -12.9),
@@ -138,11 +275,15 @@ beforeEach(() => {
           colour_index,
           beats_ms: [],
         })),
-        saved: null,
+        saved: server.replaySaves ? savedSnapshot(request.passage_index as number) : null,
       };
+    if (operation === "session-note") {
+      server.notes.push(request);
+      return { note_id: `note-${server.notes.length}`, time: saveTime };
+    }
     if (operation === "save") {
       server.saves.push(request);
-      return { save_id: `save-${server.saves.length}`, time: "2026-10-25T01:00:00.000Z" };
+      return { save_id: `save-${server.saves.length}`, time: saveTime };
     }
     if (operation === "reveal")
       return {
@@ -169,12 +310,16 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+/** The toolbar (counter, save state) and the stage header (passage, warnings, errors). */
 function hud(): string {
-  return container.querySelector(".timing-hud")?.textContent?.replace(/\s+/g, " ") ?? "";
+  return [".frame-toolbar", ".timing-hud"]
+    .map((selector) => container.querySelector(selector)?.textContent ?? "")
+    .join(" ")
+    .replace(/\s+/g, " ");
 }
 
 function status(): string {
-  return container.querySelectorAll(".timing-hud .health-status")[1]?.textContent?.trim() ?? "";
+  return container.querySelector(".timing-status")?.textContent?.trim() ?? "";
 }
 
 function key(name: string, target: EventTarget = document.activeElement ?? document.body) {
@@ -306,14 +451,16 @@ it("shows revealed names only beside the passage they were revealed for", async 
   release();
   await vi.waitFor(() => expect(mock.settledResults[reveal]?.type).toBe("fulfilled"));
   await nextTick();
-  expect(hud()).toMatch(/Passage 01 of 2 .* Blind/);
+  expect(hud()).toContain("Passage 01 of 2");
+  expect(container.querySelector(".timing-blind")?.textContent?.trim()).toBe("Blind");
   expect(container.querySelector(".timing-legend")?.textContent).not.toContain("model-a");
 
   // The service recorded the reveal, so the passage it was for reads as revealed.
   passageKey("BracketRight");
   await vi.waitFor(() => expect(hud()).toContain("Passage 02 of 2"));
   await opened();
-  expect(hud()).toMatch(/Passage 02 of 2 .* Revealed/);
+  expect(hud()).toContain("Passage 02 of 2");
+  expect(container.querySelector(".timing-blind")?.textContent?.trim()).toBe("Revealed");
 });
 
 it("brings unsaved marks back when the same session is opened again", async () => {
@@ -342,7 +489,7 @@ it("gives the keyboard back to the shortcuts after a rail control is used with t
   expect(container.querySelector<HTMLInputElement>(".timing-offset-editor input")?.value).toBe("1");
 
   // From the keyboard the control keeps focus and Space stays with it.
-  const follow = button("On");
+  const follow = button("Follow");
   follow.focus();
   follow.click();
   expect(document.activeElement).toBe(follow);
@@ -358,6 +505,8 @@ it("gives the keyboard back to the shortcuts after a rail control is used with t
     control.dispatchEvent(new Event("change", { bubbles: true }));
     expect(document.activeElement).not.toBe(control);
   }
+  // Playing: B goes where the output clock says the press was heard.
+  engine.positionMs = 150;
   key("b");
   await nextTick();
   expect(status()).toBe("Unsaved · 1 marks");
@@ -370,25 +519,154 @@ it("gives the keyboard back to the shortcuts after a rail control is used with t
   expect(status()).toBe("Unsaved · 1 marks");
 });
 
-it("asks for the output device rate before the first save", async () => {
-  await mount({ setup: "DT 270 PRO", deviceRateHz: null });
-  expect(hud()).toContain("Output device rate not stated");
+it("saves in a fresh browser with the setup carried from the marks file and the rate detected", async () => {
+  const contexts = stubAudioContext(44_100);
+  const from = { session_id: "session-00", save_id: "s0", time: "2026-10-24T08:37:00.000Z" };
+  server.lastSetup = {
+    setup: { text: "DT270pro 3%", from },
+    device_rate: { hz: 48_000, from },
+  };
+  await mount({});
+  const field = container.querySelector<HTMLInputElement>("#timing-setup");
+  expect(field?.value).toBe("DT270pro 3%");
+  expect(container.querySelector(".timing-setup-source")?.textContent).toContain(
+    "From the last save",
+  );
+  expect(container.querySelector(".timing-setup-status")?.textContent).toContain(
+    "DT270pro 3% · last save",
+  );
+  // The detected rate ranks above the carried one, and it equals the recording's.
+  expect(container.querySelector("#timing-device-rate option")?.textContent).toBe(
+    "Detected: 44,100 Hz",
+  );
+  expect(container.querySelector(".timing-hud-warning")).toBeNull();
+  expect(container.querySelector(".frame-status")?.textContent).toContain(
+    "No rate conversion (detected)",
+  );
   key("b");
   key("Enter");
+  await vi.waitFor(() => expect(status()).toBe("Saved"));
+  expect(server.saves[0]).toMatchObject({
+    setup: "DT270pro 3%",
+    setup_source: "last-save",
+    setup_from: from,
+    playback: {
+      device_rate_hz: 44_100,
+      device_rate_source: "detected",
+      device_rate_from: null,
+      device_rate_detected_hz: 44_100,
+      device_rate_detected_at: expect.stringMatching(/^\d{4}-\d\d-\d\dT/),
+    },
+  });
+  // Probed at open and again before the save, each time with a default context closed at once.
+  expect(contexts.made).toBe(2);
+  expect(contexts.options).toEqual([]);
+  await vi.waitFor(() => expect(contexts.closed).toBe(2));
+});
+
+it("saves with nothing known about the setup, and says so", async () => {
+  await mount({});
+  expect(container.querySelector<HTMLInputElement>("#timing-setup")?.value).toBe("");
+  expect(hud()).toContain("Output device rate not known.");
+  const item = container.querySelector(".timing-setup-status");
+  expect(item?.textContent).toContain("not stated");
+  expect(item?.classList).toContain("status-warning");
+  key("b");
+  key("Enter");
+  await vi.waitFor(() => expect(status()).toBe("Saved"));
+  expect(server.saves[0]).toMatchObject({
+    setup: "",
+    setup_source: "none",
+    setup_from: null,
+    playback: {
+      device_rate_hz: null,
+      device_rate_source: "none",
+      device_rate_detected_hz: null,
+      device_rate_detected_at: null,
+    },
+  });
+});
+
+it("records a typed setup as typed, and carries it from that save after a reopen", async () => {
+  stubAudioContext(44_100);
+  await mount({});
+  const field = () => container.querySelector<HTMLInputElement>("#timing-setup");
+  const input = field();
+  if (!input) throw new Error("No setup field");
+  input.focus();
+  input.value = "HD 600 · FineTune off · 20%";
+  input.dispatchEvent(new Event("input", { bubbles: true }));
   await nextTick();
-  expect(container.textContent).toContain("Choose the output device rate before saving.");
-  expect(server.saves).toHaveLength(0);
+  expect(container.querySelector(".timing-setup-source")?.textContent).toContain("Typed now");
+  key("b", document.body);
+  key("Enter", document.body);
+  await vi.waitFor(() => expect(status()).toBe("Saved"));
+  expect(server.saves[0]).toMatchObject({
+    setup: "HD 600 · FineTune off · 20%",
+    setup_source: "typed",
+    setup_from: null,
+  });
+
+  vi.stubGlobal("confirm", () => true);
+  button("Open another session").click();
+  await nextTick();
+  container.querySelector("form")?.dispatchEvent(new Event("submit"));
+  await opened();
+  expect(field()?.value).toBe("HD 600 · FineTune off · 20%");
+  expect(container.querySelector(".timing-setup-source")?.textContent).toContain(
+    "From the last save",
+  );
+  key("Enter");
+  await vi.waitFor(() => expect(server.saves).toHaveLength(2));
+  expect(server.saves[1]).toMatchObject({
+    setup_source: "last-save",
+    setup_from: { session_id: "session-01", save_id: "save-1", time: saveTime },
+  });
+});
+
+it("warns on the stage when the chosen rate differs from the detected one", async () => {
+  stubAudioContext(48_000);
+  await mount({ setup: "DT 270 PRO" });
+  expect(hud()).toContain("output device is at 48,000 Hz and this recording at 44,100 Hz");
   const rate = container.querySelector<HTMLSelectElement>("#timing-device-rate");
   if (!rate) throw new Error("No device rate field");
-  expect(document.activeElement).toBe(rate);
-  rate.dispatchEvent(new Event("pointerdown", { bubbles: true }));
   rate.value = "44100";
   rate.dispatchEvent(new Event("change", { bubbles: true }));
   await nextTick();
-  expect(hud()).toContain("Reopen audio before listening");
+  expect(hud()).toContain(
+    "The browser reports the output device at 48,000 Hz; 44,100 Hz is chosen.",
+  );
   key("Enter");
-  await vi.waitFor(() => expect(status()).toBe("Saved"));
-  expect(server.saves[0]).toMatchObject({ playback: { device_rate_hz: 44_100 } });
+  await vi.waitFor(() => expect(server.saves).toHaveLength(1));
+  expect(server.saves[0]).toMatchObject({
+    playback: {
+      device_rate_hz: 44_100,
+      device_rate_source: "typed",
+      device_rate_detected_hz: 48_000,
+    },
+  });
+  button("Use detected (48,000 Hz)").click();
+  await nextTick();
+  expect(hud()).not.toContain("is chosen");
+  expect(hud()).toContain("output device is at 48,000 Hz");
+});
+
+it("probes the output rate only while stopped, closing each context", async () => {
+  const contexts = stubAudioContext(44_100);
+  await mount({ setup: "DT 270 PRO" });
+  expect(contexts.made).toBe(1);
+  key(" ");
+  await vi.waitFor(() => expect(engine.plays).toBe(1));
+  engine.positionMs = 300;
+  key("b");
+  key("Enter");
+  await vi.waitFor(() => expect(server.saves).toHaveLength(1));
+  expect(contexts.made).toBe(1);
+  key(" ");
+  key("Enter");
+  await vi.waitFor(() => expect(server.saves).toHaveLength(2));
+  expect(contexts.made).toBe(2);
+  await vi.waitFor(() => expect(contexts.closed).toBe(2));
 });
 
 it("warns in the HUD when the device rate differs from the recording or the recording rate changes", async () => {
@@ -431,23 +709,23 @@ it("lists mark times to 0.001 ms with the sample index, so a one-sample nudge sh
   expect(row()).toContain("n 4422");
 });
 
-it("keeps digits typed into the offset and pre-roll fields while playback redraws every frame", async () => {
+it("keeps digits typed into the offset and pre-roll fields while playback updates the HUD", async () => {
   await opened();
-  const frames: FrameRequestCallback[] = [];
-  vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => frames.push(callback));
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
+  onTestFinished(() => {
+    vi.useRealTimers();
+  });
   key(" ");
-  await vi.waitFor(() => expect(frames).toHaveLength(1));
+  await vi.waitFor(() => expect(engine.plays).toBe(1));
   const redraw = async (positionMs: number) => {
     engine.positionMs = positionMs;
-    frames.shift()?.(0);
+    vi.advanceTimersByTime(25);
     await nextTick();
     expect(hud()).toContain(`00:00.${positionMs}`);
   };
 
-  const fields = container.querySelectorAll<HTMLInputElement>(
-    ".timing-details input[type='number']",
-  );
-  const [offset, preroll] = fields;
+  const offset = container.querySelector<HTMLInputElement>(".timing-details #timing-offset");
+  const preroll = container.querySelector<HTMLInputElement>(".timing-details #timing-preroll");
   if (!offset || !preroll) throw new Error("No number fields");
   offset.focus();
   for (const [index, text] of ["1", "10", "100"].entries()) {
@@ -498,4 +776,638 @@ it("visits a passage asked for by key while another passage is loading", async (
     .mock.calls.filter(([operation]) => operation === "passage")
     .map(([, body]) => (body as { passage_index: number }).passage_index);
   expect(visited).toEqual([1, 0, 1]);
+});
+
+/** What the stage stub was last given, and a way to send it a stage event. */
+function stageEmit(name: string, ...args: unknown[]) {
+  const handler = stage.props[`on${name[0]?.toUpperCase()}${name.slice(1)}`];
+  if (typeof handler !== "function") throw new Error(`No ${name} handler`);
+  handler(...args);
+}
+
+function markIds(): string[] {
+  return (stage.props.marks as { id: string }[]).map((mark) => mark.id);
+}
+
+it("moves the selected marks by the nudge buttons and deletes a selection made on the stage", async () => {
+  await opened();
+  stageEmit("place", "beat", 300);
+  stageEmit("place", "beat", 400);
+  stageEmit("place", "beat", 500);
+  await nextTick();
+  const [first, second, third] = markIds();
+  stageEmit("select", [first, second], "replace");
+  await nextTick();
+  expect(stage.props["selected-ids"]).toEqual([first, second]);
+  expect(container.querySelector(".timing-marks-heading .rail-count")?.textContent?.trim()).toBe(
+    "2 of 3",
+  );
+  button("+15").click();
+  await nextTick();
+  button("−2").click();
+  await nextTick();
+  const times = () => (stage.props.marks as { time_ms: number }[]).map((mark) => mark.time_ms);
+  expect(times()).toEqual([313, 413, 500]);
+  stageEmit("select", [third], "toggle");
+  await nextTick();
+  key("Delete");
+  await nextTick();
+  expect(markIds()).toEqual([]);
+  window.dispatchEvent(new KeyboardEvent("keydown", { key: "z", metaKey: true }));
+  await nextTick();
+  expect(markIds()).toHaveLength(3);
+});
+
+it("places B while playing at the time heard when the key went down, not at the last frame", async () => {
+  await opened();
+  key(" ");
+  await vi.waitFor(() => expect(engine.plays).toBe(1));
+  engine.positionMs = 456.789;
+  const press = new KeyboardEvent("keydown", { key: "b", bubbles: true });
+  document.body.dispatchEvent(press);
+  await nextTick();
+  expect(engine.positionTimes.at(-1)).toBe(press.timeStamp);
+  expect(stage.props.marks).toMatchObject([{ time_ms: 456.789, method: "key-playing" }]);
+  // Stopped, B goes at the playhead.
+  key("Escape");
+  key("b");
+  await nextTick();
+  expect((stage.props.marks as { method: string }[]).map((mark) => mark.method)).toContain(
+    "key-playhead",
+  );
+});
+
+it("clicks on the listener's own beats when asked, and records that with the save", async () => {
+  await opened();
+  stageEmit("place", "beat", 300);
+  stageEmit("place", "unbeat", 350);
+  await nextTick();
+  expect(engine.clicks.at(-1)).toBeNull();
+  key("c");
+  await nextTick();
+  expect(engine.clicks.at(-1)).toEqual([300]);
+  stageEmit("place", "beat", 600);
+  await nextTick();
+  expect(engine.clicks.at(-1)).toEqual([300, 600]);
+  // Toggled on but never heard: the save says so.
+  key("Enter");
+  await vi.waitFor(() => expect(server.saves).toHaveLength(1));
+  expect(server.saves[0]).toMatchObject({ playback: { mark_clicks: false } });
+  key(" ");
+  await vi.waitFor(() => expect(engine.plays).toBe(1));
+  key("Escape");
+  stageEmit("place", "beat", 700);
+  await nextTick();
+  key("Enter");
+  await vi.waitFor(() => expect(server.saves).toHaveLength(2));
+  expect(server.saves[1]).toMatchObject({ playback: { mark_clicks: true } });
+  expect(JSON.parse(localStorage.getItem("lens-timing-preferences") ?? "{}")).toMatchObject({
+    markClicks: true,
+  });
+});
+
+it("hides the passage list for a wider stage and remembers it", async () => {
+  await opened();
+  const rail = () => container.querySelector<HTMLElement>("#timing-passages");
+  expect(rail()?.style.display).toBe("");
+  button("Hide passages").click();
+  await nextTick();
+  expect(rail()?.style.display).toBe("none");
+  expect(container.querySelector(".timing-workspace")?.classList).toContain("is-passages-hidden");
+  expect(JSON.parse(localStorage.getItem("lens-timing-preferences") ?? "{}")).toMatchObject({
+    passagesHidden: true,
+  });
+  button("Show passages").click();
+  await nextTick();
+  expect(rail()?.style.display).toBe("");
+});
+
+it("times the Beat button by its press, ignores the release, and still works from the keyboard", async () => {
+  await opened();
+  key(" ");
+  await vi.waitFor(() => expect(engine.plays).toBe(1));
+  engine.positionMs = 321.5;
+  const beat = button("Beat at playhead B");
+  const press = new PointerEvent("pointerdown", { button: 0, bubbles: true });
+  beat.dispatchEvent(press);
+  beat.dispatchEvent(new MouseEvent("click", { detail: 1, bubbles: true }));
+  await nextTick();
+  expect(stage.props.marks).toMatchObject([{ time_ms: 321.5, method: "key-playing" }]);
+  expect(engine.positionTimes.at(-1)).toBe(press.timeStamp);
+  key("Escape");
+  beat.dispatchEvent(new MouseEvent("click", { detail: 0, bubbles: true }));
+  await nextTick();
+  expect(markIds()).toHaveLength(2);
+});
+
+it("does not repeat a held B or C", async () => {
+  await opened();
+  key("b");
+  for (const name of ["b", "c"])
+    document.body.dispatchEvent(
+      new KeyboardEvent("keydown", { key: name, repeat: true, bubbles: true }),
+    );
+  await nextTick();
+  expect(markIds()).toHaveLength(1);
+  expect(engine.clicks.at(-1)).toBeNull();
+});
+
+it("gives the keyboard back after the help disclosure is clicked", async () => {
+  await opened();
+  const summary = container.querySelector<HTMLElement>(".timing-help summary");
+  if (!summary) throw new Error("No help disclosure");
+  summary.focus();
+  expect(document.activeElement).toBe(summary);
+  summary.dispatchEvent(new Event("pointerdown", { bubbles: true }));
+  summary.click();
+  expect(document.activeElement).not.toBe(summary);
+  key(" ");
+  await vi.waitFor(() => expect(engine.plays).toBe(1));
+  key("Escape");
+  key("b");
+  await nextTick();
+  key("Enter");
+  await vi.waitFor(() => expect(server.saves).toHaveLength(1));
+});
+
+describe("a change of output", () => {
+  const devices = new EventTarget();
+  beforeEach(() => {
+    Object.defineProperty(navigator, "mediaDevices", { value: devices, configurable: true });
+  });
+  afterEach(() => {
+    Reflect.deleteProperty(navigator, "mediaDevices");
+  });
+
+  const offsetItem = () =>
+    [...container.querySelectorAll(".frame-status .status-item")].find((item) =>
+      item.textContent?.includes("Offset"),
+    );
+  const passageLoads = () =>
+    vi.mocked(timingJson).mock.calls.filter(([operation]) => operation === "passage").length;
+
+  it("is on the stage with Reopen audio until the offset is checked, with the pane closed", async () => {
+    // Output and sync closed, and the details pane hidden.
+    localStorage.setItem("lens-sections", JSON.stringify({ "timing-sync": false }));
+    localStorage.setItem(
+      "lens-layout:timing",
+      JSON.stringify({ "timing-inspector": { size: 320, collapsed: true } }),
+    );
+    await mount({ setup: "DT 270 PRO", deviceRateHz: 44_100, playheadOffsetMs: 12 });
+    const sync = () => container.querySelector<HTMLElement>("#timing-sync-body");
+    expect(sync()?.style.display).toBe("none");
+    expect(offsetItem()?.classList).not.toContain("status-warning");
+
+    devices.dispatchEvent(new Event("devicechange"));
+    await nextTick();
+    expect(hud()).toContain("The output device changed: reopen the audio, then check");
+    expect(offsetItem()?.classList).toContain("status-warning");
+    expect(offsetItem()?.textContent).toContain("check");
+    // The section with the offset opens for it, without remembering that.
+    expect(sync()?.style.display).toBe("");
+    expect(JSON.parse(localStorage.getItem("lens-sections") ?? "{}")).toEqual({
+      "timing-sync": false,
+    });
+
+    const loads = passageLoads();
+    button("Reopen audio").click();
+    await vi.waitFor(() => expect(passageLoads()).toBe(loads + 1));
+    await opened();
+    expect(hud()).toContain("check the playhead offset");
+
+    button("Check offset").click();
+    await vi.waitFor(() => expect(document.activeElement?.id).toBe("timing-offset"));
+    expect(container.querySelector<HTMLElement>("#timing-inspector")?.style.display).toBe("");
+    button("+1").click();
+    await nextTick();
+    expect(container.querySelector(".timing-hud-offset")).toBeNull();
+    expect(offsetItem()?.classList).not.toContain("status-warning");
+    expect(offsetItem()?.textContent).toContain("13 ms");
+  });
+
+  it("asks for a check when the offset was set at another context rate", async () => {
+    await mount({ setup: "DT 270 PRO", deviceRateHz: 44_100, offsetRate: 48_000 });
+    expect(hud()).toContain(
+      "The playhead offset was set with the audio at 48,000 Hz, and it now runs at 44,100 Hz",
+    );
+    expect(container.querySelector(".timing-hud-offset")?.textContent).not.toContain(
+      "Reopen audio",
+    );
+    expect(offsetItem()?.classList).toContain("status-warning");
+  });
+});
+
+it("hands the stage the playhead's motion and refreshes the HUD on a timer, at most every 100 ms", async () => {
+  await opened();
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
+  onTestFinished(() => {
+    vi.useRealTimers();
+  });
+  const frames: FrameRequestCallback[] = [];
+  vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => frames.push(callback));
+  key(" ");
+  await vi.waitFor(() => expect(engine.plays).toBe(1));
+  const motion = {
+    startPerfMs: performance.now(),
+    holdMs: 100,
+    speed: 1,
+    firstEndMs: 900,
+    loop: null,
+  };
+  engine.motion = motion;
+  const advance = async (ms: number) => {
+    vi.advanceTimersByTime(ms);
+    await nextTick();
+  };
+  await advance(25);
+  const handed = stage.props["playhead-motion"];
+  expect(handed).toEqual(motion);
+  expect(hud()).toContain("00:00.125");
+  await advance(50);
+  expect(hud()).toContain("00:00.125");
+  // A refit that moves the playhead by a fraction of a millisecond keeps the running motion.
+  engine.motion = { ...motion, startPerfMs: motion.startPerfMs + 0.01 };
+  await advance(50);
+  expect(stage.props["playhead-motion"]).toBe(handed);
+  expect(hud()).toContain("00:00.225");
+  // No animation-frame loop runs while playing.
+  expect(frames).toHaveLength(0);
+  key(" ");
+  await nextTick();
+  expect(stage.props["playhead-motion"]).toBeUndefined();
+});
+
+it("hands the stage a loop's motion again once its compositor piece has run 32 passes", async () => {
+  await opened();
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
+  onTestFinished(() => {
+    vi.useRealTimers();
+  });
+  key("l");
+  key(" ");
+  await vi.waitFor(() => expect(engine.plays).toBe(1));
+  // From the start of the play, a first pass of 50 ms, then a 50 ms loop.
+  engine.motion = {
+    startPerfMs: performance.now(),
+    holdMs: 200,
+    speed: 1,
+    firstEndMs: 250,
+    loop: { startMs: 200, endMs: 250 },
+  };
+  vi.advanceTimersByTime(25);
+  await nextTick();
+  const handed = stage.props["playhead-motion"];
+  expect(handed).toEqual(engine.motion);
+  // The same motion all along: kept until 32 passes after the first wrap (50 + 1600 ms).
+  vi.advanceTimersByTime(1600);
+  await nextTick();
+  expect(stage.props["playhead-motion"]).toBe(handed);
+  vi.advanceTimersByTime(50);
+  await nextTick();
+  const again = stage.props["playhead-motion"];
+  expect(again).not.toBe(handed);
+  expect(again).toEqual(engine.motion);
+  vi.advanceTimersByTime(1500);
+  await nextTick();
+  expect(stage.props["playhead-motion"]).toBe(again);
+});
+
+it("ends a play that ran out inside the passage's bounds, holding the playhead there", async () => {
+  await opened();
+  key(" ");
+  await vi.waitFor(() => expect(engine.plays).toBe(1));
+  // The frame really played ends a fraction of a sample after the bounds (1000 ms here).
+  engine.instance?.onEnded?.(1000.0113);
+  await nextTick();
+  expect(stage.props["playhead-ms"]).toBe(1000);
+  expect(stage.props["playhead-motion"]).toBeUndefined();
+  expect(hud()).toContain("00:01.000");
+});
+
+/** Fake timers and page clock, a 1000 px stage showing `view`, and playback started: page time. */
+async function playing(view: { startMs: number; msPerPx: number }): Promise<number> {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
+  onTestFinished(() => {
+    vi.useRealTimers();
+  });
+  stageEmit("resize", 1000, 1);
+  stageEmit("update:view", view);
+  await nextTick();
+  expect(stage.props.view).toEqual(view);
+  key(" ");
+  await vi.waitFor(() => expect(engine.plays).toBe(1));
+  return performance.now();
+}
+
+/** Moves the fake page clock to `atMs`, running the transport's timers on the way. */
+async function until(atMs: number) {
+  vi.advanceTimersByTime(atMs - performance.now());
+  await nextTick();
+}
+
+it("follows on the timer: a jump right when the playhead leaves the view, not up to 25 ms later", async () => {
+  await opened();
+  const view = { startMs: 300, msPerPx: 0.2 };
+  const t0 = await playing(view);
+  // Moving from 400 ms at page time t0 + 10: past the right edge (500 ms) at t0 + 110.
+  engine.motion = { startPerfMs: t0 + 10, holdMs: 400, speed: 1, firstEndMs: 1000, loop: null };
+  await until(t0 + 109.9);
+  expect(stage.props.view).toEqual(view);
+  // Checked 0.5 ms after the crossing, the delay rounded up to whole milliseconds: the playhead,
+  // placed at 15 % of the width, is at most 1.5 ms past the edge.
+  await until(t0 + 111.6);
+  const jumped = (stage.props.view as { startMs: number }).startMs + 30;
+  expect(jumped).toBeGreaterThanOrEqual(500.5);
+  expect(jumped).toBeLessThan(501.5);
+});
+
+it("follows a loop's wrap out of the view at the wrap", async () => {
+  await opened();
+  const view = { startMs: 300, msPerPx: 0.2 };
+  const t0 = await playing(view);
+  // From 450 ms, wrapping at 480 ms (page time t0 + 40) back to 150 ms, left of the view.
+  engine.motion = {
+    startPerfMs: t0 + 10,
+    holdMs: 450,
+    speed: 1,
+    firstEndMs: 480,
+    loop: { startMs: 150, endMs: 480 },
+  };
+  await until(t0 + 39.9);
+  expect(stage.props.view).toEqual(view);
+  await until(t0 + 41.6);
+  const jumped = (stage.props.view as { startMs: number }).startMs + 30;
+  expect(jumped).toBeGreaterThanOrEqual(150.5);
+  expect(jumped).toBeLessThan(151.5);
+});
+
+it("does not jump for the pre-roll just left of the view", async () => {
+  await opened();
+  const view = { startMs: 300, msPerPx: 0.2 };
+  const t0 = await playing(view);
+  // The pre-roll starts 50 ms (250 px) left of the view; 120 ms of pre-roll is 600 px.
+  engine.motion = { startPerfMs: t0 + 10, holdMs: 250, speed: 1, firstEndMs: 1000, loop: null };
+  await until(t0 + 100);
+  expect(stage.props.view).toEqual(view);
+});
+
+it("reads the exact playhead, not the HUD's readout, for zoom, the adjacent mark and loop edges", async () => {
+  await opened();
+  stageEmit("place", "beat", 340);
+  stageEmit("place", "beat", 380);
+  key("Escape");
+  await nextTick();
+  expect(stage.props["selected-ids"]).toEqual([]);
+  const view = { startMs: 300, msPerPx: 0.2 };
+  const t0 = await playing(view);
+  engine.motion = { startPerfMs: t0, holdMs: 300, speed: 1, firstEndMs: 1000, loop: null };
+  // A readout at the next step; 40 ms later the HUD still shows it, while the playhead is further.
+  await until(t0 + 25);
+  const readout = hud().match(/00:00\.(\d{3})/)?.[1];
+  await until(t0 + 65);
+  expect(hud()).toContain(`00:00.${readout}`);
+  const exactMs = 365;
+  // Zoom keeps the playhead where it is on screen.
+  key("+");
+  await nextTick();
+  const zoomed = stage.props.view as { startMs: number; msPerPx: number };
+  expect((exactMs - zoomed.startMs) / zoomed.msPerPx).toBeCloseTo((exactMs - 300) / 0.2, 6);
+  expect(engine.positionTimes.at(-1)).toBe(t0 + 65);
+  // ] selects the first mark after the playhead: 380 ms, where the readout would give 340 ms.
+  key("]");
+  await nextTick();
+  const marks = stage.props.marks as { id: string; time_ms: number }[];
+  expect(stage.props["selected-ids"]).toEqual([marks.find((mark) => mark.time_ms === 380)?.id]);
+  // I sets the loop start at the playhead (the play restarts for the new region).
+  key("i");
+  await nextTick();
+  expect(stage.props["loop-region"]).toEqual({ startMs: exactMs, endMs: 900 });
+  await vi.waitFor(() => expect(engine.plays).toBe(2));
+});
+
+describe("locate with the middle button or Option+click", () => {
+  const counter = () => container.querySelector(".timing-counter")?.textContent ?? "";
+
+  it("stopped: the playhead follows the drag, nothing plays, and Esc puts it back", async () => {
+    await opened();
+    stageEmit("locate", 400, "move");
+    await nextTick();
+    expect(stage.props["playhead-ms"]).toBe(400);
+    expect(counter()).toContain("00:00.400");
+    expect(counter()).toContain(`n ${Math.floor((400 * 44_100) / 1000 + 0.5)}`);
+    stageEmit("locate", 500.5, "move");
+    stageEmit("locate", 600.25, "end");
+    await nextTick();
+    expect(stage.props["playhead-ms"]).toBe(600.25);
+    expect(engine.plays).toBe(0);
+
+    stageEmit("locate", 300, "move");
+    stageEmit("locate", 0, "cancel");
+    await nextTick();
+    expect(stage.props["playhead-ms"]).toBe(600.25);
+    // Clamped to the shown bounds (the passage and its context, inside the 1 s recording).
+    stageEmit("locate", 5000, "end");
+    await nextTick();
+    expect(stage.props["playhead-ms"]).toBe(1000);
+    expect(engine.plays).toBe(0);
+  });
+
+  it("playing: moves change nothing and the release restarts once, from the target minus the pre-roll", async () => {
+    await opened();
+    stageEmit("resize", 1000, 1);
+    const view = { startMs: 0, msPerPx: 1 };
+    stageEmit("update:view", view);
+    key(" ");
+    await vi.waitFor(() => expect(engine.plays).toBe(1));
+    stageEmit("locate", 300, "move");
+    stageEmit("locate", 400, "move");
+    await nextTick();
+    expect(engine.plays).toBe(1);
+    stageEmit("locate", 500, "end");
+    await vi.waitFor(() => expect(engine.plays).toBe(2));
+    expect(engine.starts.at(-1)).toBe(500 - 120);
+    expect(stage.props.view).toEqual(view);
+    // With follow off, the same.
+    key("f");
+    stageEmit("locate", 700, "end");
+    await vi.waitFor(() => expect(engine.plays).toBe(3));
+    expect(engine.starts.at(-1)).toBe(700 - 120);
+    expect(stage.props.view).toEqual(view);
+  });
+
+  it("a locate while a start waits for the audio restarts at the new point", async () => {
+    await opened();
+    let resume = () => {};
+    engine.resume = new Promise<void>((resolve) => {
+      resume = resolve;
+    });
+    key(" ");
+    await vi.waitFor(() => expect(engine.plays).toBe(1));
+    stageEmit("locate", 500, "end");
+    await vi.waitFor(() => expect(engine.plays).toBe(2));
+    resume();
+    await vi.waitFor(() => expect(button("Pause")).toBeDefined());
+    expect(engine.starts).toEqual([0, 500 - 120]);
+  });
+});
+
+describe("notes", () => {
+  const field = (id: string) => {
+    const element = container.querySelector<HTMLTextAreaElement | HTMLInputElement>(`#${id}`);
+    if (!element) throw new Error(`No ${id}`);
+    return element;
+  };
+  const type = async (id: string, text: string) => {
+    const element = field(id);
+    element.focus();
+    element.value = text;
+    element.dispatchEvent(new Event("input", { bubbles: true }));
+    await nextTick();
+    return element;
+  };
+  const noteStates = () =>
+    [...container.querySelectorAll(".timing-note-state")].map((p) => p.textContent?.trim());
+  const freshPage = async () => {
+    server.replaySaves = true;
+    app.unmount();
+    app = createApp(TimingWorkspace);
+    app.mount(container);
+    await opened();
+  };
+
+  it("a passage note makes the passage unsaved, a save writes it, a reopen restores it, and a reveal waits for the save", async () => {
+    await opened();
+    key("b");
+    key("Enter");
+    await vi.waitFor(() => expect(status()).toBe("Saved"));
+    expect(server.saves[0]).toMatchObject({ note: null });
+    expect(button("Reveal names").disabled).toBe(false);
+
+    const note = await type("timing-passage-note", "pulse unclear after the break");
+    expect(status()).toBe("Unsaved · 1 marks");
+    expect(noteStates()).toContain("Unsaved: saved with the marks");
+    expect(button("Reveal names").disabled).toBe(true);
+    // Cmd/Ctrl+S saves from inside the note.
+    note.dispatchEvent(new KeyboardEvent("keydown", { key: "s", metaKey: true, bubbles: true }));
+    await vi.waitFor(() => expect(server.saves).toHaveLength(2));
+    await vi.waitFor(() => expect(status()).toBe("Saved"));
+    expect(server.saves[1]).toMatchObject({
+      marks: [{ kind: "beat" }],
+      note: {
+        text: "pulse unclear after the break",
+        edited: expect.stringMatching(/^\d{4}-/),
+        blind: true,
+      },
+    });
+    expect(button("Reveal names").disabled).toBe(false);
+    expect(server.notes).toHaveLength(0);
+
+    await freshPage();
+    expect(hud()).toContain("Passage 02 of 2");
+    expect(field("timing-passage-note").value).toBe("pulse unclear after the break");
+    expect(status()).toBe("Saved");
+    expect(noteStates()).toContain("Saved with the marks");
+  });
+
+  it("a passage note changed after the reveal is not blind", async () => {
+    await opened();
+    key("b");
+    key("Enter");
+    await vi.waitFor(() => expect(status()).toBe("Saved"));
+    button("Reveal names").click();
+    await vi.waitFor(() =>
+      expect(container.querySelector(".timing-blind")?.textContent?.trim()).toBe("Revealed"),
+    );
+    await type("timing-passage-note", "the names did not change my mind");
+    key("Enter", document.body);
+    await vi.waitFor(() => expect(server.saves).toHaveLength(2));
+    expect(server.saves[1]).toMatchObject({ note: { blind: false } });
+    await vi.waitFor(() =>
+      expect(noteStates()).toContain("Saved with the marks · written after the reveal"),
+    );
+  });
+
+  it("the session note saves on its own or with the marks, to its own operation, and reopens", async () => {
+    await opened();
+    await type("timing-session-note", "Tired by the end. ");
+    expect(noteStates()).toContain("Unsaved");
+    expect(status()).toBe("No marks saved");
+    button("Save session note").click();
+    await vi.waitFor(() => expect(server.notes).toHaveLength(1));
+    expect(server.notes[0]).toMatchObject({ text: "Tired by the end. ", revealed_passages: [] });
+    expect(server.saves).toHaveLength(0);
+    await vi.waitFor(() =>
+      expect(noteStates().some((text) => text?.startsWith("Saved"))).toBe(true),
+    );
+
+    await freshPage();
+    expect(field("timing-session-note").value).toBe("Tired by the end.");
+    await type("timing-session-note", "Tired by the end; headphones slipped once.");
+    key("b", document.body);
+    key("Enter", document.body);
+    await vi.waitFor(() => expect(server.notes).toHaveLength(2));
+    expect(server.saves).toHaveLength(1);
+    expect(server.notes[1]).toMatchObject({ text: "Tired by the end; headphones slipped once." });
+  });
+
+  it("keeps keys typed into a note or the setup line from the shortcuts, through an IME too", async () => {
+    await opened();
+    const note = await type("timing-passage-note", "");
+    for (const name of ["b", "n", " ", "Enter", "f", "Delete", "1"]) key(name, note);
+    note.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "{",
+        code: "BracketLeft",
+        shiftKey: true,
+        bubbles: true,
+      }),
+    );
+    await nextTick();
+    expect(markIds()).toHaveLength(0);
+    expect(engine.plays).toBe(0);
+    expect(server.saves).toHaveLength(0);
+    expect(hud()).toContain("Passage 02 of 2");
+    expect(document.activeElement).toBe(note);
+
+    // An IME composition in the setup line: its Enter and Esc confirm or cancel the composition.
+    const setup = field("timing-setup");
+    setup.focus();
+    setup.dispatchEvent(new Event("compositionstart", { bubbles: true }));
+    setup.value = "ヘッドホン";
+    setup.dispatchEvent(new Event("input", { bubbles: true }));
+    await nextTick();
+    expect(container.querySelector(".timing-setup-status")?.textContent).not.toContain(
+      "ヘッドホン",
+    );
+    for (const name of ["Enter", "Escape", "b"])
+      setup.dispatchEvent(
+        new KeyboardEvent("keydown", { key: name, isComposing: true, bubbles: true }),
+      );
+    expect(document.activeElement).toBe(setup);
+    setup.dispatchEvent(new Event("compositionend", { bubbles: true }));
+    await nextTick();
+    expect(container.querySelector(".timing-setup-status")?.textContent).toContain(
+      "ヘッドホン · typed",
+    );
+    expect(server.saves).toHaveLength(0);
+    expect(markIds()).toHaveLength(0);
+
+    // Esc gives the keys back to marking, without stopping or saving anything.
+    key("Escape", setup);
+    expect(document.activeElement).not.toBe(setup);
+    key("b");
+    await nextTick();
+    expect(markIds()).toHaveLength(1);
+    // Keys pressed while no field has the focus never reach a field.
+    expect(field("timing-passage-note").value).toBe("");
+    expect(field("timing-session-note").value).toBe("");
+  });
+
+  it("asks before leaving with an unsaved session note", async () => {
+    await opened();
+    await type("timing-session-note", "headphones slipped");
+    const event = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(event);
+    expect(event.defaultPrevented).toBe(true);
+  });
 });

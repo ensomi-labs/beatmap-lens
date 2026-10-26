@@ -6,7 +6,17 @@
  * This module is pure (no Node imports) because the standalone service runs it with plain `node`
  * and the tests run it directly; the caller resolves paths.
  */
-import type { Mark, PageProvenance, PlaybackSetup, RevealedName } from "./contracts.ts";
+import type {
+  LastSetup,
+  Mark,
+  PageProvenance,
+  PassageNote,
+  PlaybackSetup,
+  RevealedName,
+  SaveRef,
+  SessionNote,
+  SetupSource,
+} from "./contracts.ts";
 
 export interface SessionFileV1 {
   version: 1;
@@ -138,10 +148,16 @@ export interface SaveEventV1 {
     decode: Record<string, unknown>;
   };
   page: PageProvenance;
+  /** Empty only with `setup_source: "none"`. */
   setup: string;
+  /** Absent from saves made before sources were recorded: the listener stated the setup. */
+  setup_source?: SetupSource;
+  setup_from?: SaveRef | null;
   playback: PlaybackSetup;
   proposals_shown: ShownProposal[];
   marks: MarkRecord[];
+  /** The passage note saved with these marks; null for none, absent before notes existed. */
+  note?: PassageNote | null;
 }
 
 export interface RevealEventV1 {
@@ -163,9 +179,13 @@ export function saveEvent(input: {
   passage: TimingPassage;
   marks: Mark[];
   setup: string;
+  /** Given by every current page; omitted only for a page that predates it. */
+  setupSource?: { source: SetupSource; from: SaveRef | null };
   playback: PlaybackSetup;
   page: PageProvenance;
   proposals: ShownProposal[];
+  /** Omitted only for a page that predates notes. */
+  note?: PassageNote | null;
 }): SaveEventV1 {
   const { audio } = input.passage;
   return {
@@ -188,6 +208,9 @@ export function saveEvent(input: {
     },
     page: input.page,
     setup: input.setup,
+    ...(input.setupSource
+      ? { setup_source: input.setupSource.source, setup_from: input.setupSource.from }
+      : {}),
     playback: input.playback,
     proposals_shown: input.proposals,
     marks: [...input.marks]
@@ -202,6 +225,7 @@ export function saveEvent(input: {
           ...provenance,
         };
       }),
+    ...(input.note !== undefined ? { note: input.note } : {}),
   };
 }
 
@@ -223,34 +247,162 @@ export function revealEvent(input: {
   };
 }
 
-export function encodeEvent(event: TimingEvent): string {
-  return `${JSON.stringify(event)}\n`;
+/**
+ * One line of `<session>.timing.notes.jsonl`: the session note as saved. It has no `passage_id`
+ * and lives in its own file, so no build's marks reader ever sees it; builds up to `4954249` read
+ * only the marks file, and count any line there that is not a save as a reveal.
+ */
+export interface SessionNoteEventV1 extends SessionNote {
+  version: 1;
+  type: "session-note";
+  session_id: string;
+}
+
+export function sessionNoteEvent(input: SessionNote & { sessionId: string }): SessionNoteEventV1 {
+  return {
+    version: 1,
+    type: "session-note",
+    id: input.id,
+    session_id: input.sessionId,
+    time: input.time,
+    text: input.text,
+    edited: input.edited,
+    revealed_passages: input.revealed_passages,
+  };
+}
+
+/** The notes file beside the session, from its marks file's name. */
+export function notesPathFor(marksPath: string): string {
+  return marksPath.replace(/\.timing\.marks\.jsonl$/, ".timing.notes.jsonl");
 }
 
 /**
- * The latest save per passage is current; a passage stays revealed once any reveal is recorded.
- * A line that does not parse, such as the end of an append cut short by a crash, is skipped and
- * its 1-based number returned for the caller to report; the file is never rewritten.
+ * The latest session note of this session in a notes file. Lines that do not parse to an object,
+ * and lines of this session of another kind, are skipped and returned as in `readMarksFile`.
+ */
+export function readNotesFile(text: string, sessionId: string) {
+  let latest: SessionNote | null = null;
+  const skipped: number[] = [];
+  const unknown: number[] = [];
+  for (const [index, line] of text.split("\n").entries()) {
+    if (!line) continue;
+    const record = parseRecord(line);
+    if (!record) {
+      skipped.push(index + 1);
+      continue;
+    }
+    if (record.session_id !== sessionId) continue;
+    const { id, time, text: note, edited, revealed_passages } = record;
+    if (
+      record.type !== "session-note" ||
+      typeof id !== "string" ||
+      typeof time !== "string" ||
+      typeof note !== "string"
+    ) {
+      unknown.push(index + 1);
+      continue;
+    }
+    latest = {
+      id,
+      time,
+      text: note,
+      edited: typeof edited === "string" ? edited : null,
+      revealed_passages: Array.isArray(revealed_passages)
+        ? revealed_passages.filter((value): value is string => typeof value === "string")
+        : [],
+    };
+  }
+  return { latest, skipped, unknown };
+}
+
+export function encodeEvent(event: TimingEvent | SessionNoteEventV1): string {
+  return `${JSON.stringify(event)}\n`;
+}
+
+/** One line of a JSONL file as an object, or undefined when it does not parse to one. */
+function parseRecord(line: string): Record<string, unknown> | undefined {
+  try {
+    const value: unknown = JSON.parse(line);
+    return value && typeof value === "object" && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The latest save per passage is current; a passage stays revealed once a `reveal` record names
+ * it. Only a `reveal` record reveals: a line of this session of any other kind is skipped and its
+ * 1-based number returned in `unknown`, so a kind written by a later version never shows names. A
+ * line that does not parse to an object, such as the end of an append cut short by a crash, is
+ * skipped and returned in `skipped`. Lines of other sessions are ignored. The file is never
+ * rewritten.
  */
 export function readMarksFile(text: string, sessionId: string) {
   const saves = new Map<string, SaveEventV1>();
   const reveals = new Set<string>();
   const skipped: number[] = [];
+  const unknown: number[] = [];
   const lines = text.split("\n");
   for (const [index, line] of lines.entries()) {
     if (!line) continue;
-    let event: TimingEvent;
-    try {
-      event = JSON.parse(line);
-    } catch {
+    const record = parseRecord(line);
+    if (!record) {
       skipped.push(index + 1);
       continue;
     }
-    if (event.session_id !== sessionId) continue;
-    if (event.type === "save") saves.set(event.passage_id, event);
-    else reveals.add(event.passage_id);
+    if (record.session_id !== sessionId) continue;
+    const event = record as unknown as TimingEvent;
+    if (typeof event.passage_id !== "string") unknown.push(index + 1);
+    else if (event.type === "save") saves.set(event.passage_id, event);
+    else if (event.type === "reveal") reveals.add(event.passage_id);
+    else unknown.push(index + 1);
   }
-  return { saves, reveals, skipped };
+  return { saves, reveals, skipped, unknown };
+}
+
+/** How the service reports the lines `readMarksFile` skipped; undefined when none were. */
+export function skippedLinesWarning(
+  fileName: string,
+  { skipped, unknown }: { skipped: number[]; unknown: number[] },
+): string | undefined {
+  const lines = (numbers: number[]) => `line${numbers.length > 1 ? "s" : ""} ${numbers.join(", ")}`;
+  const parts = [
+    ...(skipped.length ? [`${lines(skipped)} could not be read`] : []),
+    ...(unknown.length ? [`${lines(unknown)} of a kind this version does not know`] : []),
+  ];
+  if (!parts.length) return undefined;
+  return `${fileName}: ${parts.join("; ")}; skipped, and the file is left as it is.`;
+}
+
+/**
+ * The latest setup line and the latest device rate stated in one marks file's saves, by save time,
+ * of any session. Reads only `save` lines' ids, times, `setup` and `playback.device_rate_hz`.
+ */
+export function latestSetup(text: string): LastSetup {
+  let latest: LastSetup = { setup: null, device_rate: null };
+  for (const line of text.split("\n")) {
+    const record = line ? parseRecord(line) : undefined;
+    if (record?.type !== "save") continue;
+    const { id, session_id, time, setup, playback } = record;
+    if (typeof id !== "string" || typeof session_id !== "string" || typeof time !== "string")
+      continue;
+    const from = { session_id, save_id: id, time };
+    const hz = (playback as Partial<PlaybackSetup> | undefined)?.device_rate_hz;
+    latest = laterSetup(latest, {
+      setup: typeof setup === "string" && setup.trim() ? { text: setup, from } : null,
+      device_rate: typeof hz === "number" && hz > 0 ? { hz, from } : null,
+    });
+  }
+  return latest;
+}
+
+/** Each statement of `a` or `b`, whichever was saved later. */
+export function laterSetup(a: LastSetup, b: LastSetup): LastSetup {
+  const later = <T extends { from: SaveRef }>(x: T | null, y: T | null) =>
+    !x ? y : !y ? x : y.from.time > x.from.time ? y : x;
+  return { setup: later(a.setup, b.setup), device_rate: later(a.device_rate, b.device_rate) };
 }
 
 /** Back from a record to the page's mark: the derived sample is dropped, `time_ms` is kept. */

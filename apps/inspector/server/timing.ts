@@ -1,27 +1,45 @@
 import { createHash, randomInt, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { appendFile, readFile, realpath } from "node:fs/promises";
+import { appendFile, readdir, readFile, realpath } from "node:fs/promises";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import {
   type BlindPassage,
+  type DeviceRateSource,
+  deviceRateSources,
+  type LastSetup,
+  noteMaxLength,
   type OpenTiming,
+  type PassageNote,
   type PassageTarget,
+  type PlaybackSetup,
   type RevealedName,
+  type SaveRef,
   type SaveRequest,
   type SaveResponse,
+  type SessionNote,
+  type SessionNoteRequest,
+  type SessionNoteResponse,
+  type SetupSource,
+  setupSources,
   staleSessionError,
 } from "../src/timing/contracts.ts";
 import {
   type AudioInputV1,
   encodeEvent,
+  laterSetup,
+  latestSetup,
   markFromRecord,
+  notesPathFor,
   parseSession,
   readMarksFile,
+  readNotesFile,
   revealEvent,
   revealedNames,
   type SaveEventV1,
   saveEvent,
+  sessionNoteEvent,
+  skippedLinesWarning,
   type TimingPassage,
   type TimingSession,
 } from "../src/timing/format.ts";
@@ -38,16 +56,26 @@ const prefix = "/api/inspector/timing";
 /** Must match the page's proposal palette. */
 export const proposalPaletteSize = 9;
 
+/** An append-only JSONL file; one that ends inside a line gets its next event on a new line. */
+interface Output {
+  path: string;
+  pendingNewline: boolean;
+}
+
 interface Session {
   session: TimingSession;
   marksPath: string;
   passages: PassageState[];
   /** Opaque handle to audio input; the page never sees a path. */
   audio: Map<string, AudioInputV1>;
-  /** The marks file ends inside a line (an append cut short), so the next event starts a line. */
-  pendingNewline: boolean;
-  /** Lines of the marks file that did not parse and were skipped. */
+  marks: Output;
+  /** The session note's own file: never the marks file, which older builds read. */
+  notes: Output;
+  sessionNote: SessionNote | null;
+  /** Lines of the marks or notes file that did not parse and were skipped. */
   marksWarning?: string;
+  /** The setup to carry over, as found at open. */
+  lastSetup: LastSetup;
 }
 
 interface PassageState {
@@ -86,6 +114,10 @@ export function timingHandler() {
       throw Object.assign(new Error("Reopen the session to reconnect the local service."), {
         name: staleSessionError,
       });
+    if (operation === "session-note") {
+      sendJson(response, await saveSessionNote(session, body));
+      return;
+    }
     if (operation === "audio") {
       const bytes = await verifiedAudio(session, body.handle);
       response.setHeader("Content-Type", "application/octet-stream");
@@ -116,10 +148,19 @@ async function openSession(input: string, legends: Legends): Promise<Session> {
     if (error.code !== "ENOENT") throw error;
     return "";
   });
-  const { saves, reveals, skipped } = readMarksFile(text, session.id);
-  const marksWarning = skipped.length
-    ? `${basename(marksPath)}: line ${skipped.join(", ")} could not be read and was skipped; the file is left as it is.`
-    : undefined;
+  const read = readMarksFile(text, session.id);
+  const { saves, reveals } = read;
+  const notesPath = notesPathFor(marksPath);
+  const notesText = await readFile(notesPath, "utf8").catch((error: NodeJS.ErrnoException) => {
+    if (error.code !== "ENOENT") throw error;
+    return "";
+  });
+  const notes = readNotesFile(notesText, session.id);
+  const warnings = [
+    skippedLinesWarning(basename(marksPath), read),
+    skippedLinesWarning(basename(notesPath), notes),
+  ].filter(Boolean);
+  const marksWarning = warnings.length ? warnings.join(" ") : undefined;
   if (marksWarning) console.warn(`Timing: ${folder}/${marksWarning}`);
   const audio = new Map<string, AudioInputV1>();
   const handles = new Map<string, string>();
@@ -151,9 +192,27 @@ async function openSession(input: string, legends: Legends): Promise<Session> {
     marksPath,
     passages,
     audio,
-    pendingNewline: text !== "" && !text.endsWith("\n"),
+    marks: { path: marksPath, pendingNewline: text !== "" && !text.endsWith("\n") },
+    notes: { path: notesPath, pendingNewline: notesText !== "" && !notesText.endsWith("\n") },
+    sessionNote: notes.latest,
     ...(marksWarning ? { marksWarning } : {}),
+    lastSetup: await folderSetup(folder),
   };
+}
+
+/**
+ * The latest setup line and device rate saved in any marks file of the session's folder (this
+ * session's and its siblings'). Only those fields of `save` lines are read; an unreadable file is
+ * passed over.
+ */
+async function folderSetup(folder: string): Promise<LastSetup> {
+  let latest: LastSetup = { setup: null, device_rate: null };
+  const names = (await readdir(folder)).filter((name) => name.endsWith(".timing.marks.jsonl"));
+  for (const name of names.sort()) {
+    const text = await readFile(join(folder, name), "utf8").catch(() => "");
+    latest = laterSetup(latest, latestSetup(text));
+  }
+  return latest;
 }
 
 /**
@@ -193,14 +252,17 @@ function shuffle<T>(values: T[]): T[] {
 
 function describe(
   sessionId: string,
-  { session, marksPath, passages, marksWarning }: Session,
+  { session, marksPath, notes, sessionNote, passages, marksWarning, lastSetup }: Session,
 ): OpenTiming {
   return {
     session_id: sessionId,
     id: session.id,
     clock: session.clock,
     marks_path: marksPath,
+    notes_path: notes.path,
+    session_note: sessionNote,
     ...(marksWarning ? { marks_warning: marksWarning } : {}),
+    last_setup: lastSetup,
     passages: passages.map(({ passage, audioHandle, save, revealed }) => ({
       id: passage.id,
       title: passage.title,
@@ -253,6 +315,7 @@ async function blindPassage(session: Session, state: PassageState): Promise<Blin
           time: state.save.time,
           setup: state.save.setup,
           marks: state.save.marks.map(markFromRecord),
+          note: state.save.note ?? null,
         }
       : null,
     ...(state.revealed ? await revealedView(session, state) : {}),
@@ -276,7 +339,9 @@ async function save(
   state: PassageState,
   body: SaveRequest,
 ): Promise<SaveResponse> {
-  if (!body.setup?.trim()) throw new Error("Describe the playback setup before saving.");
+  const setup = checkedSetup(body);
+  checkDeviceRate(body.playback);
+  const note = checkedPassageNote(body.note);
   const { start_ms, end_ms } = state.passage;
   for (const mark of body.marks) {
     if (typeof mark.id !== "string" || !mark.id) throw new Error("Each mark needs an id.");
@@ -293,7 +358,8 @@ async function save(
     session: session.session,
     passage: state.passage,
     marks: body.marks,
-    setup: body.setup.trim(),
+    ...setup,
+    ...(note !== undefined ? { note } : {}),
     playback: body.playback,
     page: body.page,
     proposals: state.legend.map(({ key, colour_index }, legend_index) => ({
@@ -303,9 +369,77 @@ async function save(
       visible_at_save: body.visible_keys.includes(key),
     })),
   });
-  await append(session, encodeEvent(event));
+  await append(session.marks, encodeEvent(event));
   state.save = event;
   return { save_id: event.id, time: event.time };
+}
+
+/**
+ * The setup line and where it came from. A page that predates sources sends none and always
+ * stated a setup, so its saves keep their old meaning. Otherwise an empty setup is saved only as
+ * `none`, and a carried one names its save.
+ */
+function checkedSetup(body: SaveRequest): {
+  setup: string;
+  setupSource?: { source: SetupSource; from: SaveRef | null };
+} {
+  if (typeof body.setup !== "string") throw new Error("The playback setup must be text.");
+  const setup = body.setup.trim();
+  if (body.setup_source === undefined) {
+    if (!setup) throw new Error("Describe the playback setup before saving.");
+    return { setup };
+  }
+  if (!setupSources.includes(body.setup_source)) throw new Error("Unknown setup source.");
+  if ((body.setup_source === "none") !== !setup)
+    throw new Error("An empty playback setup is saved only with the source none.");
+  return {
+    setup,
+    setupSource: {
+      source: body.setup_source,
+      from: checkedFrom(body.setup_source, body.setup_from),
+    },
+  };
+}
+
+/** The new device rate fields, when the page sends them (every current page does). */
+function checkDeviceRate(playback: PlaybackSetup) {
+  const source: DeviceRateSource | undefined = playback.device_rate_source;
+  if (source === undefined) return;
+  if (!deviceRateSources.includes(source)) throw new Error("Unknown device rate source.");
+  const isRate = (value: unknown) =>
+    typeof value === "number" && Number.isFinite(value) && value > 0;
+  const rate = playback.device_rate_hz;
+  if (rate !== null && !isRate(rate)) throw new Error("The device rate must be a positive number.");
+  if ((source === "none") !== (rate === null))
+    throw new Error("A device rate is saved as none exactly when it is not known.");
+  checkedFrom(source, playback.device_rate_from);
+  const detected = playback.device_rate_detected_hz ?? null;
+  if (detected !== null && !isRate(detected))
+    throw new Error("The detected device rate must be a positive number.");
+  if (source === "detected" && detected !== rate)
+    throw new Error("A detected device rate must be the rate detected.");
+  const detectedAt = playback.device_rate_detected_at ?? null;
+  if (
+    (detectedAt === null) !== (detected === null) ||
+    (detectedAt !== null && typeof detectedAt !== "string")
+  )
+    throw new Error("A detected device rate needs the time it was detected.");
+}
+
+/** The save a `last-save` value names; any other source names none. */
+function checkedFrom(source: string, from: SaveRef | null | undefined): SaveRef | null {
+  if (source !== "last-save") {
+    if (from) throw new Error("Only a value carried from a save names that save.");
+    return null;
+  }
+  if (
+    !from ||
+    typeof from.session_id !== "string" ||
+    typeof from.save_id !== "string" ||
+    typeof from.time !== "string"
+  )
+    throw new Error("A value carried from a save must name the save.");
+  return { session_id: from.session_id, save_id: from.save_id, time: from.time };
 }
 
 /** Names leave the service only for a passage whose current snapshot is saved. */
@@ -320,7 +454,7 @@ async function reveal(
   const revealed = await names(session, state);
   if (!state.revealed) {
     await append(
-      session,
+      session.marks,
       encodeEvent(
         revealEvent({
           id: randomUUID(),
@@ -352,9 +486,62 @@ async function names(session: Session, state: PassageState): Promise<RevealedNam
   }
 }
 
-async function append(session: Session, line: string) {
-  await appendFile(session.marksPath, session.pendingNewline ? `\n${line}` : line, {
+async function append(output: Output, line: string) {
+  await appendFile(output.path, output.pendingNewline ? `\n${line}` : line, {
     flag: constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | constants.O_NOFOLLOW,
   });
-  session.pendingNewline = false;
+  output.pendingNewline = false;
+}
+
+function checkedNoteText(text: unknown): string {
+  if (typeof text !== "string") throw new Error("A note must be text.");
+  if (text.length > noteMaxLength)
+    throw new Error(`A note is at most ${noteMaxLength.toLocaleString("en")} characters.`);
+  return text.trim();
+}
+
+function checkedEdited(edited: unknown): string | null {
+  if (edited !== null && typeof edited !== "string")
+    throw new Error("A note's edit time must be a time or null.");
+  return edited;
+}
+
+/** A passage note as saved: trimmed, and null when empty. Undefined from a page without notes. */
+function checkedPassageNote(note: PassageNote | null | undefined): PassageNote | null | undefined {
+  if (note === undefined || note === null) return note;
+  if (typeof note !== "object") throw new Error("A passage note must be an object.");
+  const text = checkedNoteText(note.text);
+  if (typeof note.blind !== "boolean")
+    throw new Error("A passage note must say whether it was blind.");
+  return text ? { text, edited: checkedEdited(note.edited), blind: note.blind } : null;
+}
+
+/**
+ * Appends the session note to its own file, `<session>.timing.notes.jsonl`. The marks file is
+ * never written here: builds up to `4954249` count any line there that is not a save as a reveal.
+ */
+async function saveSessionNote(
+  session: Session,
+  body: SessionNoteRequest,
+): Promise<SessionNoteResponse> {
+  const text = checkedNoteText(body.text);
+  const ids = new Set(session.passages.map((state) => state.passage.id));
+  if (
+    !Array.isArray(body.revealed_passages) ||
+    !body.revealed_passages.every((id) => typeof id === "string" && ids.has(id))
+  )
+    throw new Error("A session note's revealed passages must be passages of this session.");
+  const note: SessionNote = {
+    id: randomUUID(),
+    time: new Date().toISOString(),
+    text,
+    edited: checkedEdited(body.edited),
+    revealed_passages: [...new Set(body.revealed_passages)],
+  };
+  await append(
+    session.notes,
+    encodeEvent(sessionNoteEvent({ ...note, sessionId: session.session.id })),
+  );
+  session.sessionNote = note;
+  return { note_id: note.id, time: note.time };
 }

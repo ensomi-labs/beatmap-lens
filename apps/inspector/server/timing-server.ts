@@ -149,7 +149,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   });
   if (values.help) {
     process.stdout.write(
-      "Inspector timing mode\n  node apps/inspector/server/timing-server.ts --session PATH [--port 4177] [--static DIR]\n\nOpen the printed address. Marks append to <session>.timing.marks.jsonl beside the session.\n",
+      "Inspector timing mode\n  node apps/inspector/server/timing-server.ts --session PATH [--port 4177] [--static DIR]\n\nOpen the printed address. Marks append to <session>.timing.marks.jsonl and the session note to <session>.timing.notes.jsonl, beside the session.\n",
     );
     process.exit(0);
   }

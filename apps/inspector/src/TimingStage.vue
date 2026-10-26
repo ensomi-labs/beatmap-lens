@@ -1,8 +1,11 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, shallowRef, watch } from "vue";
 import type { Mark } from "./timing/contracts";
+import type { PlayheadMotion } from "./timing/display";
 import { nearestSample } from "./timing/format";
+import { marksWithin, type SelectMode } from "./timing/marks";
 import { proposalColour } from "./timing/palette";
+import { PlayheadLayer } from "./timing/playhead-layer";
 import {
   computeSpectrogram,
   cropSamples,
@@ -38,36 +41,69 @@ const props = defineProps<{
   view: TimeView;
   proposals: StageProposal[];
   marks: Mark[];
-  selectedId: string | null;
+  selectedIds: string[];
   playheadMs: number;
+  /** While playing: how the playhead moves; it then ignores `playheadMs`. */
+  playheadMotion?: PlayheadMotion | undefined;
   loopRegion: TimeRange;
   looping: boolean;
 }>();
+
+/** A locate drag: the pointer moved (`move`), was released (`end`) or Esc cancelled it. */
+export type LocatePhase = "move" | "end" | "cancel";
 
 const emit = defineEmits<{
   "update:view": [view: TimeView];
   resize: [widthPx: number, devicePixelRatio: number];
   place: [kind: Mark["kind"], timeMs: number];
-  select: [id: string];
+  select: [ids: string[], mode: SelectMode];
   seek: [timeMs: number];
   "loop-region": [region: TimeRange];
+  /** The middle button, or Option+click: put the playhead at the source time under the release. */
+  locate: [timeMs: number, phase: LocatePhase];
 }>();
 
+// Lane colours follow the Inspector's strata (DESIGN.md): the data lanes are the well, the ruler
+// and overview are raised a step like the chrome, and selection uses the interface accent only
+// where no proposal is drawn.
 const stageBackground = "#101820";
-const rulerHeight = 20;
+const rulerBackground = "#21262c";
+const overviewBackground = "#1a1e24";
+const loopRegionColour = "rgba(101, 167, 250, 0.42)";
+const loopRegionIdleColour = "rgba(255, 255, 255, 0.09)";
+const markColour = "#ffffff";
+/** Either side of a selected mark, so it differs from a proposal bar of any colour. */
+const markCasingColour = "#06090e";
+const markSelectedPlate = "#2466c3";
+/** Where a locate drag will put the playhead: the playhead's red, dashed. */
+const locateTargetColour = "rgba(255, 77, 79, 0.9)";
+/** A selection drag in progress: the interface accent, as selected rows in the marks list. */
+const selectionDragFill = "rgba(101, 167, 250, 0.16)";
+const selectionDragEdge = "rgba(101, 167, 250, 0.75)";
+const rulerHeight = 22;
 const stripRowHeight = 6;
-const marksHeight = 16;
-const overviewHeight = 28;
-/** A pointer that moves less than this (device pixels) clicks; more drags. */
-const dragThreshold = 4;
+const marksHeight = 18;
+const overviewHeight = 30;
+/** A pointer that moves less than this many CSS pixels clicks; more drags. */
+const dragThresholdPx = 4;
+/** With Shift a press places a beat unless it clearly drags a loop region. */
+const shiftDragThresholdPx = 8;
+/** A click this close to a mark (CSS pixels, the glyph's half-width) hits it; marks this close share a glyph. */
+const markHitPx = 6;
 
 const host = ref<HTMLDivElement>();
 const base = ref<HTMLCanvasElement>();
 const overlay = ref<HTMLCanvasElement>();
+const playheadLine = ref<HTMLDivElement>();
+const playheadOverview = ref<HTMLDivElement>();
 const size = ref({ width: 0, height: 0, dpr: 1 });
 const spectrogram = shallowRef<Spectrogram>();
 const hoverX = ref<number>();
 const pendingLoop = ref<TimeRange>();
+/** The time range a selection drag covers so far. */
+const pendingSelection = ref<TimeRange>();
+/** Where a locate drag in progress would put the playhead. */
+const pendingLocate = ref<number>();
 
 const sampleRate = computed(() => props.buffer.sampleRate);
 const channels = computed(() =>
@@ -175,7 +211,12 @@ let observer: ResizeObserver | undefined;
 let baseFrame = 0;
 let overlayFrame = 0;
 
+let lineLayer: PlayheadLayer | undefined;
+let overviewLayer: PlayheadLayer | undefined;
+
 onMounted(() => {
+  if (playheadLine.value) lineLayer = new PlayheadLayer(playheadLine.value);
+  if (playheadOverview.value) overviewLayer = new PlayheadLayer(playheadOverview.value);
   observer = new ResizeObserver(() => resize());
   if (host.value) observer.observe(host.value);
   resize();
@@ -186,6 +227,8 @@ onBeforeUnmount(() => {
   worker?.terminate();
   cancelAnimationFrame(baseFrame);
   cancelAnimationFrame(overlayFrame);
+  lineLayer?.cancel();
+  overviewLayer?.cancel();
 });
 
 function resize() {
@@ -211,7 +254,7 @@ watch(
     props.view,
     props.proposals,
     props.marks,
-    props.selectedId,
+    props.selectedIds,
     props.loopRegion,
     props.looping,
     props.span,
@@ -219,20 +262,49 @@ watch(
   ],
   () => scheduleBase(),
 );
+// The overlay (hover line, drags) is drawn at once, not in a later frame. While a base frame is
+// pending (the view moved), the overlay is drawn with it, so the two layers never disagree.
 watch(
-  () => [props.playheadMs, hoverX.value, pendingLoop.value, props.view],
-  () => scheduleOverlay(),
+  () => [hoverX.value, pendingLoop.value, pendingSelection.value, pendingLocate.value, props.view],
+  () => {
+    if (!baseFrame) drawOverlay();
+  },
+  { flush: "post" },
+);
+// The playhead is not drawn on a canvas: it is an element on its own compositor layer, moved by a
+// transform (see `PlayheadLayer`). While playing it is placed again only when its motion, the view
+// or the stage changes, not every frame. While a base frame is pending (the view moved), it is
+// placed with that frame, so it never shows the new view over the old picture.
+watch(
+  () => [
+    props.playheadMotion,
+    props.playheadMotion ? 0 : props.playheadMs,
+    props.view,
+    size.value,
+    lanes.value,
+    overviewView.value,
+  ],
+  () => {
+    if (!baseFrame) placePlayhead();
+  },
+  { flush: "post" },
 );
 watch(spectrogram, () => columnCache.clear());
 
+// A frame already requested draws whatever the props are when it runs, so it is kept, never
+// cancelled and requested again.
 function scheduleBase() {
-  cancelAnimationFrame(baseFrame);
-  baseFrame = requestAnimationFrame(drawBase);
+  baseFrame ||= requestAnimationFrame(() => {
+    baseFrame = 0;
+    drawBase();
+  });
 }
 
 function scheduleOverlay() {
-  cancelAnimationFrame(overlayFrame);
-  overlayFrame = requestAnimationFrame(drawOverlay);
+  overlayFrame ||= requestAnimationFrame(() => {
+    overlayFrame = 0;
+    drawOverlay();
+  });
 }
 
 /** Device-pixel x of a time; rounding happens only where a line is drawn. */
@@ -286,6 +358,8 @@ function drawBase() {
   if (left > 0) context.fillRect(0, shadeTop, Math.min(left, canvas.width), shadeHeight);
   if (right < canvas.width) context.fillRect(Math.max(0, right), shadeTop, canvas.width, shadeHeight);
   drawOverview(context);
+  drawOverlay();
+  placePlayhead();
 }
 
 /** The grey ramp as packed RGBA words (little-endian canvas memory: 0xAABBGGRR). */
@@ -392,12 +466,12 @@ function drawWaveform(context: CanvasRenderingContext2D) {
 function drawRuler(context: CanvasRenderingContext2D) {
   const lane = lanes.value.ruler;
   const { dpr, width } = size.value;
-  context.fillStyle = "#0b1117";
+  context.fillStyle = rulerBackground;
   context.fillRect(0, lane.top * dpr, width * dpr, lane.height * dpr);
   // The loop region, brighter while looping.
   const loopLeft = deviceX(props.loopRegion.startMs);
   const loopRight = deviceX(props.loopRegion.endMs);
-  context.fillStyle = props.looping ? "rgba(255, 255, 255, 0.24)" : "rgba(255, 255, 255, 0.08)";
+  context.fillStyle = props.looping ? loopRegionColour : loopRegionIdleColour;
   context.fillRect(loopLeft, lane.top * dpr, loopRight - loopLeft, lane.height * dpr);
   const step = tickStepMs(props.view.msPerPx, 96);
   const minor = step / 5;
@@ -481,15 +555,27 @@ function drawMarks(context: CanvasRenderingContext2D) {
     context.textBaseline = "middle";
     context.fillText(String(groupCount), groupX + 7 * dpr, glyphY);
   };
+  const selectedIds = new Set(props.selectedIds);
   for (const mark of marks) {
-    const selected = mark.id === props.selectedId;
+    const selected = selectedIds.has(mark.id);
     const x = deviceX(mark.time_ms);
     const lineWidth = Math.max(1, Math.round(dpr)) * (selected ? 2 : 1);
-    context.fillStyle = selected ? "#8fb3ff" : "#ffffff";
+    if (selected) {
+      // A faint wash of the selection colour either side, as while dragging a selection, so the
+      // line reads as selected on the dark well too; it leaves the onset under the line visible.
+      context.fillStyle = selectionDragFill;
+      context.fillRect(x - 4.5 * dpr, lineTop, 9 * dpr, lineHeight);
+      const casing = lineWidth + 2 * Math.max(1, Math.round(dpr));
+      context.fillStyle = markCasingColour;
+      if (mark.kind === "unbeat")
+        dashedVline(context, x, lineTop, lineHeight, casing, 4 * dpr, 3 * dpr);
+      else vline(context, x, lineTop, lineHeight, casing);
+    }
+    context.fillStyle = markColour;
     if (mark.kind === "unbeat")
       dashedVline(context, x, lineTop, lineHeight, lineWidth, 4 * dpr, 3 * dpr);
     else vline(context, x, lineTop, lineHeight, lineWidth);
-    if (x - groupX < dragThreshold * dpr) {
+    if (x - groupX < markHitPx * dpr) {
       groupCount++;
       continue;
     }
@@ -497,8 +583,12 @@ function drawMarks(context: CanvasRenderingContext2D) {
     groupX = x;
     groupCount = 1;
     const r = 5 * dpr;
-    context.fillStyle = selected ? "#8fb3ff" : "#ffffff";
-    context.strokeStyle = context.fillStyle;
+    if (selected) {
+      context.fillStyle = markSelectedPlate;
+      context.fillRect(x - r * 1.5, glyphY - r * 1.5, r * 3, r * 3);
+    }
+    context.fillStyle = markColour;
+    context.strokeStyle = markColour;
     context.lineWidth = 1.5 * dpr;
     if (mark.kind === "beat") {
       context.beginPath();
@@ -524,7 +614,7 @@ function drawOverview(context: CanvasRenderingContext2D) {
   const { dpr, width } = size.value;
   const top = lane.top * dpr;
   const height = lane.height * dpr;
-  context.fillStyle = "#0b1117";
+  context.fillStyle = overviewBackground;
   context.fillRect(0, top, width * dpr, height);
   const view = overviewView.value;
   const columns = Math.round(width * dpr);
@@ -558,11 +648,36 @@ function drawOverlay() {
     context.fillStyle = "rgba(255, 255, 255, 0.12)";
     context.fillRect(Math.min(left, right), 0, Math.abs(right - left), L.overview.top * dpr);
   }
-  if (hoverX.value !== undefined) {
-    const timeMs = xToMs(props.view, hoverX.value);
-    const x = hoverX.value * dpr;
-    context.fillStyle = "rgba(255, 255, 255, 0.35)";
-    vline(context, x, L.strip.top * dpr, (L.overview.top - L.strip.top) * dpr);
+  if (pendingSelection.value) {
+    const left = deviceX(pendingSelection.value.startMs);
+    const right = deviceX(pendingSelection.value.endMs);
+    const top = L.spectrogram.top * dpr;
+    const height = (L.marks.top + L.marks.height - L.spectrogram.top) * dpr;
+    context.fillStyle = selectionDragFill;
+    context.fillRect(left, top, right - left, height);
+    context.fillStyle = selectionDragEdge;
+    vline(context, left, top, height);
+    vline(context, right, top, height);
+  }
+  const locating = pendingLocate.value;
+  if (locating !== undefined) {
+    // The target in the overview too, since a locate there may land outside the view.
+    context.fillStyle = locateTargetColour;
+    const overviewX = deviceX(locating, overviewView.value);
+    dashedVline(context, overviewX, L.overview.top * dpr, L.overview.height * dpr, dpr, 3 * dpr, 2 * dpr);
+  }
+  if (hoverX.value !== undefined || locating !== undefined) {
+    const timeMs = locating ?? xToMs(props.view, hoverX.value ?? 0);
+    const x = deviceX(timeMs);
+    const top = L.strip.top * dpr;
+    const height = (L.overview.top - L.strip.top) * dpr;
+    if (locating !== undefined) {
+      context.fillStyle = locateTargetColour;
+      dashedVline(context, x, top, height, dpr, 6 * dpr, 4 * dpr);
+    } else {
+      context.fillStyle = "rgba(255, 255, 255, 0.35)";
+      vline(context, x, top, height);
+    }
     const digits = props.view.msPerPx < 0.1 ? 2 : props.view.msPerPx < 1 ? 1 : 0;
     let label = formatSourceTime(timeMs, digits);
     if (props.view.msPerPx < 1) label += ` · n ${nearestSample(timeMs, sampleRate.value)}`;
@@ -576,45 +691,107 @@ function drawOverlay() {
     context.fillStyle = "#fff";
     context.fillText(label, textX, textY);
   }
-  // One CSS pixel, translucent so a bar or mark at the same time still shows through it, and
-  // placed like a mark of the same width so the two coincide; the ruler triangle makes it easy to
-  // find.
-  const playX = deviceX(props.playheadMs);
-  context.fillStyle = "#ff4d4f";
-  context.globalAlpha = 0.75;
-  vline(context, playX, L.ruler.top * dpr, L.overview.top * dpr, Math.max(1, Math.round(dpr)));
-  context.globalAlpha = 1;
-  context.beginPath();
-  context.moveTo(playX - 5 * dpr, L.ruler.top * dpr);
-  context.lineTo(playX + 5 * dpr, L.ruler.top * dpr);
-  context.lineTo(playX, (L.ruler.top + 7) * dpr);
-  context.closePath();
-  context.fill();
-  const overviewX = Math.round(deviceX(props.playheadMs, overviewView.value));
-  context.fillRect(overviewX - dpr, L.overview.top * dpr, 2 * dpr, L.overview.height * dpr);
 }
 
-// Pointer: a press that moves beyond the threshold drags (pan, loop selection, overview jump);
-// otherwise it clicks (seek on the ruler and overview, select or place on the lanes).
+/**
+ * The playhead: one CSS pixel (whole device pixels), translucent so a bar or mark at the same time
+ * still shows through it, with the ruler triangle that makes it easy to find, and a 2 px marker in
+ * the overview. Standing still, it is placed like a mark of the same width so the two coincide;
+ * moving, it is centred on its time without rounding, so it glides rather than stepping a pixel at
+ * a time.
+ */
+/** What the playhead was last placed for; a base redraw that changes none of it leaves it alone. */
+let placed: unknown[] = [];
+
+function placePlayhead() {
+  const line = playheadLine.value;
+  const marker = playheadOverview.value;
+  if (!line || !marker || !lineLayer || !overviewLayer) return;
+  const motion = props.playheadMotion;
+  const inputs = [
+    motion,
+    motion ? 0 : props.playheadMs,
+    props.view,
+    size.value,
+    lanes.value,
+    overviewView.value,
+  ];
+  if (inputs.every((value, index) => value === placed[index])) return;
+  placed = inputs;
+  const { dpr } = size.value;
+  const L = lanes.value;
+  const width = Math.max(1, Math.round(dpr));
+  line.style.top = `${L.ruler.top}px`;
+  line.style.height = `${L.overview.top - L.ruler.top}px`;
+  line.style.width = `${width / dpr}px`;
+  marker.style.top = `${L.overview.top}px`;
+  marker.style.height = `${L.overview.height}px`;
+  const overview = overviewView.value;
+  if (motion) {
+    lineLayer.run(motion, (timeMs) => (deviceX(timeMs) - width / 2) / dpr);
+    overviewLayer.run(motion, (timeMs) => deviceX(timeMs, overview) / dpr - 1);
+    return;
+  }
+  lineLayer.hold(lineLeft(deviceX(props.playheadMs), width) / dpr);
+  overviewLayer.hold((Math.round(deviceX(props.playheadMs, overview)) - dpr) / dpr);
+}
+
+// Pointer: a press that moves beyond the threshold drags, otherwise it clicks.
+// - Spectrogram, waveform and mark lanes: a click selects the mark under it (Cmd toggles it) or
+//   clears the selection; a drag selects every mark in its range (Cmd adds them). Shift+click
+//   places a beat, right-click an unbeat, Shift+drag selects the loop region, right-drag pans.
+// - Ruler and proposal strip: a click seeks, a drag pans (Shift+drag: loop region).
+// - Overview: a click or drag jumps.
+// - Anywhere, the middle button or Option+click locates: the playhead goes to the time under the
+//   release (overview: the time there, and the view centres on it). Stopped, the playhead follows
+//   the drag; playing, a dashed red target does, and the release restarts the play once. It never
+//   selects, places or pans, whatever the modifiers.
 let press:
   | {
       x: number;
       y: number;
       lane: LaneName;
+      /** The middle button, or the main button with Option: a locate. */
+      locate: boolean;
       /** Right button, or Control+click (the macOS secondary click). */
       secondary: boolean;
       shift: boolean;
+      /** Cmd (or the Windows key): toggle or add to the selection instead of replacing it. */
+      meta: boolean;
+      /** The time under the press, so a view that jumps during the drag does not move it. */
+      timeMs: number;
       view: TimeView;
       dragging: boolean;
     }
   | undefined;
+
+function isMarkLane(lane: LaneName): boolean {
+  return lane === "spectrogram" || lane === "waveform" || lane === "marks";
+}
 
 function localPoint(event: PointerEvent | WheelEvent | MouseEvent) {
   const rect = overlay.value?.getBoundingClientRect();
   return { x: event.clientX - (rect?.left ?? 0), y: event.clientY - (rect?.top ?? 0) };
 }
 
+/** The middle button, or Option (Alt) with the main button. */
+function isLocate(event: MouseEvent): boolean {
+  return event.button === 1 || (event.button === 0 && event.altKey);
+}
+
+/** The source time a locate at `x` means: on the overview its own scale, elsewhere the view's. */
+function locateTime(lane: LaneName, x: number): number {
+  return xToMs(lane === "overview" ? overviewView.value : props.view, x);
+}
+
 function onPointerDown(event: PointerEvent) {
+  // A second button pressed while another is held is chorded and arrives as a move; if a browser
+  // sends a press instead, the press in progress keeps the pointer.
+  const ownButton = [1, 4, 2][event.button] ?? 0;
+  if (press && (event.buttons & ~ownButton) !== 0) return;
+  const locate = isLocate(event);
+  // No autoscroll, paste or other default action for the middle button.
+  if (locate) event.preventDefault();
   // A rail button keeps focus after a click and would take Space; working on the stage returns
   // the keyboard to the workspace shortcuts.
   if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
@@ -623,8 +800,11 @@ function onPointerDown(event: PointerEvent) {
     x,
     y,
     lane: laneAt(y),
+    locate,
     secondary: event.button === 2 || (event.button === 0 && event.ctrlKey),
     shift: event.shiftKey,
+    meta: event.metaKey,
+    timeMs: xToMs(props.view, x),
     view: props.view,
     dragging: false,
   };
@@ -636,15 +816,22 @@ function onPointerMove(event: PointerEvent) {
   hoverX.value = x;
   if (!press) return;
   const dx = x - press.x;
-  if (!press.dragging && Math.abs(dx) * size.value.dpr < dragThreshold) return;
+  const threshold = press.shift && !press.locate ? shiftDragThresholdPx : dragThresholdPx;
+  if (!press.dragging && Math.abs(dx) < threshold) return;
   press.dragging = true;
+  if (press.locate) {
+    pendingLocate.value = locateTime(press.lane, x);
+    emit("locate", pendingLocate.value, "move");
+    return;
+  }
+  const timeMs = xToMs(props.view, x);
+  const range = { startMs: Math.min(press.timeMs, timeMs), endMs: Math.max(press.timeMs, timeMs) };
   if (press.lane === "overview") {
     jumpTo(xToMs(overviewView.value, x));
   } else if (press.shift) {
-    pendingLoop.value = {
-      startMs: Math.min(xToMs(press.view, press.x), xToMs(press.view, x)),
-      endMs: Math.max(xToMs(press.view, press.x), xToMs(press.view, x)),
-    };
+    pendingLoop.value = range;
+  } else if (isMarkLane(press.lane) && !press.secondary) {
+    pendingSelection.value = range;
   } else {
     emit("update:view", { startMs: press.view.startMs - dx * press.view.msPerPx, msPerPx: press.view.msPerPx });
   }
@@ -654,9 +841,24 @@ function onPointerUp(event: PointerEvent) {
   const current = press;
   press = undefined;
   if (!current) return;
+  if (current.locate) {
+    pendingLocate.value = undefined;
+    const timeMs = locateTime(current.lane, localPoint(event).x);
+    if (current.lane === "overview") jumpTo(timeMs);
+    emit("locate", timeMs, "end");
+    return;
+  }
   if (current.dragging) {
     if (pendingLoop.value) emit("loop-region", pendingLoop.value);
+    if (pendingSelection.value) {
+      // A mark whose glyph the band touches counts, as it would for a click.
+      const reachMs = markHitPx * props.view.msPerPx;
+      const { startMs, endMs } = pendingSelection.value;
+      const ids = marksWithin(props.marks, { startMs: startMs - reachMs, endMs: endMs + reachMs });
+      emit("select", ids, current.meta ? "add" : "replace");
+    }
     pendingLoop.value = undefined;
+    pendingSelection.value = undefined;
     return;
   }
   const { x } = localPoint(event);
@@ -671,20 +873,35 @@ function onPointerUp(event: PointerEvent) {
     emit("seek", timeMs);
     return;
   }
-  const toleranceMs = (dragThreshold / size.value.dpr) * props.view.msPerPx;
+  const inside = timeMs >= props.span.startMs && timeMs <= props.span.endMs;
+  if (current.shift && !current.secondary) {
+    if (inside) emit("place", "beat", timeMs);
+    else emit("seek", timeMs);
+    return;
+  }
+  const toleranceMs = markHitPx * props.view.msPerPx;
   let near: Mark | undefined;
   for (const mark of props.marks) {
     const distance = Math.abs(mark.time_ms - timeMs);
     if (distance <= toleranceMs && (!near || distance < Math.abs(near.time_ms - timeMs))) near = mark;
   }
-  if (near) emit("select", near.id);
-  else if (timeMs < props.span.startMs || timeMs > props.span.endMs) emit("seek", timeMs);
-  else emit("place", current.secondary ? "unbeat" : "beat", timeMs);
+  if (near) emit("select", [near.id], current.meta && !current.secondary ? "toggle" : "replace");
+  else if (!inside) emit("seek", timeMs);
+  else if (current.secondary) emit("place", "unbeat", timeMs);
+  else if (!current.meta) emit("select", [], "replace");
 }
 
 function onPointerCancel() {
+  if (press?.locate) emit("locate", press.timeMs, "cancel");
   press = undefined;
   pendingLoop.value = undefined;
+  pendingSelection.value = undefined;
+  pendingLocate.value = undefined;
+}
+
+/** The mouse events that follow a locate press keep no default action either. */
+function onMouseDefault(event: MouseEvent) {
+  if (isLocate(event)) event.preventDefault();
 }
 
 /** Centres the view on a time picked in the overview. */
@@ -714,11 +931,15 @@ function onWheel(event: WheelEvent) {
   });
 }
 
-/** Cancels a loop-region drag; returns whether one was in progress. */
+/** Cancels a loop-region, selection or locate drag; returns whether one was in progress. */
 function cancelDrag(): boolean {
-  const active = Boolean(press?.dragging);
+  const locate = press?.locate;
+  const active = Boolean(press?.dragging || locate);
+  if (locate && press) emit("locate", press.timeMs, "cancel");
   press = undefined;
   pendingLoop.value = undefined;
+  pendingSelection.value = undefined;
+  pendingLocate.value = undefined;
   return active;
 }
 
@@ -728,12 +949,16 @@ defineExpose({ cancelDrag });
 <template>
   <div ref="host" class="timing-stage">
     <canvas ref="base" class="timing-stage-canvas" aria-hidden="true"></canvas>
+    <div ref="playheadLine" class="timing-stage-playhead" aria-hidden="true"></div>
+    <div ref="playheadOverview" class="timing-stage-playhead-overview" aria-hidden="true"></div>
     <canvas
       ref="overlay"
       class="timing-stage-canvas timing-stage-overlay"
       role="img"
-      aria-label="Spectrogram and waveform; click places a beat, right-click an unbeat"
+      aria-label="Spectrogram and waveform; click or drag selects marks, Shift+click places a beat, right-click an unbeat, middle-click or Option+click moves the playhead"
       @pointerdown="onPointerDown"
+      @mousedown="onMouseDefault"
+      @auxclick="onMouseDefault"
       @pointermove="onPointerMove"
       @pointerup="onPointerUp"
       @pointercancel="onPointerCancel"
@@ -751,7 +976,7 @@ defineExpose({ cancelDrag });
   flex: 1 1 auto;
   min-height: 0;
   overflow: hidden;
-  background: #101820;
+  background: var(--well, #101820);
 }
 
 .timing-stage-canvas {
@@ -766,14 +991,43 @@ defineExpose({ cancelDrag });
   touch-action: none;
 }
 
+/* The playhead's compositor layers, moved only by transform (TimingStage placePlayhead). */
+.timing-stage-playhead,
+.timing-stage-playhead-overview {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 2px;
+  z-index: 1;
+  pointer-events: none;
+  will-change: transform;
+  background: #ff4d4f;
+}
+
+.timing-stage-playhead {
+  background: rgb(255 77 79 / 0.75);
+}
+
+.timing-stage-playhead::before {
+  position: absolute;
+  top: 0;
+  left: 50%;
+  width: 10px;
+  height: 7px;
+  margin-left: -5px;
+  clip-path: polygon(0 0, 100% 0, 50% 100%);
+  background: #ff4d4f;
+  content: "";
+}
+
 .timing-stage-note {
   position: absolute;
   top: 28px;
   right: 12px;
   margin: 0;
-  color: oklch(80% 0.01 255);
+  color: var(--ink-secondary, oklch(80% 0.01 255));
   font-family: var(--font-data);
-  font-size: 0.55rem;
+  font-size: var(--text-xs, 11px);
   pointer-events: none;
 }
 </style>
