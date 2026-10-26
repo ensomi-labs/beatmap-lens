@@ -19,6 +19,7 @@ import type {
 } from "../src/timing/contracts";
 import type { SessionFileV1 } from "../src/timing/format";
 import { createTimingMiddleware as deployedMiddleware } from "./fixtures/build-4954249/server/timing";
+import { readMarksFile as deployedReader } from "./fixtures/build-4954249/src/timing/format";
 import { createTimingMiddleware } from "./timing";
 
 /** Git blob ids of the files at `4954249` (`git rev-parse 4954249:apps/inspector/<path>`). */
@@ -81,6 +82,115 @@ it("opens a marks file written by 4954249 as that build does: saves, reveals and
   expect(blind.saved?.marks).toEqual([mark("m3", 75_000.25)]);
   expect(blind.names).toBeUndefined();
   expect(JSON.stringify(blind)).not.toContain("model-");
+});
+
+it("gives 4954249's readers no reveal from what this build writes: notes, sources, session notes", async () => {
+  const f = await fixture();
+  const current = await f.service(createTimingMiddleware());
+  const opened: OpenTiming = await current("open", { session_path: f.sessionPath });
+  const target = (passage_index: number) => ({ session_id: opened.session_id, passage_index });
+  const shown: BlindPassage[] = [
+    await current("passage", target(0)),
+    await current("passage", target(1)),
+  ];
+  const note = (text: string) => ({ text, edited: "2026-10-26T09:00:00.000Z", blind: true });
+  const detected = {
+    device_rate_hz: 48_000,
+    device_rate_source: "detected",
+    device_rate_from: null,
+    device_rate_detected_hz: 48_000,
+    device_rate_detected_at: "2026-10-26T08:59:00.000Z",
+  };
+  const none = {
+    device_rate_hz: null,
+    device_rate_source: "none",
+    device_rate_from: null,
+    device_rate_detected_hz: null,
+    device_rate_detected_at: null,
+  };
+  const save = (passage: number, marks: Mark[], extra: object, playback: object) => {
+    const body = saveBody(target(passage), marks);
+    return current("save", { ...body, ...extra, playback: { ...body.playback, ...playback } });
+  };
+  await save(
+    0,
+    [mark("m1", 72_468.9342)],
+    {
+      setup: "",
+      setup_source: "none",
+      setup_from: null,
+      note: note("pulse unclear after the break"),
+    },
+    none,
+  );
+  const carried = await save(
+    0,
+    [mark("m1", 72_468.9342), mark("m2", 73_000)],
+    { setup_source: "typed", setup_from: null, note: note("hi-hat pickup, not the beat?") },
+    detected,
+  );
+  await save(
+    1,
+    [mark("m3", 75_000.25)],
+    {
+      setup_source: "last-save",
+      setup_from: { session_id: "session-01", save_id: carried.save_id, time: carried.time },
+      note: null,
+    },
+    detected,
+  );
+  for (const text of ["Tired by the end.", "Tired by the end; headphones slipped once."])
+    await current("session-note", {
+      session_id: opened.session_id,
+      text,
+      edited: "2026-10-26T09:30:00.000Z",
+      revealed_passages: [],
+    });
+  const marksText = await readFile(opened.marks_path, "utf8");
+  const notesText = await readFile(opened.notes_path, "utf8");
+  expect(marksText.trim().split("\n")).toHaveLength(3);
+  expect(notesText.trim().split("\n")).toHaveLength(2);
+
+  // 4954249's own reader, on the marks file, on the notes file, and on both run together.
+  const passageIds = (reveals: Set<string>) => [...reveals].filter((id) => typeof id === "string");
+  const marks = deployedReader(marksText, "session-01");
+  expect([...marks.saves.keys()].sort()).toEqual(["passage-01", "passage-02"]);
+  expect(marks.reveals.size).toBe(0);
+  expect(marks.skipped).toEqual([]);
+  for (const text of [notesText, `${marksText}${notesText}`]) {
+    const read = deployedReader(text, "session-01");
+    expect(passageIds(read.reveals)).toEqual([]);
+    expect(read.reveals.has("passage-01") || read.reveals.has("passage-02")).toBe(false);
+  }
+
+  // 4954249's own service on the folder: saved, blind, the same legends and marks, no names.
+  const old = await f.service(deployedMiddleware());
+  const reopened: OpenTiming = await old("open", { session_path: f.sessionPath });
+  expect(reopened.marks_warning).toBeUndefined();
+  expect(reopened.passages.map(({ saved, revealed }) => ({ saved, revealed }))).toEqual([
+    { saved: true, revealed: false },
+    { saved: true, revealed: false },
+  ]);
+  for (const index of [0, 1]) {
+    const view: BlindPassage = await old("passage", {
+      session_id: reopened.session_id,
+      passage_index: index,
+    });
+    expect(view.names).toBeUndefined();
+    expect(view.names_error).toBeUndefined();
+    expect(view.proposals).toEqual(shown[index]?.proposals);
+    expect(JSON.stringify(view)).not.toContain("model-");
+  }
+  const first: BlindPassage = await old("passage", {
+    session_id: reopened.session_id,
+    passage_index: 0,
+  });
+  expect(first.saved?.marks).toEqual([mark("m1", 72_468.9342), mark("m2", 73_000)]);
+
+  // Only an explicit reveal, after a save, reveals; and only its own passage.
+  await current("reveal", { ...target(0), save_id: carried.save_id });
+  const afterReveal: OpenTiming = await old("open", { session_path: f.sessionPath });
+  expect(afterReveal.passages.map(({ revealed }) => revealed)).toEqual([true, false]);
 });
 
 function mark(id: string, time_ms: number): Mark {

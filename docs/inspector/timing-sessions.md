@@ -126,7 +126,9 @@ this file, so those builds can open it safely.
   "marks": [
     { "id": "…", "kind": "beat", "time_ms": 72468.9342, "sample": 3195880,
       "placed": "…", "method": "click", "zoom_ms_per_px": 0.25, "rate_at_placement": 0.5,
-      "blind": true, "nudged_ms": -0.0227, "snapped_to": null } ] }
+      "blind": true, "nudged_ms": -0.0227, "snapped_to": null } ],
+  "note": { "text": "pulse unclear after the break", "edited": "2026-10-25T01:11:40.551Z",
+            "blind": true } }
 { "version": 1, "type": "reveal", "id": "…", "session_id": "session-01",
   "passage_id": "passage-01", "time": "…", "after_save_id": "…" }
 ```
@@ -145,4 +147,28 @@ this file, so those builds can open it safely.
 | `proposals_shown` | Anonymous keys only; names are joined from the key file afterwards. |
 | `marks[].zoom_ms_per_px` | Milliseconds per device pixel when the mark was placed. |
 | `marks[].blind` | `false` for a mark placed or edited after the passage's names were revealed. |
+| `note` | The listener's optional note about this passage, one listening in Timing: `{ text, edited, blind }`, never tied to a mark or a time. `text` is trimmed and at most 4,000 characters; `edited` is when it last changed; `blind` is `false` once it was changed after the passage's names were revealed. `null` for no note; absent from saves made before notes existed. Like the marks, the latest save's note is current. |
 | `marks[].method` | `click` (at the pointer), `key-playhead` (B or N, or the Beat and Unbeat buttons, at the playhead while stopped) or `key-playing` (the same while the audio plays, at the source time heard when the key or button went down, read from the output clock at the event's time stamp without the playhead offset). |
+
+## Session note
+
+`<name>.timing.notes.jsonl` beside the session, append-only, one line per
+save of the note about the whole session. The latest line of the session is
+current; an empty `text` means the note was cleared.
+
+```json
+{ "version": 1, "type": "session-note", "id": "…uuid…", "session_id": "session-01",
+  "time": "2026-10-25T01:40:12.004Z", "text": "Tired by passage 05; headphones slipped once.",
+  "edited": "2026-10-25T01:39:58.310Z", "revealed_passages": ["passage-01"] }
+```
+
+| Field | Meaning |
+| --- | --- |
+| `time` | When the note was saved. |
+| `edited` | When its text last changed. |
+| `revealed_passages` | Passages whose names had been revealed when the text last changed. |
+
+The session note never goes into the marks file, and it has no `passage_id`.
+Builds up to `4954249` read only the marks file and count any line there that
+is not a `save` as a reveal, so a note line in it would show proposal names in
+those builds; in its own file no build reads it as anything but a note.

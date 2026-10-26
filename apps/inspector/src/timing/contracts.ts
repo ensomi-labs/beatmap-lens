@@ -67,9 +67,13 @@ export interface OpenTiming {
   id: string;
   clock: string;
   marks_path: string;
-  /** Lines of the marks file that could not be read and were skipped. */
+  /** `<session>.timing.notes.jsonl`, where the session note is kept. */
+  notes_path: string;
+  /** Lines of the marks or notes file that could not be read and were skipped. */
   marks_warning?: string;
   passages: BlindPassageRow[];
+  /** The latest session note, or null when none was ever saved. */
+  session_note: SessionNote | null;
   /** The latest setup line and device rate saved in this session's folder, to carry over. */
   last_setup: LastSetup;
 }
@@ -122,6 +126,48 @@ export interface SavedSnapshot {
   time: string;
   setup: string;
   marks: Mark[];
+  /** The passage note saved with these marks, or null. */
+  note: PassageNote | null;
+}
+
+/** The longest note, in UTF-16 code units, either kind. */
+export const noteMaxLength = 4000;
+
+/**
+ * The listener's note about one passage, which is one listening in Timing. Optional, never tied
+ * to a mark or a time; saved inside that passage's save, like its marks.
+ */
+export interface PassageNote {
+  text: string;
+  /** When the text last changed. */
+  edited: string | null;
+  /** False once the text was changed after this passage's names were revealed. */
+  blind: boolean;
+}
+
+/** The listener's note about the whole session; kept beside the marks, never in their file. */
+export interface SessionNote {
+  id: string;
+  /** When it was saved. */
+  time: string;
+  /** Empty when the note was cleared. */
+  text: string;
+  /** When the text last changed. */
+  edited: string | null;
+  /** Passages whose names had been revealed when the text last changed. */
+  revealed_passages: string[];
+}
+
+export interface SessionNoteRequest {
+  session_id: string;
+  text: string;
+  edited: string | null;
+  revealed_passages: string[];
+}
+
+export interface SessionNoteResponse {
+  note_id: string;
+  time: string;
 }
 
 export interface BlindPassage {
@@ -181,6 +227,8 @@ export interface SaveRequest extends PassageTarget {
   /** Absent from a page that predates it; that page always stated the setup. */
   setup_source?: SetupSource;
   setup_from?: SaveRef | null;
+  /** The passage note; absent from a page that predates notes. */
+  note?: PassageNote | null;
   playback: PlaybackSetup;
   page: PageProvenance;
   /** Keys of the proposals switched on at save. */

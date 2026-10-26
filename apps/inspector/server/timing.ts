@@ -8,13 +8,18 @@ import {
   type DeviceRateSource,
   deviceRateSources,
   type LastSetup,
+  noteMaxLength,
   type OpenTiming,
+  type PassageNote,
   type PassageTarget,
   type PlaybackSetup,
   type RevealedName,
   type SaveRef,
   type SaveRequest,
   type SaveResponse,
+  type SessionNote,
+  type SessionNoteRequest,
+  type SessionNoteResponse,
   type SetupSource,
   setupSources,
   staleSessionError,
@@ -25,12 +30,15 @@ import {
   laterSetup,
   latestSetup,
   markFromRecord,
+  notesPathFor,
   parseSession,
   readMarksFile,
+  readNotesFile,
   revealEvent,
   revealedNames,
   type SaveEventV1,
   saveEvent,
+  sessionNoteEvent,
   skippedLinesWarning,
   type TimingPassage,
   type TimingSession,
@@ -48,15 +56,23 @@ const prefix = "/api/inspector/timing";
 /** Must match the page's proposal palette. */
 export const proposalPaletteSize = 9;
 
+/** An append-only JSONL file; one that ends inside a line gets its next event on a new line. */
+interface Output {
+  path: string;
+  pendingNewline: boolean;
+}
+
 interface Session {
   session: TimingSession;
   marksPath: string;
   passages: PassageState[];
   /** Opaque handle to audio input; the page never sees a path. */
   audio: Map<string, AudioInputV1>;
-  /** The marks file ends inside a line (an append cut short), so the next event starts a line. */
-  pendingNewline: boolean;
-  /** Lines of the marks file that did not parse and were skipped. */
+  marks: Output;
+  /** The session note's own file: never the marks file, which older builds read. */
+  notes: Output;
+  sessionNote: SessionNote | null;
+  /** Lines of the marks or notes file that did not parse and were skipped. */
   marksWarning?: string;
   /** The setup to carry over, as found at open. */
   lastSetup: LastSetup;
@@ -98,6 +114,10 @@ export function timingHandler() {
       throw Object.assign(new Error("Reopen the session to reconnect the local service."), {
         name: staleSessionError,
       });
+    if (operation === "session-note") {
+      sendJson(response, await saveSessionNote(session, body));
+      return;
+    }
     if (operation === "audio") {
       const bytes = await verifiedAudio(session, body.handle);
       response.setHeader("Content-Type", "application/octet-stream");
@@ -130,7 +150,17 @@ async function openSession(input: string, legends: Legends): Promise<Session> {
   });
   const read = readMarksFile(text, session.id);
   const { saves, reveals } = read;
-  const marksWarning = skippedLinesWarning(basename(marksPath), read);
+  const notesPath = notesPathFor(marksPath);
+  const notesText = await readFile(notesPath, "utf8").catch((error: NodeJS.ErrnoException) => {
+    if (error.code !== "ENOENT") throw error;
+    return "";
+  });
+  const notes = readNotesFile(notesText, session.id);
+  const warnings = [
+    skippedLinesWarning(basename(marksPath), read),
+    skippedLinesWarning(basename(notesPath), notes),
+  ].filter(Boolean);
+  const marksWarning = warnings.length ? warnings.join(" ") : undefined;
   if (marksWarning) console.warn(`Timing: ${folder}/${marksWarning}`);
   const audio = new Map<string, AudioInputV1>();
   const handles = new Map<string, string>();
@@ -162,7 +192,9 @@ async function openSession(input: string, legends: Legends): Promise<Session> {
     marksPath,
     passages,
     audio,
-    pendingNewline: text !== "" && !text.endsWith("\n"),
+    marks: { path: marksPath, pendingNewline: text !== "" && !text.endsWith("\n") },
+    notes: { path: notesPath, pendingNewline: notesText !== "" && !notesText.endsWith("\n") },
+    sessionNote: notes.latest,
     ...(marksWarning ? { marksWarning } : {}),
     lastSetup: await folderSetup(folder),
   };
@@ -220,13 +252,15 @@ function shuffle<T>(values: T[]): T[] {
 
 function describe(
   sessionId: string,
-  { session, marksPath, passages, marksWarning, lastSetup }: Session,
+  { session, marksPath, notes, sessionNote, passages, marksWarning, lastSetup }: Session,
 ): OpenTiming {
   return {
     session_id: sessionId,
     id: session.id,
     clock: session.clock,
     marks_path: marksPath,
+    notes_path: notes.path,
+    session_note: sessionNote,
     ...(marksWarning ? { marks_warning: marksWarning } : {}),
     last_setup: lastSetup,
     passages: passages.map(({ passage, audioHandle, save, revealed }) => ({
@@ -281,6 +315,7 @@ async function blindPassage(session: Session, state: PassageState): Promise<Blin
           time: state.save.time,
           setup: state.save.setup,
           marks: state.save.marks.map(markFromRecord),
+          note: state.save.note ?? null,
         }
       : null,
     ...(state.revealed ? await revealedView(session, state) : {}),
@@ -306,6 +341,7 @@ async function save(
 ): Promise<SaveResponse> {
   const setup = checkedSetup(body);
   checkDeviceRate(body.playback);
+  const note = checkedPassageNote(body.note);
   const { start_ms, end_ms } = state.passage;
   for (const mark of body.marks) {
     if (typeof mark.id !== "string" || !mark.id) throw new Error("Each mark needs an id.");
@@ -323,6 +359,7 @@ async function save(
     passage: state.passage,
     marks: body.marks,
     ...setup,
+    ...(note !== undefined ? { note } : {}),
     playback: body.playback,
     page: body.page,
     proposals: state.legend.map(({ key, colour_index }, legend_index) => ({
@@ -332,7 +369,7 @@ async function save(
       visible_at_save: body.visible_keys.includes(key),
     })),
   });
-  await append(session, encodeEvent(event));
+  await append(session.marks, encodeEvent(event));
   state.save = event;
   return { save_id: event.id, time: event.time };
 }
@@ -417,7 +454,7 @@ async function reveal(
   const revealed = await names(session, state);
   if (!state.revealed) {
     await append(
-      session,
+      session.marks,
       encodeEvent(
         revealEvent({
           id: randomUUID(),
@@ -449,9 +486,62 @@ async function names(session: Session, state: PassageState): Promise<RevealedNam
   }
 }
 
-async function append(session: Session, line: string) {
-  await appendFile(session.marksPath, session.pendingNewline ? `\n${line}` : line, {
+async function append(output: Output, line: string) {
+  await appendFile(output.path, output.pendingNewline ? `\n${line}` : line, {
     flag: constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | constants.O_NOFOLLOW,
   });
-  session.pendingNewline = false;
+  output.pendingNewline = false;
+}
+
+function checkedNoteText(text: unknown): string {
+  if (typeof text !== "string") throw new Error("A note must be text.");
+  if (text.length > noteMaxLength)
+    throw new Error(`A note is at most ${noteMaxLength.toLocaleString("en")} characters.`);
+  return text.trim();
+}
+
+function checkedEdited(edited: unknown): string | null {
+  if (edited !== null && typeof edited !== "string")
+    throw new Error("A note's edit time must be a time or null.");
+  return edited;
+}
+
+/** A passage note as saved: trimmed, and null when empty. Undefined from a page without notes. */
+function checkedPassageNote(note: PassageNote | null | undefined): PassageNote | null | undefined {
+  if (note === undefined || note === null) return note;
+  if (typeof note !== "object") throw new Error("A passage note must be an object.");
+  const text = checkedNoteText(note.text);
+  if (typeof note.blind !== "boolean")
+    throw new Error("A passage note must say whether it was blind.");
+  return text ? { text, edited: checkedEdited(note.edited), blind: note.blind } : null;
+}
+
+/**
+ * Appends the session note to its own file, `<session>.timing.notes.jsonl`. The marks file is
+ * never written here: builds up to `4954249` count any line there that is not a save as a reveal.
+ */
+async function saveSessionNote(
+  session: Session,
+  body: SessionNoteRequest,
+): Promise<SessionNoteResponse> {
+  const text = checkedNoteText(body.text);
+  const ids = new Set(session.passages.map((state) => state.passage.id));
+  if (
+    !Array.isArray(body.revealed_passages) ||
+    !body.revealed_passages.every((id) => typeof id === "string" && ids.has(id))
+  )
+    throw new Error("A session note's revealed passages must be passages of this session.");
+  const note: SessionNote = {
+    id: randomUUID(),
+    time: new Date().toISOString(),
+    text,
+    edited: checkedEdited(body.edited),
+    revealed_passages: [...new Set(body.revealed_passages)],
+  };
+  await append(
+    session.notes,
+    encodeEvent(sessionNoteEvent({ ...note, sessionId: session.session.id })),
+  );
+  session.sessionNote = note;
+  return { note_id: note.id, time: note.time };
 }

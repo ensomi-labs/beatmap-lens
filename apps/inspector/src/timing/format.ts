@@ -10,9 +10,11 @@ import type {
   LastSetup,
   Mark,
   PageProvenance,
+  PassageNote,
   PlaybackSetup,
   RevealedName,
   SaveRef,
+  SessionNote,
   SetupSource,
 } from "./contracts.ts";
 
@@ -154,6 +156,8 @@ export interface SaveEventV1 {
   playback: PlaybackSetup;
   proposals_shown: ShownProposal[];
   marks: MarkRecord[];
+  /** The passage note saved with these marks; null for none, absent before notes existed. */
+  note?: PassageNote | null;
 }
 
 export interface RevealEventV1 {
@@ -180,6 +184,8 @@ export function saveEvent(input: {
   playback: PlaybackSetup;
   page: PageProvenance;
   proposals: ShownProposal[];
+  /** Omitted only for a page that predates notes. */
+  note?: PassageNote | null;
 }): SaveEventV1 {
   const { audio } = input.passage;
   return {
@@ -219,6 +225,7 @@ export function saveEvent(input: {
           ...provenance,
         };
       }),
+    ...(input.note !== undefined ? { note: input.note } : {}),
   };
 }
 
@@ -240,7 +247,75 @@ export function revealEvent(input: {
   };
 }
 
-export function encodeEvent(event: TimingEvent): string {
+/**
+ * One line of `<session>.timing.notes.jsonl`: the session note as saved. It has no `passage_id`
+ * and lives in its own file, so no build's marks reader ever sees it; builds up to `4954249` read
+ * only the marks file, and count any line there that is not a save as a reveal.
+ */
+export interface SessionNoteEventV1 extends SessionNote {
+  version: 1;
+  type: "session-note";
+  session_id: string;
+}
+
+export function sessionNoteEvent(input: SessionNote & { sessionId: string }): SessionNoteEventV1 {
+  return {
+    version: 1,
+    type: "session-note",
+    id: input.id,
+    session_id: input.sessionId,
+    time: input.time,
+    text: input.text,
+    edited: input.edited,
+    revealed_passages: input.revealed_passages,
+  };
+}
+
+/** The notes file beside the session, from its marks file's name. */
+export function notesPathFor(marksPath: string): string {
+  return marksPath.replace(/\.timing\.marks\.jsonl$/, ".timing.notes.jsonl");
+}
+
+/**
+ * The latest session note of this session in a notes file. Lines that do not parse to an object,
+ * and lines of this session of another kind, are skipped and returned as in `readMarksFile`.
+ */
+export function readNotesFile(text: string, sessionId: string) {
+  let latest: SessionNote | null = null;
+  const skipped: number[] = [];
+  const unknown: number[] = [];
+  for (const [index, line] of text.split("\n").entries()) {
+    if (!line) continue;
+    const record = parseRecord(line);
+    if (!record) {
+      skipped.push(index + 1);
+      continue;
+    }
+    if (record.session_id !== sessionId) continue;
+    const { id, time, text: note, edited, revealed_passages } = record;
+    if (
+      record.type !== "session-note" ||
+      typeof id !== "string" ||
+      typeof time !== "string" ||
+      typeof note !== "string"
+    ) {
+      unknown.push(index + 1);
+      continue;
+    }
+    latest = {
+      id,
+      time,
+      text: note,
+      edited: typeof edited === "string" ? edited : null,
+      revealed_passages: Array.isArray(revealed_passages)
+        ? revealed_passages.filter((value): value is string => typeof value === "string")
+        : [],
+    };
+  }
+  return { latest, skipped, unknown };
+}
+
+export function encodeEvent(event: TimingEvent | SessionNoteEventV1): string {
   return `${JSON.stringify(event)}\n`;
 }
 

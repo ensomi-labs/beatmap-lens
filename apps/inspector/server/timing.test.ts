@@ -365,6 +365,90 @@ it("carries the latest setup line and device rate saved in the session's folder"
   expect(await readFile(sibling, "utf8")).toBe(before);
 });
 
+it("saves a passage note inside its save, trimmed, null when empty, and refuses a bad one", async () => {
+  const f = await fixture();
+  const opened: OpenTiming = await f.post("open", { session_path: f.sessionPath });
+  const target = { session_id: opened.session_id, passage_index: 0 };
+  const marks = [mark("m1", "beat", 72_468.9342)];
+  const note = {
+    text: "  pulse unclear after the break\n",
+    edited: "2026-10-26T09:00:00.000Z",
+    blind: true,
+  };
+  await f.post("save", { ...saveBody(target, marks), note });
+  await f.post("save", { ...saveBody(target, marks), note: { ...note, text: " \n " } });
+  await f.post("save", { ...saveBody(target, marks), note });
+  const tooLong = { ...note, text: "x".repeat(4001) };
+  for (const [bad, message] of [
+    [{ ...note, text: 7 }, "must be text"],
+    [tooLong, "at most 4,000"],
+    [{ ...note, blind: "yes" }, "blind"],
+    [{ ...note, edited: 5 }, "edit time"],
+  ] as const)
+    await expect(f.post("save", { ...saveBody(target, marks), note: bad })).rejects.toThrow(
+      message,
+    );
+  const records = (await readFile(opened.marks_path, "utf8"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line) as SaveEventV1);
+  expect(records.map((record) => record.note)).toEqual([
+    { text: "pulse unclear after the break", edited: note.edited, blind: true },
+    null,
+    { text: "pulse unclear after the break", edited: note.edited, blind: true },
+  ]);
+  // A page that predates notes sends none, and its save has no note field.
+  await f.post("save", saveBody(target, marks));
+  const last = (await readFile(opened.marks_path, "utf8")).trim().split("\n").at(-1) ?? "";
+  expect(JSON.parse(last)).not.toHaveProperty("note");
+  await f.post("save", { ...saveBody(target, marks), note });
+  const shown: BlindPassage = await f.post("passage", target);
+  expect(shown.saved?.note).toEqual({
+    text: "pulse unclear after the break",
+    edited: note.edited,
+    blind: true,
+  });
+});
+
+it("keeps the session note in its own file, never the marks file, and serves the latest", async () => {
+  const f = await fixture();
+  const first: OpenTiming = await f.post("open", { session_path: f.sessionPath });
+  expect(first.notes_path).toBe(join(f.root, "sessions", "session-01.timing.notes.jsonl"));
+  expect(first.session_note).toBeNull();
+  const body = {
+    session_id: first.session_id,
+    text: "Tired by passage 05. ",
+    edited: "2026-10-26T09:30:00.000Z",
+    revealed_passages: [],
+  };
+  const saved = await f.post("session-note", body);
+  await expect(f.post("session-note", { ...body, text: "x".repeat(4001) })).rejects.toThrow(
+    "4,000",
+  );
+  await expect(
+    f.post("session-note", { ...body, revealed_passages: ["passage-99"] }),
+  ).rejects.toThrow("passages of this session");
+  await expect(readFile(first.marks_path, "utf8")).rejects.toThrow("ENOENT");
+  const line = JSON.parse(await readFile(first.notes_path, "utf8"));
+  expect(line).toEqual({
+    version: 1,
+    type: "session-note",
+    id: saved.note_id,
+    session_id: "session-01",
+    time: saved.time,
+    text: "Tired by passage 05.",
+    edited: body.edited,
+    revealed_passages: [],
+  });
+  expect(line).not.toHaveProperty("passage_id");
+
+  await f.post("session-note", { ...body, text: "", revealed_passages: ["passage-01"] });
+  const again: OpenTiming = await f.post("open", { session_path: f.sessionPath });
+  expect(again.session_note).toMatchObject({ text: "", revealed_passages: ["passage-01"] });
+  expect(again.passages[0]).toMatchObject({ saved: false, revealed: false });
+  expect(again.marks_warning).toBeUndefined();
+});
+
 it("keeps an unsaved passage's legend when the session is opened again", async () => {
   const f = await fixture();
   const first: OpenTiming = await f.post("open", { session_path: f.sessionPath });
