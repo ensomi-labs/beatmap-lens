@@ -224,7 +224,6 @@ function resize() {
   emit("resize", width, dpr);
   scheduleBase();
   scheduleOverlay();
-  placePlayhead();
 }
 
 watch(
@@ -251,16 +250,19 @@ watch(
 );
 // The playhead is not drawn on a canvas: it is an element on its own compositor layer, moved by a
 // transform (see `PlayheadLayer`). While playing it is placed again only when its motion, the view
-// or the stage changes, not every frame.
+// or the stage changes, not every frame. While a base frame is pending (the view moved), it is
+// placed with that frame, so it never shows the new view over the old picture.
 watch(
-  () => [props.playheadMotion, props.view, size.value, lanes.value, overviewView.value],
-  () => placePlayhead(),
-  { flush: "post" },
-);
-watch(
-  () => props.playheadMs,
+  () => [
+    props.playheadMotion,
+    props.playheadMotion ? 0 : props.playheadMs,
+    props.view,
+    size.value,
+    lanes.value,
+    overviewView.value,
+  ],
   () => {
-    if (!props.playheadMotion) placePlayhead();
+    if (!baseFrame) placePlayhead();
   },
   { flush: "post" },
 );
@@ -334,6 +336,7 @@ function drawBase() {
   if (right < canvas.width) context.fillRect(Math.max(0, right), shadeTop, canvas.width, shadeHeight);
   drawOverview(context);
   drawOverlay();
+  placePlayhead();
 }
 
 /** The grey ramp as packed RGBA words (little-endian canvas memory: 0xAABBGGRR). */
@@ -645,10 +648,24 @@ function drawOverlay() {
  * moving, it is centred on its time without rounding, so it glides rather than stepping a pixel at
  * a time.
  */
+/** What the playhead was last placed for; a base redraw that changes none of it leaves it alone. */
+let placed: unknown[] = [];
+
 function placePlayhead() {
   const line = playheadLine.value;
   const marker = playheadOverview.value;
   if (!line || !marker || !lineLayer || !overviewLayer) return;
+  const motion = props.playheadMotion;
+  const inputs = [
+    motion,
+    motion ? 0 : props.playheadMs,
+    props.view,
+    size.value,
+    lanes.value,
+    overviewView.value,
+  ];
+  if (inputs.every((value, index) => value === placed[index])) return;
+  placed = inputs;
   const { dpr } = size.value;
   const L = lanes.value;
   const width = Math.max(1, Math.round(dpr));
@@ -658,7 +675,6 @@ function placePlayhead() {
   marker.style.top = `${L.overview.top}px`;
   marker.style.height = `${L.overview.height}px`;
   const overview = overviewView.value;
-  const motion = props.playheadMotion;
   if (motion) {
     lineLayer.run(motion, (timeMs) => (deviceX(timeMs) - width / 2) / dpr);
     overviewLayer.run(motion, (timeMs) => deviceX(timeMs, overview) / dpr - 1);

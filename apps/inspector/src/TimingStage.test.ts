@@ -54,7 +54,6 @@ function mark(id: string, time_ms: number): Mark {
 const marks = [mark("a", 300), mark("b", 600)];
 const span = { startMs: 100, endMs: 900 };
 const bounds = { startMs: 0, endMs: 1000 };
-const view = { startMs: 0, msPerPx: 10 };
 const loopRegion = { startMs: 0, endMs: 0 };
 const proposals: never[] = [];
 
@@ -62,6 +61,7 @@ const props = reactive({
   playheadMs: 100,
   playheadMotion: undefined as PlayheadMotion | undefined,
   selectedIds: [] as string[],
+  view: { startMs: 0, msPerPx: 10 },
 });
 
 beforeEach(() => {
@@ -72,6 +72,7 @@ beforeEach(() => {
   props.playheadMs = 100;
   props.playheadMotion = undefined;
   props.selectedIds = [];
+  props.view = { startMs: 0, msPerPx: 10 };
   HTMLElement.prototype.animate = function (keyframes, options) {
     const record = {
       element: this,
@@ -119,7 +120,7 @@ beforeEach(() => {
         buffer,
         span,
         bounds,
-        view,
+        view: props.view,
         proposals,
         marks,
         selectedIds: props.selectedIds,
@@ -212,10 +213,13 @@ it("runs the playhead on the compositor while playing, placed again only for a n
   ]);
   expect(line[1]?.options).toMatchObject({ duration: 200, iterations: Infinity, easing: "linear" });
   expect(playhead().style.transform).toBe("translateX(9.5px)");
-  // The HUD's readouts while playing move nothing.
+  // The HUD's readouts while playing, and base redraws for a new selection, move nothing.
   const count = animations.length;
   props.playheadMs = 250;
   await nextTick();
+  props.selectedIds = ["a"];
+  await nextTick();
+  runFrames();
   expect(animations).toHaveLength(count);
   // Stopping cancels the animations and holds the playhead still.
   props.playheadMotion = undefined;
@@ -294,4 +298,18 @@ it("on Retina, a click that wobbles a few pixels still clicks and a mark's glyph
     ["place", "beat", 510],
     ["select", ["a"], "replace"],
   ]);
+});
+
+it("places the playhead for a new view with the base frame that draws that view", async () => {
+  await nextTick();
+  runFrames();
+  props.playheadMs = 500;
+  await nextTick();
+  expect(playhead().style.transform).toBe("translateX(50px)");
+  // The view moves 100 ms: the playhead waits for the frame that redraws the stage.
+  props.view = { startMs: 100, msPerPx: 10 };
+  await nextTick();
+  expect(playhead().style.transform).toBe("translateX(50px)");
+  runFrames();
+  expect(playhead().style.transform).toBe("translateX(40px)");
 });
