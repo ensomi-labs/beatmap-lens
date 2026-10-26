@@ -12,6 +12,7 @@ import { timingJson, timingRequest } from "./timing/client";
 import {
   type BlindPassage,
   type BlindPassageRow,
+  type LastSetup,
   type Mark,
   type MarkKind,
   type MarkMethod,
@@ -52,6 +53,15 @@ import {
 } from "./timing/marks";
 import { proposalColour } from "./timing/palette";
 import { deinterleave } from "./timing/pcm";
+import {
+  type Detection,
+  deviceRate,
+  initialSetup,
+  probeDeviceRate,
+  rateConflict,
+  recordedSetup,
+  type SetupLine,
+} from "./timing/setup";
 import {
   clampView,
   fitView,
@@ -124,8 +134,12 @@ interface TimingPreferences {
   /** Context rate the offset was last set at; another rate needs a fresh check. */
   offsetRate: number | null;
   prerollMs: number;
+  /** The output device rate last chosen in this browser, and when (null: before that was kept). */
   deviceRateHz: number | null;
+  deviceRateAt: string | null;
+  /** The setup line last typed in this browser, and when. */
   setup: string;
+  setupAt: string | null;
   /** A click at each of the listener's own beat marks while playing. */
   markClicks: boolean;
   passagesHidden: boolean;
@@ -146,7 +160,9 @@ const preferences = ref<TimingPreferences>({
   offsetRate: null,
   prerollMs: minimumPrerollMs,
   deviceRateHz: null,
+  deviceRateAt: null,
   setup: "",
+  setupAt: null,
   markClicks: false,
   passagesHidden: false,
   ...readPreferences(),
@@ -199,8 +215,18 @@ const contextRate = ref<number>();
 const deviceChanged = ref(false);
 /** The context opened at another rate than the previous one; cleared by reopening the audio. */
 const rateChanged = ref(false);
-/** The stated device rate changed after the context opened; cleared by a new context. */
+/** The device rate in force changed after the context opened; cleared by a new context. */
 const reopenNeeded = ref(false);
+
+// Playback setup: carried from the last save, the device rate detected; nothing blocks a save.
+/** The latest setup line and device rate saved in the session's folder, as given at open. */
+const lastSetup = shallowRef<LastSetup>({ setup: null, device_rate: null });
+/** The setup line and where it came from; `typed` once edited after the session opened. */
+const setupLine = ref<SetupLine>({ text: "", source: "none", from: null });
+/** A device rate chosen since the session opened, or null to use the detected or carried one. */
+const rateChosen = ref<number | null>(null);
+/** The latest probe of the output device's rate; probes run only while stopped. */
+const detection = shallowRef<Detection | null>(null);
 
 // Stage
 const workspaceFrame = ref<InstanceType<typeof WorkspaceFrame>>();
@@ -237,6 +263,46 @@ const bounds = computed<TimeRange>(() => {
   };
 });
 const sampleRate = computed(() => passage.value?.audio.sample_rate ?? 44_100);
+const outputRate = computed(() =>
+  deviceRate(rateChosen.value, detection.value, lastSetup.value, {
+    value: preferences.value.deviceRateHz,
+    at: preferences.value.deviceRateAt,
+  }),
+);
+/** The setup line as the status bar and the Save section describe it. */
+const setupText = computed({
+  get: () => setupLine.value.text,
+  set: (text: string) => {
+    setupLine.value = { text, source: "typed", from: null };
+    setPreference("setup", text);
+    setPreference("setupAt", new Date().toISOString());
+  },
+});
+const setupOrigin = computed(() => {
+  const line = setupLine.value;
+  if (!line.text.trim()) return "Not stated; the save will record that";
+  if (line.source === "typed") return "Typed now";
+  if (line.source === "browser") return "Remembered by this browser";
+  if (line.from) return `From the last save, ${savedAt(line.from.time)} · ${line.from.session_id}`;
+  return "From the last save";
+});
+const setupBrief = computed(() => {
+  const line = setupLine.value;
+  if (!line.text.trim()) return "not stated";
+  const origin = { typed: "typed", "last-save": "last save", browser: "this browser", none: "" };
+  return `${line.text.trim()} · ${origin[line.source]}`;
+});
+/** The device rate select's first entry: what applies when no rate is chosen. */
+const automaticRate = computed(() => {
+  const hz = (value: number) => `${value.toLocaleString()} Hz`;
+  if (detection.value) return `Detected: ${hz(detection.value.hz)}`;
+  const carried = deviceRate(null, null, lastSetup.value, {
+    value: preferences.value.deviceRateHz,
+    at: preferences.value.deviceRateAt,
+  });
+  if (carried.hz === null) return "Not known";
+  return `${carried.source === "last-save" ? "Last save" : "This browser"}: ${hz(carried.hz)}`;
+});
 const draft = computed(() => drafts.value.get(passage.value?.id ?? ""));
 const marks = computed(() => draft.value?.state.marks ?? []);
 const selected = computed(() => (draft.value ? selectedMark(draft.value.state) : undefined));
@@ -291,22 +357,27 @@ const passageSummary = computed(() => {
 });
 const conversion = computed(() => {
   const source = passage.value?.audio.sample_rate;
-  const device = preferences.value.deviceRateHz;
-  if (!source || !device) return "Device rate not stated";
+  const device = outputRate.value.hz;
+  if (!source || !device) return "Device rate not known";
+  const detected = outputRate.value.source === "detected" ? " (detected)" : "";
   return device === source
-    ? "No rate conversion"
-    : `Device converts ${source.toLocaleString()} → ${device.toLocaleString()} Hz`;
+    ? `No rate conversion${detected}`
+    : `Device converts ${source.toLocaleString()} → ${device.toLocaleString()} Hz${detected}`;
 });
 /** The output-rate condition to fix before listening, shown in the stage HUD. */
 const rateWarning = computed(() => {
   const source = passage.value?.audio.sample_rate;
   if (!source) return "";
   const hz = (value: number) => `${value.toLocaleString()} Hz`;
-  const device = preferences.value.deviceRateHz;
+  const device = outputRate.value.hz;
   if (!device)
-    return `Output device rate not stated. This recording is ${hz(source)}; set the output device to it in Audio MIDI Setup and choose it under Output device rate before saving.`;
-  if (device !== source)
-    return `The output device is at ${hz(device)} and this recording at ${hz(source)}, so the system resamples. Set the output device to ${hz(source)} in Audio MIDI Setup, choose it under Output device rate, then Reopen audio.`;
+    return `Output device rate not known. This recording is ${hz(source)}; set the output device to it in Audio MIDI Setup.`;
+  if (rateConflict(rateChosen.value, detection.value) && detection.value)
+    return `The browser reports the output device at ${hz(detection.value.hz)}; ${hz(device)} is chosen.`;
+  if (device !== source) {
+    const choose = outputRate.value.source === "typed" ? ", choose it under Output device rate" : "";
+    return `The output device is at ${hz(device)} and this recording at ${hz(source)}, so the system resamples. Set the output device to ${hz(source)} in Audio MIDI Setup${choose}, then Reopen audio.`;
+  }
   if (reopenNeeded.value) return "The output device rate changed. Reopen audio before listening.";
   if (rateChanged.value)
     return `The recording rate changed to ${hz(source)}. Check that the output device is at ${hz(source)}, then Reopen audio.`;
@@ -386,8 +457,29 @@ function remembered(key: string): string | null {
   }
 }
 
+/** A save's time as the Save section shows it, such as "26 Oct, 08:37". */
+function savedAt(time: string): string {
+  return new Date(time).toLocaleString(undefined, {
+    day: "numeric",
+    month: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+/**
+ * Reads the output device's rate from a short-lived default context, only while nothing plays or
+ * waits to start; while playing, the last probe stands and saves carry its time.
+ */
+function probeOutputRate() {
+  if (playing.value || engine?.starting) return;
+  const found = probeDeviceRate();
+  if (found) detection.value = found;
+}
+
 function markDeviceChanged() {
   deviceChanged.value = true;
+  probeOutputRate();
 }
 
 function guardUnload(event: BeforeUnloadEvent) {
@@ -423,6 +515,13 @@ async function open() {
     if (owner !== draftsOwner) drafts.value = new Map();
     draftsOwner = owner;
     openedPath = sessionPath.value;
+    lastSetup.value = result.last_setup;
+    setupLine.value = initialSetup(result.last_setup, {
+      value: preferences.value.setup,
+      at: preferences.value.setupAt,
+    });
+    rateChosen.value = null;
+    probeOutputRate();
     opened.value = result;
     notice.value = result.marks_warning ?? "";
     await select(firstPassage(result));
@@ -513,6 +612,7 @@ async function select(index: number) {
   if (index === passageIndex.value && engine) {
     rateChanged.value = false;
     await closeAudio();
+    probeOutputRate();
   }
   passageIndex.value = index;
   blind.value = undefined;
@@ -535,8 +635,6 @@ async function select(index: number) {
       });
       triggerRef(drafts);
     }
-    if (result.saved?.setup && !preferences.value.setup)
-      setPreference("setup", result.saved.setup);
     visibility.value = Object.fromEntries(result.proposals.map((p) => [p.key, true]));
     hiddenByP.value = undefined;
     names.value = result.names;
@@ -881,10 +979,16 @@ function setPlayheadOffset(value: number) {
   deviceChanged.value = false;
 }
 
+/** A rate chosen in the Save section, or null to go back to the detected or carried rate. */
 function setDeviceRate(value: number | null) {
-  setPreference("deviceRateHz", value);
+  const before = outputRate.value.hz;
+  rateChosen.value = value;
+  if (value !== null) {
+    setPreference("deviceRateHz", value);
+    setPreference("deviceRateAt", new Date().toISOString());
+  }
   rateChanged.value = false;
-  if (engine) reopenNeeded.value = true;
+  if (engine && outputRate.value.hz !== before) reopenNeeded.value = true;
 }
 
 function setPreroll(value: number) {
@@ -1025,7 +1129,11 @@ function playbackSetup(): PlaybackSetup {
     playhead_offset_ms: preferences.value.playheadOffsetMs,
     preroll_ms: preferences.value.prerollMs,
     mark_clicks: Boolean(draft.value?.clicksHeard),
-    device_rate_hz: preferences.value.deviceRateHz,
+    device_rate_hz: outputRate.value.hz,
+    device_rate_source: outputRate.value.source,
+    device_rate_from: outputRate.value.from,
+    device_rate_detected_hz: detection.value?.hz ?? null,
+    device_rate_detected_at: detection.value?.at ?? null,
     base_latency_ms: measured.base_latency_ms,
     output_latency_ms: measured.output_latency_ms,
   };
@@ -1058,26 +1166,20 @@ async function save() {
   const row = passage.value;
   const current = draft.value;
   if (!row || !current || saving.value || !blind.value) return;
-  if (!preferences.value.setup.trim()) {
-    error.value = "Describe the playback setup before saving.";
-    focusDetailsField("timing-setup");
-    return;
-  }
-  if (!preferences.value.deviceRateHz) {
-    error.value = "Choose the output device rate before saving.";
-    focusDetailsField("timing-device-rate");
-    return;
-  }
+  probeOutputRate();
   // The passage, marks, legend and playback are taken as they are now, since the listener can move
   // to another passage or change the playback before a retry. Only the session id is read again,
   // because reconnecting replaces it.
   const index = passageIndex.value;
   const shown = legend(blind.value);
   const snapshot = current.state.marks;
+  const setup = recordedSetup(setupLine.value);
   const body = {
     passage_index: index,
     marks: snapshot,
-    setup: preferences.value.setup,
+    setup: setup.text,
+    setup_source: setup.source,
+    setup_from: setup.from,
     playback: playbackSetup(),
     page: pageProvenance(),
     visible_keys: stageProposals.value.filter((p) => p.visible).map((p) => p.key),
@@ -1800,30 +1902,45 @@ function handleKeydown(event: KeyboardEvent) {
               </p>
             </PanelSection>
 
-            <PanelSection id="timing-save" title="Save and reveal" :collapsible="false">
+            <PanelSection id="timing-save" title="Save and reveal">
               <label class="field-stack" for="timing-setup">
                 <span>Playback setup</span>
                 <input
                   id="timing-setup"
-                  :value="preferences.setup"
-                  placeholder="DT 270 PRO · FineTune bypassed · 48 kHz device"
+                  v-model="setupText"
+                  placeholder="Headphones · FineTune state · volume"
                   autocomplete="off"
-                  @input="setPreference('setup', ($event.target as HTMLInputElement).value)"
+                  spellcheck="false"
                 />
               </label>
+              <p
+                class="setup-note timing-setup-source"
+                :class="{ 'timing-warning': !setupLine.text.trim() }"
+              >
+                {{ setupOrigin }}
+              </p>
               <label class="field-stack prop-field" for="timing-device-rate">
                 <span>Output device rate</span>
                 <select
                   id="timing-device-rate"
-                  :value="preferences.deviceRateHz ?? ''"
+                  :value="rateChosen ?? 'automatic'"
                   @change="setDeviceRate(Number(($event.target as HTMLSelectElement).value) || null)"
                 >
-                  <option value="">Not stated</option>
+                  <option value="automatic">{{ automaticRate }}</option>
                   <option v-for="value in deviceRates" :key="value" :value="value">
                     {{ value.toLocaleString() }} Hz
                   </option>
                 </select>
               </label>
+              <button
+                v-if="rateChosen !== null && detection"
+                class="tool-button"
+                type="button"
+                title="Use the rate the browser reports for the output device"
+                @click="setDeviceRate(null)"
+              >
+                Use detected ({{ detection.hz.toLocaleString() }} Hz)
+              </button>
               <button
                 class="tool-button timing-reveal"
                 type="button"
@@ -1970,9 +2087,16 @@ function handleKeydown(event: KeyboardEvent) {
           </span>
           <span
             class="status-item"
-            :class="{ 'status-warning': conversion.startsWith('Device converts') || !preferences.deviceRateHz }"
+            :class="{ 'status-warning': conversion.startsWith('Device converts') || !outputRate.hz }"
           >
             {{ conversion }}
+          </span>
+          <span
+            class="status-item status-optional timing-setup-status"
+            :class="{ 'status-warning': !setupLine.text.trim() }"
+            :title="setupOrigin"
+          >
+            Setup <b>{{ setupBrief }}</b>
           </span>
           <span
             class="status-item"
@@ -2275,6 +2399,24 @@ function handleKeydown(event: KeyboardEvent) {
 
 .timing-output {
   font-size: var(--text-2xs);
+}
+
+.timing-setup-source {
+  margin-top: -2px;
+  font-size: var(--text-2xs);
+}
+
+/* The setup line can be long; it gives way before the marks file does. */
+.timing-setup-status {
+  min-width: 0;
+  max-width: 240px;
+  flex: 0 1 auto;
+  overflow: hidden;
+}
+
+.timing-setup-status > b {
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .timing-output span {

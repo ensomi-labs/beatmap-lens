@@ -3,7 +3,12 @@ import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 
 import { createApp, defineComponent, h, nextTick } from "vue";
 import TimingWorkspace from "./TimingWorkspace.vue";
 import { timingJson, timingRequest } from "./timing/client";
-import { type BlindPassageRow, type OpenTiming, staleSessionError } from "./timing/contracts";
+import {
+  type BlindPassageRow,
+  type LastSetup,
+  type OpenTiming,
+  staleSessionError,
+} from "./timing/contracts";
 import type { PlayheadMotion } from "./timing/display";
 
 vi.mock("./timing/client", () => ({ timingJson: vi.fn(), timingRequest: vi.fn() }));
@@ -96,7 +101,43 @@ const server = vi.hoisted(() => ({
   colours: [3, 5],
   rates: [44_100, 44_100],
   saves: [] as Record<string, unknown>[],
+  /** What the folder held before this test's saves. */
+  lastSetup: { setup: null, device_rate: null } as LastSetup,
 }));
+
+/** As the service finds it at open: the latest save's setup and rate, else what was there. */
+function lastSetup(): LastSetup {
+  const found = { ...server.lastSetup };
+  server.saves.forEach((save, index) => {
+    const from = { session_id: "session-01", save_id: `save-${index + 1}`, time: saveTime };
+    const playback = save.playback as { device_rate_hz: number | null };
+    if (typeof save.setup === "string" && save.setup.trim())
+      found.setup = { text: save.setup.trim(), from };
+    if (playback.device_rate_hz) found.device_rate = { hz: playback.device_rate_hz, from };
+  });
+  return found;
+}
+
+const saveTime = "2026-10-25T01:00:00.000Z";
+
+/** A default AudioContext that reports `hz`, counting the contexts made and closed. */
+function stubAudioContext(hz: number) {
+  const contexts = { made: 0, closed: 0, options: [] as unknown[] };
+  vi.stubGlobal(
+    "AudioContext",
+    class {
+      readonly sampleRate = hz;
+      constructor(...options: unknown[]) {
+        contexts.made++;
+        contexts.options.push(...options);
+      }
+      async close() {
+        contexts.closed++;
+      }
+    },
+  );
+  return contexts;
+}
 
 function row(id: string, saved: boolean, sample_rate: number, loudness = -6): BlindPassageRow {
   return {
@@ -131,6 +172,7 @@ beforeEach(() => {
     colours: [3, 5],
     rates: [44_100, 44_100],
     saves: [],
+    lastSetup: { setup: null, device_rate: null },
   });
   Object.assign(engine, {
     plays: 0,
@@ -157,7 +199,7 @@ beforeEach(() => {
         id: "session-01",
         clock: "osu",
         marks_path: "/s/session-01.timing.marks.jsonl",
-        last_setup: { setup: null, device_rate: null },
+        last_setup: lastSetup(),
         passages: [
           row("passage-01", true, server.rates[0] as number, -4.2),
           row("passage-02", false, server.rates[1] as number, -12.9),
@@ -180,7 +222,7 @@ beforeEach(() => {
       };
     if (operation === "save") {
       server.saves.push(request);
-      return { save_id: `save-${server.saves.length}`, time: "2026-10-25T01:00:00.000Z" };
+      return { save_id: `save-${server.saves.length}`, time: saveTime };
     }
     if (operation === "reveal")
       return {
@@ -416,25 +458,154 @@ it("gives the keyboard back to the shortcuts after a rail control is used with t
   expect(status()).toBe("Unsaved · 1 marks");
 });
 
-it("asks for the output device rate before the first save", async () => {
-  await mount({ setup: "DT 270 PRO", deviceRateHz: null });
-  expect(hud()).toContain("Output device rate not stated");
+it("saves in a fresh browser with the setup carried from the marks file and the rate detected", async () => {
+  const contexts = stubAudioContext(44_100);
+  const from = { session_id: "session-00", save_id: "s0", time: "2026-10-24T08:37:00.000Z" };
+  server.lastSetup = {
+    setup: { text: "DT270pro 3%", from },
+    device_rate: { hz: 48_000, from },
+  };
+  await mount({});
+  const field = container.querySelector<HTMLInputElement>("#timing-setup");
+  expect(field?.value).toBe("DT270pro 3%");
+  expect(container.querySelector(".timing-setup-source")?.textContent).toContain(
+    "From the last save",
+  );
+  expect(container.querySelector(".timing-setup-status")?.textContent).toContain(
+    "DT270pro 3% · last save",
+  );
+  // The detected rate ranks above the carried one, and it equals the recording's.
+  expect(container.querySelector("#timing-device-rate option")?.textContent).toBe(
+    "Detected: 44,100 Hz",
+  );
+  expect(container.querySelector(".timing-hud-warning")).toBeNull();
+  expect(container.querySelector(".frame-status")?.textContent).toContain(
+    "No rate conversion (detected)",
+  );
   key("b");
   key("Enter");
+  await vi.waitFor(() => expect(status()).toBe("Saved"));
+  expect(server.saves[0]).toMatchObject({
+    setup: "DT270pro 3%",
+    setup_source: "last-save",
+    setup_from: from,
+    playback: {
+      device_rate_hz: 44_100,
+      device_rate_source: "detected",
+      device_rate_from: null,
+      device_rate_detected_hz: 44_100,
+      device_rate_detected_at: expect.stringMatching(/^\d{4}-\d\d-\d\dT/),
+    },
+  });
+  // Probed at open and again before the save, each time with a default context closed at once.
+  expect(contexts.made).toBe(2);
+  expect(contexts.options).toEqual([]);
+  await vi.waitFor(() => expect(contexts.closed).toBe(2));
+});
+
+it("saves with nothing known about the setup, and says so", async () => {
+  await mount({});
+  expect(container.querySelector<HTMLInputElement>("#timing-setup")?.value).toBe("");
+  expect(hud()).toContain("Output device rate not known.");
+  const item = container.querySelector(".timing-setup-status");
+  expect(item?.textContent).toContain("not stated");
+  expect(item?.classList).toContain("status-warning");
+  key("b");
+  key("Enter");
+  await vi.waitFor(() => expect(status()).toBe("Saved"));
+  expect(server.saves[0]).toMatchObject({
+    setup: "",
+    setup_source: "none",
+    setup_from: null,
+    playback: {
+      device_rate_hz: null,
+      device_rate_source: "none",
+      device_rate_detected_hz: null,
+      device_rate_detected_at: null,
+    },
+  });
+});
+
+it("records a typed setup as typed, and carries it from that save after a reopen", async () => {
+  stubAudioContext(44_100);
+  await mount({});
+  const field = () => container.querySelector<HTMLInputElement>("#timing-setup");
+  const input = field();
+  if (!input) throw new Error("No setup field");
+  input.focus();
+  input.value = "HD 600 · FineTune off · 20%";
+  input.dispatchEvent(new Event("input", { bubbles: true }));
   await nextTick();
-  expect(container.textContent).toContain("Choose the output device rate before saving.");
-  expect(server.saves).toHaveLength(0);
+  expect(container.querySelector(".timing-setup-source")?.textContent).toContain("Typed now");
+  key("b", document.body);
+  key("Enter", document.body);
+  await vi.waitFor(() => expect(status()).toBe("Saved"));
+  expect(server.saves[0]).toMatchObject({
+    setup: "HD 600 · FineTune off · 20%",
+    setup_source: "typed",
+    setup_from: null,
+  });
+
+  vi.stubGlobal("confirm", () => true);
+  button("Open another session").click();
+  await nextTick();
+  container.querySelector("form")?.dispatchEvent(new Event("submit"));
+  await opened();
+  expect(field()?.value).toBe("HD 600 · FineTune off · 20%");
+  expect(container.querySelector(".timing-setup-source")?.textContent).toContain(
+    "From the last save",
+  );
+  key("Enter");
+  await vi.waitFor(() => expect(server.saves).toHaveLength(2));
+  expect(server.saves[1]).toMatchObject({
+    setup_source: "last-save",
+    setup_from: { session_id: "session-01", save_id: "save-1", time: saveTime },
+  });
+});
+
+it("warns on the stage when the chosen rate differs from the detected one", async () => {
+  stubAudioContext(48_000);
+  await mount({ setup: "DT 270 PRO" });
+  expect(hud()).toContain("output device is at 48,000 Hz and this recording at 44,100 Hz");
   const rate = container.querySelector<HTMLSelectElement>("#timing-device-rate");
   if (!rate) throw new Error("No device rate field");
-  expect(document.activeElement).toBe(rate);
-  rate.dispatchEvent(new Event("pointerdown", { bubbles: true }));
   rate.value = "44100";
   rate.dispatchEvent(new Event("change", { bubbles: true }));
   await nextTick();
-  expect(hud()).toContain("Reopen audio before listening");
+  expect(hud()).toContain(
+    "The browser reports the output device at 48,000 Hz; 44,100 Hz is chosen.",
+  );
   key("Enter");
-  await vi.waitFor(() => expect(status()).toBe("Saved"));
-  expect(server.saves[0]).toMatchObject({ playback: { device_rate_hz: 44_100 } });
+  await vi.waitFor(() => expect(server.saves).toHaveLength(1));
+  expect(server.saves[0]).toMatchObject({
+    playback: {
+      device_rate_hz: 44_100,
+      device_rate_source: "typed",
+      device_rate_detected_hz: 48_000,
+    },
+  });
+  button("Use detected (48,000 Hz)").click();
+  await nextTick();
+  expect(hud()).not.toContain("is chosen");
+  expect(hud()).toContain("output device is at 48,000 Hz");
+});
+
+it("probes the output rate only while stopped, closing each context", async () => {
+  const contexts = stubAudioContext(44_100);
+  await mount({ setup: "DT 270 PRO" });
+  expect(contexts.made).toBe(1);
+  key(" ");
+  await vi.waitFor(() => expect(engine.plays).toBe(1));
+  engine.positionMs = 300;
+  key("b");
+  key("Enter");
+  await vi.waitFor(() => expect(server.saves).toHaveLength(1));
+  expect(contexts.made).toBe(1);
+  key(" ");
+  key("Enter");
+  await vi.waitFor(() => expect(server.saves).toHaveLength(2));
+  expect(contexts.made).toBe(2);
+  await vi.waitFor(() => expect(contexts.closed).toBe(2));
 });
 
 it("warns in the HUD when the device rate differs from the recording or the recording rate changes", async () => {
@@ -696,21 +867,6 @@ it("gives the keyboard back after the help disclosure is clicked", async () => {
   await nextTick();
   key("Enter");
   await vi.waitFor(() => expect(server.saves).toHaveLength(1));
-});
-
-it("shows the hidden details pane to ask for the playback setup before a save", async () => {
-  await mount({ setup: "", deviceRateHz: 44_100 });
-  const pane = () => container.querySelector<HTMLElement>("#timing-inspector");
-  button("Hide marks and settings").click();
-  await nextTick();
-  expect(pane()?.style.display).toBe("none");
-  key("b");
-  key("Enter");
-  await vi.waitFor(() => expect(pane()?.style.display).toBe(""));
-  await nextTick();
-  expect(hud()).toContain("Describe the playback setup before saving.");
-  expect(document.activeElement?.id).toBe("timing-setup");
-  expect(server.saves).toHaveLength(0);
 });
 
 describe("a change of output", () => {
