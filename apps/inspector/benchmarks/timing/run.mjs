@@ -673,7 +673,8 @@ const scenarios = {
 
   /**
    * Clicks on the saved marks of the pulse passage (one every 500 ms) while the main thread stalls
-   * for 450 ms every second, longer than the baseline's 200 ms lookahead: which clicks were
+   * for 450 ms every 1.3 s, longer than the baseline's 200 ms lookahead; the period is not a
+   * multiple of the beat, so the stalls meet the beats at every phase. Which clicks were
    * scheduled, on which context time, and how far ahead of their sounding.
    */
   async clicks(browser) {
@@ -685,8 +686,8 @@ const scenarios = {
       const bench = await record(page, async () => {
         await page.keyboard.press("Space");
         await sleep(500);
-        await jank(page, 450, 1000, 6);
-        await sleep(7500);
+        await jank(page, 450, 1300, 6);
+        await sleep(8500);
         await page.keyboard.press("Escape");
         await sleep(200);
       });
