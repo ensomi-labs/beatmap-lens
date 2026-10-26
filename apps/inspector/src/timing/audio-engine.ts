@@ -177,24 +177,31 @@ export class TimingAudioEngine {
   /**
    * How the playhead moves during this play, for frames on the page clock, or undefined when
    * nothing plays, the context is suspended (the transport freezes) or output has not started.
+   * Each call also keeps the position a suspension freezes at current: the workspace asks for the
+   * motion on every transport step and evaluates it itself, so `shownAt` is rarely called.
    */
   motion(offsetMs: number): PlayheadMotion | undefined {
     const anchor = this.anchor;
     const line = this.clock.line();
     if (!anchor || !line || this.context.state !== "running") return undefined;
-    return planMotion(anchor, line, offsetMs);
+    const motion = planMotion(anchor, line, offsetMs);
+    this.frozenMs = motionAt(motion, performance.now());
+    return motion;
   }
 
   /**
    * The source time the playhead shows for a frame at `frameMs` (page clock), or undefined when
-   * nothing plays. While the context is suspended it freezes at the last position.
+   * nothing plays. While the context is not running it freezes at the position shown when the
+   * motion was last asked for or evaluated.
    */
   shownAt(frameMs: number, offsetMs: number): number | undefined {
     if (!this.anchor) return undefined;
     this.sampleClock();
     const motion = this.motion(offsetMs);
-    if (motion) this.frozenMs = motionAt(motion, frameMs);
-    return this.frozenMs;
+    if (!motion) return this.frozenMs;
+    const shown = motionAt(motion, frameMs);
+    this.frozenMs = shown;
+    return shown;
   }
 
   /**
