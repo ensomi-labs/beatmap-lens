@@ -6,7 +6,15 @@
  * This module is pure (no Node imports) because the standalone service runs it with plain `node`
  * and the tests run it directly; the caller resolves paths.
  */
-import type { Mark, PageProvenance, PlaybackSetup, RevealedName } from "./contracts.ts";
+import type {
+  LastSetup,
+  Mark,
+  PageProvenance,
+  PlaybackSetup,
+  RevealedName,
+  SaveRef,
+  SetupSource,
+} from "./contracts.ts";
 
 export interface SessionFileV1 {
   version: 1;
@@ -138,7 +146,11 @@ export interface SaveEventV1 {
     decode: Record<string, unknown>;
   };
   page: PageProvenance;
+  /** Empty only with `setup_source: "none"`. */
   setup: string;
+  /** Absent from saves made before sources were recorded: the listener stated the setup. */
+  setup_source?: SetupSource;
+  setup_from?: SaveRef | null;
   playback: PlaybackSetup;
   proposals_shown: ShownProposal[];
   marks: MarkRecord[];
@@ -163,6 +175,8 @@ export function saveEvent(input: {
   passage: TimingPassage;
   marks: Mark[];
   setup: string;
+  /** Given by every current page; omitted only for a page that predates it. */
+  setupSource?: { source: SetupSource; from: SaveRef | null };
   playback: PlaybackSetup;
   page: PageProvenance;
   proposals: ShownProposal[];
@@ -188,6 +202,9 @@ export function saveEvent(input: {
     },
     page: input.page,
     setup: input.setup,
+    ...(input.setupSource
+      ? { setup_source: input.setupSource.source, setup_from: input.setupSource.from }
+      : {}),
     playback: input.playback,
     proposals_shown: input.proposals,
     marks: [...input.marks]
@@ -282,6 +299,35 @@ export function skippedLinesWarning(
   ];
   if (!parts.length) return undefined;
   return `${fileName}: ${parts.join("; ")}; skipped, and the file is left as it is.`;
+}
+
+/**
+ * The latest setup line and the latest device rate stated in one marks file's saves, by save time,
+ * of any session. Reads only `save` lines' ids, times, `setup` and `playback.device_rate_hz`.
+ */
+export function latestSetup(text: string): LastSetup {
+  let latest: LastSetup = { setup: null, device_rate: null };
+  for (const line of text.split("\n")) {
+    const record = line ? parseRecord(line) : undefined;
+    if (record?.type !== "save") continue;
+    const { id, session_id, time, setup, playback } = record;
+    if (typeof id !== "string" || typeof session_id !== "string" || typeof time !== "string")
+      continue;
+    const from = { session_id, save_id: id, time };
+    const hz = (playback as Partial<PlaybackSetup> | undefined)?.device_rate_hz;
+    latest = laterSetup(latest, {
+      setup: typeof setup === "string" && setup.trim() ? { text: setup, from } : null,
+      device_rate: typeof hz === "number" && hz > 0 ? { hz, from } : null,
+    });
+  }
+  return latest;
+}
+
+/** Each statement of `a` or `b`, whichever was saved later. */
+export function laterSetup(a: LastSetup, b: LastSetup): LastSetup {
+  const later = <T extends { from: SaveRef }>(x: T | null, y: T | null) =>
+    !x ? y : !y ? x : y.from.time > x.from.time ? y : x;
+  return { setup: later(a.setup, b.setup), device_rate: later(a.device_rate, b.device_rate) };
 }
 
 /** Back from a record to the page's mark: the derived sample is dropped, `time_ms` is kept. */

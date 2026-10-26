@@ -85,6 +85,11 @@ colour_index, beats_ms }` in a shuffled legend order. No file paths except
 the marks file, no hashes, no proposal names. The legend order and colours
 stay the same while the service runs and are replayed from the last save.
 
+At open the page also gets `last_setup`: the latest setup line and the latest
+output device rate saved in any `*.timing.marks.jsonl` of the session's
+folder (this session's and its siblings'), each with the save it came from
+(`session_id`, `save_id`, `time`). Only those fields of `save` lines are read.
+
 ## Marks output
 
 `<name>.timing.marks.jsonl` beside the session, append-only, one event per
@@ -109,9 +114,14 @@ this file, so those builds can open it safely.
             "buffer_frames": 7591680, "buffer_channels": 2,
             "clock_method": "getOutputTimestamp", "user_agent": "…", "browser_brands": ["…"] },
   "setup": "DT 270 PRO · FineTune bypassed · 44.1 kHz device",
+  "setup_source": "last-save",
+  "setup_from": { "session_id": "session-01", "save_id": "…", "time": "2026-10-25T01:02:00.000Z" },
   "playback": { "rate": 1, "volume": 0.5, "loudness_match": false, "loudness_gain_db": -12.9,
                 "loudness_applied_db": 0, "playhead_offset_ms": 12, "preroll_ms": 120,
-                "mark_clicks": false, "device_rate_hz": 44100, "base_latency_ms": 5.8, "output_latency_ms": 16.0 },
+                "mark_clicks": false, "device_rate_hz": 44100, "device_rate_source": "detected",
+                "device_rate_from": null, "device_rate_detected_hz": 44100,
+                "device_rate_detected_at": "2026-10-25T01:11:58.004Z",
+                "base_latency_ms": 5.8, "output_latency_ms": 16.0 },
   "proposals_shown": [ { "key": "p3", "colour_index": 4, "legend_index": 0, "visible_at_save": true } ],
   "marks": [
     { "id": "…", "kind": "beat", "time_ms": 72468.9342, "sample": 3195880,
@@ -125,7 +135,12 @@ this file, so those builds can open it safely.
 | --- | --- |
 | `playback.playhead_offset_ms` | The listener's moving-bar correction in wall-clock milliseconds, applied before the playback rate; positive moves the bar earlier. It affects only the drawn playhead, never a mark. |
 | `playback.mark_clicks` | `true` when any playback of this passage in the page, before this save, had clicks on the listener's own beat marks. Absent from saves made before the option existed. |
-| `playback.device_rate_hz` | The output device rate the listener stated, or `null`. A value other than `audio.sample_rate` means the system converts the rate after the page. |
+| `setup` | The listener's line about the playback setup: headphones, EQ app state, volume. Empty only with `setup_source: "none"`. |
+| `setup_source` | Where `setup` came from: `typed` (entered or changed in the page since the session was opened), `last-save` (carried unchanged from the save in `setup_from`), `browser` (carried unchanged from the value this browser remembered), `none` (no setup stated). Absent from saves made before it was recorded: the listener stated the setup, possibly remembered by the browser or copied from an earlier save. |
+| `setup_from` | `{ session_id, save_id, time }` of the save a `last-save` value came from, possibly another session's in the same folder; `null` otherwise. |
+| `playback.device_rate_hz` | The output device rate the page worked with, or `null` when not known. A value other than `audio.sample_rate` means the system converts the rate after the page. In saves without `device_rate_source`, the rate the listener stated. |
+| `playback.device_rate_source` | `typed` (chosen in the page since the session was opened), `detected` (read from a short-lived default `AudioContext`), `last-save` (carried from the save in `device_rate_from`), `browser` (remembered by this browser), `none`. |
+| `playback.device_rate_detected_hz`, `device_rate_detected_at` | The latest detection and when it ran, whatever the source, so a chosen rate that disagrees with it stays visible. Detection runs only while stopped; `null` when it never ran or failed. |
 | `playback.*_latency_ms` | The browser's reported `baseLatency` and `outputLatency`, for spotting setup changes. |
 | `proposals_shown` | Anonymous keys only; names are joined from the key file afterwards. |
 | `marks[].zoom_ms_per_px` | Milliseconds per device pixel when the mark was placed. |

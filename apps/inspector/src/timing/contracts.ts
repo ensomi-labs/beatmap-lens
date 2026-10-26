@@ -70,6 +70,39 @@ export interface OpenTiming {
   /** Lines of the marks file that could not be read and were skipped. */
   marks_warning?: string;
   passages: BlindPassageRow[];
+  /** The latest setup line and device rate saved in this session's folder, to carry over. */
+  last_setup: LastSetup;
+}
+
+/**
+ * Where a save's setup line came from. `typed`: entered or changed in the page since the session
+ * was opened. `last-save`: carried unchanged from the save in `setup_from`. `browser`: carried
+ * unchanged from the value this browser remembered. `none`: no setup was stated.
+ */
+export type SetupSource = "typed" | "last-save" | "browser" | "none";
+export const setupSources: readonly SetupSource[] = ["typed", "last-save", "browser", "none"];
+
+/** Where the output device rate came from: as for the setup, or `detected` by the page. */
+export type DeviceRateSource = "typed" | "detected" | "last-save" | "browser" | "none";
+export const deviceRateSources: readonly DeviceRateSource[] = [
+  "typed",
+  "detected",
+  "last-save",
+  "browser",
+  "none",
+];
+
+/** The save a carried value came from; it may belong to another session in the same folder. */
+export interface SaveRef {
+  session_id: string;
+  save_id: string;
+  time: string;
+}
+
+/** The latest statement of each, over the saves of every marks file in the session's folder. */
+export interface LastSetup {
+  setup: { text: string; from: SaveRef } | null;
+  device_rate: { hz: number; from: SaveRef } | null;
 }
 
 /** One proposal while blind: an opaque key, a colour and beat times, in legend order. */
@@ -118,8 +151,15 @@ export interface PlaybackSetup {
   preroll_ms: number;
   /** A click sounded at each of the listener's own beat marks. */
   mark_clicks: boolean;
-  /** The output device rate the listener declared, or null when not stated. */
+  /** The output device rate the page worked with, or null when not known. */
   device_rate_hz: number | null;
+  /** How `device_rate_hz` was known; absent from saves made before it was recorded. */
+  device_rate_source?: DeviceRateSource;
+  /** The save a `last-save` rate came from. */
+  device_rate_from?: SaveRef | null;
+  /** The latest rate the page detected, whatever the source, and when it ran. */
+  device_rate_detected_hz?: number | null;
+  device_rate_detected_at?: string | null;
   base_latency_ms: number | null;
   output_latency_ms: number | null;
 }
@@ -138,6 +178,9 @@ export interface PageProvenance {
 export interface SaveRequest extends PassageTarget {
   marks: Mark[];
   setup: string;
+  /** Absent from a page that predates it; that page always stated the setup. */
+  setup_source?: SetupSource;
+  setup_from?: SaveRef | null;
   playback: PlaybackSetup;
   page: PageProvenance;
   /** Keys of the proposals switched on at save. */

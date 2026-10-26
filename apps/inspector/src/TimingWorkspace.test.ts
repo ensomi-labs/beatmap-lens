@@ -157,6 +157,7 @@ beforeEach(() => {
         id: "session-01",
         clock: "osu",
         marks_path: "/s/session-01.timing.marks.jsonl",
+        last_setup: { setup: null, device_rate: null },
         passages: [
           row("passage-01", true, server.rates[0] as number, -4.2),
           row("passage-02", false, server.rates[1] as number, -12.9),

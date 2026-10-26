@@ -93,6 +93,8 @@ it("saves anonymous keys and derived samples, and reveals only after a current s
     audio: { sha256: "source-sha", pcm_sha256: f.pcmSha, sample_rate: 44_100, frames: f.frames },
     setup: "DT 270 PRO · FineTune bypassed · 44.1 kHz device",
   });
+  // A page that does not say where the setup came from stated it, as before sources existed.
+  expect(record).not.toHaveProperty("setup_source");
   expect(record.marks.map((m) => [m.id, m.time_ms, m.sample])).toEqual([
     ["m1", 72_468.9342, Math.floor((72_468.9342 * 44_100) / 1000 + 0.5)],
     ["m2", 72_700.25, Math.floor((72_700.25 * 44_100) / 1000 + 0.5)],
@@ -236,6 +238,131 @@ it("skips and reports a line that parses to no object instead of failing to open
   const opened: OpenTiming = await f.post("open", { session_path: f.sessionPath });
   expect(opened.passages[0]).toMatchObject({ saved: true, revealed: false });
   expect(opened.marks_warning).toContain("lines 2, 3 could not be read");
+});
+
+it("records where the setup and the device rate came from, and an empty setup only as none", async () => {
+  const f = await fixture();
+  const opened: OpenTiming = await f.post("open", { session_path: f.sessionPath });
+  const target = { session_id: opened.session_id, passage_index: 0 };
+  const from = { session_id: "session-00", save_id: "s0", time: "2026-10-24T10:00:00.000Z" };
+  const base = saveBody(target, []);
+  const body = (setup: object, playback: object = {}) => ({
+    ...base,
+    ...setup,
+    playback: { ...base.playback, ...playback },
+  });
+  const nothing = {
+    device_rate_hz: null,
+    device_rate_source: "none",
+    device_rate_from: null,
+    device_rate_detected_hz: null,
+    device_rate_detected_at: null,
+  };
+  const detected = {
+    device_rate_hz: 48_000,
+    device_rate_source: "detected",
+    device_rate_from: null,
+    device_rate_detected_hz: 48_000,
+    device_rate_detected_at: "2026-10-26T09:00:00.000Z",
+  };
+  await f.post("save", body({ setup: " ", setup_source: "none", setup_from: null }, nothing));
+  await f.post(
+    "save",
+    body({ setup: "DT270pro 3%", setup_source: "last-save", setup_from: from }, detected),
+  );
+  const refused: [object, object, string][] = [
+    [{ setup: "", setup_source: "typed" }, {}, "only with the source none"],
+    [{ setup: "DT270pro", setup_source: "none" }, {}, "only with the source none"],
+    [{ setup_source: "guessed" }, {}, "Unknown setup source"],
+    [{ setup_source: "last-save", setup_from: null }, {}, "must name the save"],
+    [{ setup_source: "typed", setup_from: from }, {}, "Only a value carried"],
+    [
+      { setup_source: "typed" },
+      { ...detected, device_rate_source: "sideways" },
+      "Unknown device rate",
+    ],
+    [
+      { setup_source: "typed" },
+      { ...nothing, device_rate_hz: 44_100 },
+      "exactly when it is not known",
+    ],
+    [{ setup_source: "typed" }, { ...detected, device_rate_hz: 44_100 }, "the rate detected"],
+    [
+      { setup_source: "typed" },
+      { ...detected, device_rate_source: "last-save" },
+      "must name the save",
+    ],
+    [
+      { setup_source: "typed" },
+      { ...detected, device_rate_detected_at: null },
+      "time it was detected",
+    ],
+  ];
+  for (const [setup, playback, message] of refused)
+    await expect(f.post("save", body(setup, playback))).rejects.toThrow(message);
+
+  const lines = (await readFile(opened.marks_path, "utf8")).trim().split("\n");
+  expect(lines).toHaveLength(2);
+  const [none, carried] = lines.map((line) => JSON.parse(line) as SaveEventV1);
+  expect(none).toMatchObject({ setup: "", setup_source: "none", setup_from: null });
+  expect(none?.playback).toMatchObject(nothing);
+  expect(carried).toMatchObject({
+    setup: "DT270pro 3%",
+    setup_source: "last-save",
+    setup_from: from,
+  });
+  expect(carried?.playback).toMatchObject(detected);
+});
+
+it("carries the latest setup line and device rate saved in the session's folder", async () => {
+  const f = await fixture();
+  const first: OpenTiming = await f.post("open", { session_path: f.sessionPath });
+  expect(first.last_setup).toEqual({ setup: null, device_rate: null });
+  const saved = await f.post(
+    "save",
+    saveBody({ session_id: first.session_id, passage_index: 0 }, [mark("m1", "beat", 72_500)]),
+  );
+  const sibling = join(f.root, "sessions", "session-00.timing.marks.jsonl");
+  const siblingSave = (id: string, time: string, setup: string, rate: number | null) =>
+    JSON.stringify({
+      version: 1,
+      type: "save",
+      id,
+      session_id: "session-00",
+      passage_id: "passage-01",
+      time,
+      setup,
+      playback: { device_rate_hz: rate },
+      marks: [],
+    });
+  await writeFile(sibling, `${siblingSave("s0", "2020-01-01T00:00:00.000Z", "HD 600", 48_000)}\n`);
+  const ours = {
+    session_id: "session-01",
+    save_id: saved.save_id,
+    time: saved.time,
+  };
+  const second: OpenTiming = await f.post("open", { session_path: f.sessionPath });
+  expect(second.last_setup).toEqual({
+    setup: { text: "DT 270 PRO · FineTune bypassed · 44.1 kHz device", from: ours },
+    device_rate: { hz: 44_100, from: ours },
+  });
+
+  // A later sibling save that stated no setup still carries its rate; other lines are passed over.
+  await appendFile(
+    sibling,
+    `${siblingSave("s9", "2099-01-01T00:00:00.000Z", "", 96_000)}\n{"type":"reveal"}\nnot json\n`,
+  );
+  const before = await readFile(sibling, "utf8");
+  const third: OpenTiming = await f.post("open", { session_path: f.sessionPath });
+  expect(third.last_setup).toEqual({
+    setup: { text: "DT 270 PRO · FineTune bypassed · 44.1 kHz device", from: ours },
+    device_rate: {
+      hz: 96_000,
+      from: { session_id: "session-00", save_id: "s9", time: "2099-01-01T00:00:00.000Z" },
+    },
+  });
+  expect(third.marks_warning).toBeUndefined();
+  expect(await readFile(sibling, "utf8")).toBe(before);
 });
 
 it("keeps an unsaved passage's legend when the session is opened again", async () => {
