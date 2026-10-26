@@ -57,9 +57,9 @@ fi
   echo "}"
 } > "$out/environment.json"
 
-echo "== lab"
-nice -n 10 node "$here/run.mjs" lab --out "$out" --port 4199
 for i in $(seq 1 "$repeats"); do
+  echo "== lab $i"
+  nice -n 10 node "$here/run.mjs" lab --label "lab-$i" --out "$out" --port 4199
   echo "== baseline $i"
   nice -n 10 node "$here/run.mjs" app --app "$scratch/baseline" --label "baseline-$i" --out "$out" --port 4190
   echo "== engine $i"

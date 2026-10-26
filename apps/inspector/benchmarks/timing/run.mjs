@@ -3,7 +3,7 @@
  * Playwright and writes the raw observations as JSON; `analyze.mjs` turns them into statistics.
  *
  *   node run.mjs app --app BUNDLE --label NAME --out DIR [--scenarios a,b] [--port 4190]
- *   node run.mjs lab --out DIR [--port 4199]
+ *   node run.mjs lab --label NAME --out DIR [--port 4199]
  *
  * Chromium runs headless with --mute-audio: nothing reaches the speakers or headphones. A muted
  * page renders audio into Chromium's fake output stream, driven by a timer, so output latency and
@@ -41,7 +41,7 @@ const { positionals, values } = parseArgs({
 const mode = positionals[0];
 if (!values.out || (mode !== "lab" && (mode !== "app" || !values.app))) {
   process.stderr.write(
-    "Usage: run.mjs app --app BUNDLE --label NAME --out DIR | run.mjs lab --out DIR\n",
+    "Usage: run.mjs app --app BUNDLE --label NAME --out DIR | run.mjs lab --label NAME --out DIR\n",
   );
   process.exit(1);
 }
@@ -87,6 +87,7 @@ const traceCategories = [
   "benchmark",
   "v8",
   "blink.user_timing",
+  "toplevel",
 ];
 
 /**
@@ -665,8 +666,9 @@ const scenarios = {
   },
 
   /**
-   * Clicks on the saved marks of the pulse passage while the main thread stalls for 300 ms every
-   * 1.5 s: which clicks were scheduled, on which context time, and how close to their sounding.
+   * Clicks on the saved marks of the pulse passage (one every 500 ms) while the main thread stalls
+   * for 450 ms every second, longer than the baseline's 200 ms lookahead: which clicks were
+   * scheduled, on which context time, and how far ahead of their sounding.
    */
   async clicks(browser) {
     const run = await open(browser, { preferences: { markClicks: true } });
@@ -677,8 +679,8 @@ const scenarios = {
       const bench = await record(page, async () => {
         await page.keyboard.press("Space");
         await sleep(500);
-        await jank(page, 300, 1500, 4);
-        await sleep(6500);
+        await jank(page, 450, 1000, 6);
+        await sleep(7500);
         await page.keyboard.press("Escape");
         await sleep(200);
       });
@@ -803,6 +805,6 @@ async function runApp() {
 
 mkdirSync(values.out, { recursive: true });
 const result = mode === "lab" ? await runLab() : await runApp();
-const file = join(values.out, `${mode === "lab" ? "lab" : values.label}.json`);
+const file = join(values.out, `${values.label}.json`);
 writeFileSync(file, JSON.stringify(result));
 process.stderr.write(`Wrote ${file}\n`);

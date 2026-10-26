@@ -68,6 +68,36 @@ function median(values) {
   return quantile(values, 0.5);
 }
 
+/**
+ * The error as seen over time: between two presented frames the picture holds while the audio
+ * moves on, so the error falls by the gap (ms of source at rate 1). `rows` are presented frames
+ * in order, `{ t, error }` in ms; each gap is sampled every 0.5 ms. Returns the spread of
+ * |error − median| over time, and the longest gap between frames.
+ */
+function heldError(rows, rate = 1) {
+  const samples = [];
+  let longestGap = 0;
+  for (let i = 0; i + 1 < rows.length; i++) {
+    const gap = rows[i + 1].t - rows[i].t;
+    longestGap = Math.max(longestGap, gap);
+    for (let at = 0; at < gap; at += 0.5) samples.push(rows[i].error - at * rate);
+  }
+  const m = median(samples);
+  const deviation = samples.map((value) => Math.abs(value - m));
+  return {
+    medianMs: round(m),
+    p95Ms: round(quantile(deviation, 0.95)),
+    maxMs: round(deviation.length ? Math.max(...deviation) : null),
+    over8Ms: round(deviation.filter((d) => d > 8).length / Math.max(1, deviation.length), 3),
+    longestGapMs: round(longestGap),
+  };
+}
+
+/** Page time of the first Escape (the stop), or Infinity. */
+function stopTime(run) {
+  return (run.keys ?? []).find((k) => k.key === "Escape")?.timeStamp ?? Number.POSITIVE_INFINITY;
+}
+
 /** Least squares y = a + b x. */
 function lineFit(xs, ys) {
   const n = xs.length;
@@ -263,9 +293,10 @@ function displaySummary(run) {
   const typical = median(intervals);
   const presented = run.presented.filter((p) => p.x !== null && p.swapMs !== null);
   const scale = presented[0] ? presented[0].imageWidth / 1470 : 2;
+  // Within the run, once the line has started: from 50 ms after t0 to 250 ms before the end.
   const moving = presented
     .map((p) => ({ swapMs: p.swapMs, xCss: p.x / scale }))
-    .filter((p) => p.xCss > 5 && p.xCss < 1380);
+    .filter((p) => p.swapMs > run.t0 + 50 && p.swapMs < run.t0 + 2350);
   const delays = moving.map((p) => p.swapMs - run.t0 - p.xCss / run.speedPxPerMs);
   const D = median(delays);
   let stale = 0;
@@ -284,6 +315,9 @@ function displaySummary(run) {
     swapDelayMs: round(D),
     presentedErrorMs: spread(delays.map((d) => d - D)),
     staleFrames: stale,
+    held: heldError(
+      moving.map((p) => ({ t: p.swapMs, error: p.xCss / run.speedPxPerMs - (p.swapMs - run.t0) })),
+    ),
   };
 }
 
@@ -338,9 +372,10 @@ function positionsSummary(run) {
   const mappings = barMappings(run.baseDraws);
   if (!clock || !start || !mappings.length) return { error: "missing clock, start or bars" };
   const drawFrames = new Set(mappings.map((m) => m.frame));
+  const stopAt = stopTime(run);
   const rows = [];
   for (const p of run.playhead ?? []) {
-    if (drawFrames.has(p.frame + 1)) continue;
+    if (drawFrames.has(p.frame + 1) || p.ts >= stopAt) continue;
     const mapping = mappings.filter((m) => m.frame <= p.frame).at(-1);
     if (!mapping) continue;
     const audioMs = heardAt(clock, start, p.ts);
@@ -464,9 +499,10 @@ function presentedSummary(part) {
   if (!clock || !start || !mappings.length) return { error: "missing clock, start or bars" };
   const mapping = mappings.at(-1);
   const dpr = part.dpr ?? 2;
+  const stopAt = stopTime(part);
   const rows = [];
   for (const p of part.presented ?? []) {
-    if (p.x === null || p.swapMs === null) continue;
+    if (p.x === null || p.swapMs === null || p.swapMs >= stopAt) continue;
     const scale = p.imageWidth / 1470;
     const deviceX = (p.x / scale - part.stage.x) * dpr;
     const audioMs = heardAt(clock, start, p.swapMs);
@@ -489,6 +525,7 @@ function presentedSummary(part) {
     shownMinusHeardAtSwapMs: spread(errors),
     deviationFromMedianMs: spread(errors.map((e) => e - m)),
     staleFrames: stale,
+    held: heldError(rows.map((r) => ({ t: r.swapMs, error: r.error }))),
   };
 }
 
@@ -526,10 +563,11 @@ function appSummary(result) {
 const files = readdirSync(dir).filter(
   (name) => name.endsWith(".json") && !["summary.json", "environment.json"].includes(name),
 );
-const summary = { dir, apps: [] };
+const summary = { dir, apps: [], labs: [] };
 for (const name of files.sort()) {
   const result = JSON.parse(readFileSync(join(dir, name), "utf8"));
-  if (result.mode === "lab") summary.lab = labSummary(result);
+  if (result.mode === "lab" && result.owner) summary.owner = labSummary(result);
+  else if (result.mode === "lab") summary.labs.push({ label: name, ...labSummary(result) });
   else if (result.mode === "app") summary.apps.push(appSummary(result));
 }
 try {
@@ -635,6 +673,11 @@ if (summary.apps.length) {
       (a) => `${a.presented.none.presentedFrames}/${a.presented.none.staleFrames}`,
     ),
     row(
+      "presented (no load): held error p95/max ms, longest gap ms",
+      (a) =>
+        `${a.presented.none.held.p95Ms}/${a.presented.none.held.maxMs}, ${a.presented.none.held.longestGapMs}`,
+    ),
+    row(
       "presented (80 ms stalls): median, deviation sd/maxabs ms",
       (a) =>
         `${fmt(a.presented.burst.shownMinusHeardAtSwapMs)}, ${fmt(a.presented.burst.deviationFromMedianMs, "sd")}/${fmt(a.presented.burst.deviationFromMedianMs, "maxabs")}`,
@@ -643,19 +686,24 @@ if (summary.apps.length) {
       "presented (80 ms stalls): frames / stale",
       (a) => `${a.presented.burst.presentedFrames}/${a.presented.burst.staleFrames}`,
     ),
+    row(
+      "presented (80 ms stalls): held error p95/max ms, longest gap ms",
+      (a) =>
+        `${a.presented.burst.held.p95Ms}/${a.presented.burst.held.maxMs}, ${a.presented.burst.held.longestGapMs}`,
+    ),
   ];
   lines.push(`| ${header.join(" | ")} |`, `| ${header.map(() => "---").join(" | ")} |`);
   for (const r of rows) lines.push(`| ${r.join(" | ")} |`);
   lines.push("");
 }
-if (summary.lab) {
+for (const lab of summary.labs) {
   lines.push(
-    "## Lab",
+    `## Lab (${lab.label})`,
     "",
     "Offline exactness:",
     "",
     "```json",
-    JSON.stringify(summary.lab.offline, null, 1),
+    JSON.stringify(lab.offline, null, 1),
     "```",
     "",
   );
@@ -663,19 +711,30 @@ if (summary.lab) {
     "AudioContext options:",
     "",
     "```json",
-    JSON.stringify(summary.lab.contextOptions, null, 1),
+    JSON.stringify(lab.contextOptions, null, 1),
     "```",
     "",
   );
-  if (Array.isArray(summary.lab.display)) {
+  if (Array.isArray(lab.display)) {
     lines.push(
-      "| variant | load | desync | rAF p95 ms | long frames | callback delay p50/p95 ms | presented | swap delay ms | presented error sd/p95abs/maxabs ms | stale |",
-      "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+      "| variant | load | desync | rAF p95 ms | long frames | callback delay p50/p95 ms | presented | swap delay ms | presented error sd/p95abs/maxabs ms | held error p95/max ms | longest gap ms |",
+      "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     );
-    for (const d of summary.lab.display)
+    for (const d of lab.display)
       lines.push(
-        `| ${d.variant} | ${d.load} | ${d.desynchronized} | ${fmt(d.rafIntervalMs, "p95")} | ${d.longFrames} | ${fmt(d.callbackDelayMs)}/${fmt(d.callbackDelayMs, "p95")} | ${d.presentedFrames} | ${d.swapDelayMs} | ${fmt(d.presentedErrorMs, "sd")}/${fmt(d.presentedErrorMs, "p95abs")}/${fmt(d.presentedErrorMs, "maxabs")} | ${d.staleFrames} |`,
+        `| ${d.variant} | ${d.load} | ${d.desynchronized} | ${fmt(d.rafIntervalMs, "p95")} | ${d.longFrames} | ${fmt(d.callbackDelayMs)}/${fmt(d.callbackDelayMs, "p95")} | ${d.presentedFrames} | ${d.swapDelayMs} | ${fmt(d.presentedErrorMs, "sd")}/${fmt(d.presentedErrorMs, "p95abs")}/${fmt(d.presentedErrorMs, "maxabs")} | ${d.held.p95Ms}/${d.held.maxMs} | ${d.held.longestGapMs} |`,
       );
-  } else lines.push("Display:", "```json", JSON.stringify(summary.lab.display), "```");
+  } else lines.push("Display:", "```json", JSON.stringify(lab.display), "```");
 }
+if (summary.owner)
+  lines.push(
+    "",
+    "## Owner's output clock (owner-stamps.js)",
+    "",
+    `User agent: ${summary.owner.userAgent}`,
+    "",
+    "```json",
+    JSON.stringify(summary.owner.contextOptions, null, 1),
+    "```",
+  );
 process.stdout.write(`${lines.join("\n")}\n`);
