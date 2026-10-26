@@ -4,6 +4,7 @@ import WorkspaceModeSwitch from "../WorkspaceModeSwitch.vue";
 import type { WorkspaceMode } from "../workspace-mode";
 import PaneSplitter from "./PaneSplitter.vue";
 import { type PaneSpec, usePaneLayout } from "./pane-layout";
+import RenderScope from "./RenderScope.vue";
 
 export type MobilePanel = "source" | "preview" | "details";
 
@@ -158,9 +159,9 @@ const toggleLabel = (spec: PaneSpec, hidden: boolean) =>
           />
         </slot>
       </div>
-      <slot name="toolbar"></slot>
+      <RenderScope><slot name="toolbar"></slot></RenderScope>
       <div class="frame-toolbar-end">
-        <slot name="toolbar-end"></slot>
+        <RenderScope><slot name="toolbar-end"></slot></RenderScope>
         <fieldset v-if="(left || right) && !narrow" class="pane-toggles" aria-label="Panels">
           <button
             v-if="left"
@@ -222,7 +223,7 @@ const toggleLabel = (spec: PaneSpec, hidden: boolean) =>
           :style="{ gridColumn: placement.left }"
           :aria-label="left.label"
         >
-          <slot name="left"></slot>
+          <RenderScope><slot name="left"></slot></RenderScope>
         </aside>
         <PaneSplitter
           v-if="!narrow"
@@ -240,7 +241,7 @@ const toggleLabel = (spec: PaneSpec, hidden: boolean) =>
         />
       </template>
       <div v-show="mainShown" class="frame-main" :style="{ gridColumn: placement.main }">
-        <slot name="main"></slot>
+        <RenderScope><slot name="main"></slot></RenderScope>
       </div>
       <template v-if="right">
         <PaneSplitter
@@ -264,13 +265,13 @@ const toggleLabel = (spec: PaneSpec, hidden: boolean) =>
           :style="{ gridColumn: placement.right }"
           :aria-label="right.label"
         >
-          <slot name="right"></slot>
+          <RenderScope><slot name="right"></slot></RenderScope>
         </aside>
       </template>
     </div>
 
     <footer v-if="$slots.status" class="frame-status">
-      <slot name="status"></slot>
+      <RenderScope><slot name="status"></slot></RenderScope>
     </footer>
   </div>
 </template>

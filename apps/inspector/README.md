@@ -33,6 +33,16 @@ The mode switch moves between five workspaces:
 | **Compare** | Judge two generated charts of the same song by listening, without knowing which model made which. |
 | **Timing** | Mark beats and non-beats in passages of the source audio, with blind timing proposals drawn over it. |
 
+Every open workspace shares one frame: a toolbar (mode tabs, the open document,
+transport, time counter, state), a main view, side panes and a status bar. Drag the
+boundary beside a side pane to resize it, or focus it with <kbd>Tab</kbd> and use
+<kbd>←</kbd>/<kbd>→</kbd> (<kbd>Shift</kbd>: larger steps), <kbd>Home</kbd>/<kbd>End</kbd>
+for the narrowest and widest width and <kbd>Enter</kbd> to hide or restore the pane; a
+double-click restores its default width. The panel buttons at the right end of the
+toolbar hide and show the side panes. The browser remembers widths, hidden panes and
+collapsed inspector sections per workspace. At 920 px and narrower, **Source**,
+**Preview** and **Details** switch between the regions instead.
+
 `/compare` and `/timing` open Compare and Timing directly. The connected Review inbox at `/review` is served
 by `pnpm review:workspace` instead; see [agent–human review](../../docs/annotation/agent-workflow.md).
 
@@ -123,8 +133,9 @@ Open the printed address; it opens the session directly. Marks append to
   <kbd>−</kbd> and <kbd>0</kbd> zoom around the selected mark or the playhead,
   <kbd>Z</kbd> toggles 0.5 ms per pixel, and the overview strip jumps. Dragging the
   ruler or proposal strip, or right- or <kbd>Ctrl</kbd>-dragging the waveform, pans. <kbd>F</kbd>
-  toggles follow. **Hide passages** in the stage header gives the stage the
-  passage list's width.
+  toggles follow. **Hide passages** at the right end of the toolbar (or
+  <kbd>Enter</kbd> on the boundary beside the list) gives the stage the passage
+  list's width; the boundaries beside both side panes resize them.
 - <kbd>1</kbd>–<kbd>9</kbd> switch proposals, <kbd>P</kbd> hides all of them and
   brings them back. <kbd>Cmd/Ctrl+S</kbd> or <kbd>Enter</kbd> saves; the first save
   needs the playback setup line (headphones, EQ app state, device rate) and the
@@ -139,7 +150,10 @@ the audio plays; <kbd>Enter</kbd>, <kbd>Tab</kbd> or leaving the field applies
 it, and −1/+1 step it (<kbd>Shift</kbd>: 10 ms). The stage header warns when the
 stated output device rate differs from the recording's, when the recording rate
 changes from the previous passage, and when the stated rate changed since the
-audio opened. Save and reveal errors appear there too.
+audio opened. Save and reveal errors appear there too. The toolbar shows the
+playhead with its sample index, the save state and **Save marks**; the status bar
+shows zoom, follow, loop region, rate, the recording's rate and channels, rate
+conversion, the playhead offset and the marks file.
 
 ## Code map
 

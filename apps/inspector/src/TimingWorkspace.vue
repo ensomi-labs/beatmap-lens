@@ -1654,8 +1654,10 @@ function handleKeydown(event: KeyboardEvent) {
             </PanelSection>
 
             <PanelSection id="timing-proposals" :title="revealed ? 'Proposals' : 'Proposals (blind)'">
-              <template v-if="stageProposals.length" #actions>
+              <!-- Always given, so the section's slots stay stable while the playhead redraws. -->
+              <template #actions>
                 <button
+                  v-if="stageProposals.length"
                   type="button"
                   class="tool-button"
                   :aria-pressed="Boolean(hiddenByP)"
