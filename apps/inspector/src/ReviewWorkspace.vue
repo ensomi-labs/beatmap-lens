@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { parseBeatmap, renderDefaults, renderSvgPages } from "beatmap-lens";
-import { computed, onBeforeUnmount, onMounted, ref, shallowRef, watch } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, shallowRef, useSlots, watch } from "vue";
 import AnnotationTimeline from "./AnnotationTimeline.vue";
 import AudioVolumeControl from "./AudioVolumeControl.vue";
 import { AUDIO_OFFSET_PREFERENCE_KEY, AudioPlaybackController, type AudioPlaybackStatus, MUSIC_PREFERENCE_KEY } from "./annotation/audio-playback";
@@ -28,14 +28,23 @@ import { agentVersionLabel, reviewVersionOptions, skillKey } from "./annotation/
 import FallingNoteViewport from "./FallingNoteViewport.vue";
 import LongNoteTailControl from "./LongNoteTailControl.vue";
 import type { PaneSpec } from "./layout/pane-layout";
+import RenderScope from "./layout/RenderScope.vue";
 import type { MobilePanel } from "./layout/WorkspaceFrame.vue";
 import WorkspaceFrame from "./layout/WorkspaceFrame.vue";
 import WorkflowClaimEditor from "./WorkflowClaimEditor.vue";
 import WorkflowSectionSliders from "./WorkflowSectionSliders.vue";
+import WorkspaceModeSwitch from "./WorkspaceModeSwitch.vue";
 import type { WorkspaceMode } from "./workspace-mode";
 
 const props = withDefaults(defineProps<{ active?: boolean; remoteSource?: RemoteSourceV2; openClaim?: { handoffId: string; claimId: string }; openHumanObservationIds?: readonly string[] }>(), { active: true });
 const emit = defineEmits<{ "change-mode": [mode: WorkspaceMode]; "back-to-inbox": []; saved: [] }>();
+const slots = useSlots();
+/**
+ * The connected inbox's navigation, put in the toolbar without a `<slot>` outlet or a conditional
+ * slot: either would make the frame's slots dynamic, and then every render of this component would
+ * re-render every region of the frame instead of only the ones that changed.
+ */
+const InboxNavigation = () => slots.navigation?.();
 const source = shallowRef<InspectedOsuSourceV1>();
 const sourceBytes = shallowRef<Uint8Array>();
 const files = shallowRef<readonly File[]>([]);
@@ -56,6 +65,10 @@ const error = ref("");
 const busy = ref(false);
 const savingDecision = shallowRef<{ sourceSha: string; handoffId: string; claimId: string }>();
 const sourceLoading = ref(false);
+/** The toolbar's status line; the toolbar may truncate it, so it is also its title. */
+const statusLine = computed(() =>
+  savingDecision.value ? "Saving section…" : busy.value || sourceLoading.value ? "Working…" : status.value,
+);
 let pendingOpenClaim = false;
 const mobilePanel = ref<MobilePanel>("preview");
 const sourcePane: PaneSpec = { id: "review-files", label: "Files and queue", defaultSize: 260, min: 200, max: 460 };
@@ -1197,17 +1210,16 @@ onBeforeUnmount(() => { window.removeEventListener("keydown", workspaceKeydown);
     <WorkspaceFrame
       v-model:mobile-panel="mobilePanel"
       layout-key="review"
-      :mode="remoteSource ? undefined : 'review'"
-      :mode-disabled="busy || sourceLoading"
       :left="sourcePane"
       :right="judgmentPane"
       mobile-label="Review view"
-      @change-mode="emit('change-mode', $event)"
     >
-      <template v-if="remoteSource" #mode>
-        <slot name="navigation">
-          <button type="button" class="tool-button" @click="emit('back-to-inbox')">← Back to inbox</button>
-        </slot>
+      <template #mode>
+        <template v-if="remoteSource">
+          <InboxNavigation v-if="$slots.navigation" />
+          <button v-else type="button" class="tool-button" @click="emit('back-to-inbox')">← Back to inbox</button>
+        </template>
+        <WorkspaceModeSwitch v-else model-value="review" :disabled="busy || sourceLoading" @update:model-value="emit('change-mode', $event)" />
       </template>
       <template #toolbar>
         <div v-if="source" class="toolbar-identity toolbar-optional">
@@ -1235,7 +1247,7 @@ onBeforeUnmount(() => { window.removeEventListener("keydown", workspaceKeydown);
         </template>
       </template>
       <template #toolbar-end>
-        <div class="review-status" role="status">{{ savingDecision ? 'Saving section…' : busy || sourceLoading ? 'Working…' : status }}</div>
+        <div class="review-status" role="status" :title="statusLine">{{ statusLine }}</div>
       </template>
       <template #left>
         <div class="review-source review-rail">
@@ -1336,7 +1348,8 @@ onBeforeUnmount(() => { window.removeEventListener("keydown", workspaceKeydown);
               <div class="review-playback-settings">
                 <p class="review-copy">{{ audioDescription }}</p>
                 <div class="review-controls">
-                  <label>Source time · ms<input :value="Math.round(playhead)" type="number" min="0" :max="endMs" @input="seekPlayhead(($event.target as HTMLInputElement).valueAsNumber)"></label>
+                  <!-- Its own render scope: the playhead changes every frame while playing, and the rest of this pane does not. -->
+                  <RenderScope><label>Source time · ms<input :value="Math.round(playhead)" type="number" min="0" :max="endMs" @input="seekPlayhead(($event.target as HTMLInputElement).valueAsNumber)"></label></RenderScope>
                   <label>Visual speed · px/s<input :value="speed" type="number" min="30" max="2000" step="30" @change="setVisualSpeed"></label>
                 </div>
                 <label>Global audio offset · ms<input :value="audioOffsetMs" type="number" step="10" :disabled="transportDisabled" @change="setAudioOffset(($event.target as HTMLInputElement).valueAsNumber)"></label>
@@ -1476,6 +1489,7 @@ onBeforeUnmount(() => { window.removeEventListener("keydown", workspaceKeydown);
 .review-rail button:active, .review-calibration > button:active { background: var(--surface-2); }
 .review-rail button:disabled { cursor: not-allowed; opacity: 0.45; }
 .review-rail button.review-primary { color: oklch(100% 0 0); background: var(--signal-fill); }
+.review-rail button.review-primary:disabled { color: var(--ink-secondary); background: var(--surface-3); }
 @media (hover: hover) {
   .review-rail button:hover:not(:disabled), .review-calibration > button:hover { color: var(--ink); background: var(--surface-3-hover); }
   .review-rail button.review-primary:hover:not(:disabled) { background: var(--signal-fill-hover); }
