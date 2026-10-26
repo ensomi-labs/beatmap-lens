@@ -66,6 +66,9 @@ const markColour = "#ffffff";
 /** Either side of a selected mark, so it differs from a proposal bar of any colour. */
 const markCasingColour = "#06090e";
 const markSelectedPlate = "#2466c3";
+/** A selection drag in progress: the interface accent, as selected rows in the marks list. */
+const selectionDragFill = "rgba(101, 167, 250, 0.16)";
+const selectionDragEdge = "rgba(101, 167, 250, 0.75)";
 const rulerHeight = 22;
 const stripRowHeight = 6;
 const marksHeight = 18;
@@ -607,9 +610,9 @@ function drawOverlay() {
     const right = deviceX(pendingSelection.value.endMs);
     const top = L.spectrogram.top * dpr;
     const height = (L.marks.top + L.marks.height - L.spectrogram.top) * dpr;
-    context.fillStyle = "rgba(143, 179, 255, 0.16)";
+    context.fillStyle = selectionDragFill;
     context.fillRect(left, top, right - left, height);
-    context.fillStyle = "rgba(143, 179, 255, 0.7)";
+    context.fillStyle = selectionDragEdge;
     vline(context, left, top, height);
     vline(context, right, top, height);
   }

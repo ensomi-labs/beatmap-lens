@@ -116,6 +116,7 @@ function onKeydown(event: KeyboardEvent) {
 </script>
 
 <template>
+  <!-- biome-ignore lint/a11y/useSemanticElements: The APG window splitter is a focusable separator with a value and a pointer-sized grab area, which an hr does not give. -->
   <div
     class="pane-splitter"
     :class="[`pane-splitter--${edge}`, { 'is-dragging': dragging, 'is-collapsed': collapsed }]"
@@ -123,12 +124,12 @@ function onKeydown(event: KeyboardEvent) {
     tabindex="0"
     aria-orientation="vertical"
     :aria-controls="controls"
-    :aria-label="`Resize ${label}`"
+    :aria-label="`Resize ${label.toLowerCase()}`"
     :aria-valuemin="0"
     :aria-valuemax="max"
     :aria-valuenow="collapsed ? 0 : size"
     :aria-valuetext="valueText"
-    :title="`Drag to resize ${label}; double-click restores its width`"
+    :title="`Drag to resize ${label.toLowerCase()}; double-click restores its width`"
     @mousedown.prevent
     @pointerdown="onPointerDown"
     @pointermove="onPointerMove"

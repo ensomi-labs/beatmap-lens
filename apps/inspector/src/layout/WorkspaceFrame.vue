@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, onBeforeUnmount, ref } from "vue";
 import WorkspaceModeSwitch from "../WorkspaceModeSwitch.vue";
 import type { WorkspaceMode } from "../workspace-mode";
 import PaneSplitter from "./PaneSplitter.vue";
@@ -10,8 +10,8 @@ export type MobilePanel = "source" | "preview" | "details";
 /**
  * The shell every open workspace shares: a toolbar, an optional left pane, the main view, an
  * optional right pane, and a status bar. Side panes are resized at their boundaries and hidden
- * from the toolbar; their widths and hidden states are kept per workspace in the browser. Below
- * 920 px a view switch shows one of the three at a time instead.
+ * from the toolbar; their widths and hidden states are kept per workspace in the browser. At
+ * 920 px and below a view switch shows one of the three at a time instead.
  */
 const props = withDefaults(
   defineProps<{
@@ -38,12 +38,24 @@ const emit = defineEmits<{
 const specs = [props.left, props.right].filter((spec): spec is PaneSpec => Boolean(spec));
 const layout = usePaneLayout(props.layoutKey, specs);
 
+/** At 920 px and below the panes are not side by side; the view switch shows one at a time. */
+const narrowQuery =
+  typeof window.matchMedia === "function" ? window.matchMedia("(max-width: 920px)") : undefined;
+const narrow = ref(narrowQuery?.matches ?? false);
+const onNarrowChange = (event: MediaQueryListEvent) => {
+  narrow.value = event.matches;
+};
+narrowQuery?.addEventListener("change", onNarrowChange);
+onBeforeUnmount(() => narrowQuery?.removeEventListener("change", onNarrowChange));
+
 function paneState(spec: PaneSpec | undefined) {
   return spec ? layout.state.value[spec.id] : undefined;
 }
 
 const leftHidden = computed(() =>
-  props.leftCollapsed !== undefined ? props.leftCollapsed : Boolean(paneState(props.left)?.collapsed),
+  props.leftCollapsed !== undefined
+    ? props.leftCollapsed
+    : Boolean(paneState(props.left)?.collapsed),
 );
 const rightHidden = computed(() => Boolean(paneState(props.right)?.collapsed));
 
@@ -66,15 +78,35 @@ function reset(spec: PaneSpec) {
 }
 
 const columns = computed(() => {
+  if (narrow.value) return "minmax(0, 1fr)";
   const width = (spec: PaneSpec | undefined, hidden: boolean) =>
-    spec ? [hidden ? "0px" : `min(${paneState(spec)?.size ?? spec.defaultSize}px, 38vw)`, "1px"] : [];
+    spec
+      ? [hidden ? "0px" : `min(${paneState(spec)?.size ?? spec.defaultSize}px, 38vw)`, "1px"]
+      : [];
   const left = width(props.left, leftHidden.value);
   const right = width(props.right, rightHidden.value).reverse();
   return [...left, "minmax(0, 1fr)", ...right].join(" ");
 });
 
+/** Whether a pane is on screen: by its hidden state on desktop, by the view switch when narrow. */
+function paneShown(side: "left" | "right"): boolean {
+  if (narrow.value && props.mobilePanel !== undefined)
+    return props.mobilePanel === (side === "left" ? "source" : "details");
+  return side === "left" ? !leftHidden.value : !rightHidden.value;
+}
+
+const mainShown = computed(
+  () => !narrow.value || props.mobilePanel === undefined || props.mobilePanel === "preview",
+);
+
 /** Shows a hidden side pane, for a control inside it that must take focus; true if it was hidden. */
 function showPane(side: "left" | "right"): boolean {
+  if (narrow.value && props.mobilePanel !== undefined) {
+    const panel = side === "left" ? "source" : "details";
+    if (props.mobilePanel === panel) return false;
+    emit("update:mobilePanel", panel);
+    return true;
+  }
   const spec = side === "left" ? props.left : props.right;
   const hidden = side === "left" ? leftHidden.value : rightHidden.value;
   if (!spec || !hidden) return false;
@@ -89,16 +121,18 @@ const mobilePanels: { key: MobilePanel; label: string }[] = [
   { key: "preview", label: "Preview" },
   { key: "details", label: "Details" },
 ];
+
+const toggleLabel = (spec: PaneSpec, hidden: boolean) =>
+  `${hidden ? "Show" : "Hide"} ${spec.label.toLowerCase()}`;
 </script>
 
 <template>
   <div
     class="workspace-frame"
     :class="{
-      'has-mobile-switch': mobilePanel !== undefined,
+      'is-narrow': narrow,
       'is-left-hidden': left && leftHidden,
       'is-right-hidden': right && rightHidden,
-      [`is-mobile-${mobilePanel}`]: mobilePanel !== undefined,
     }"
   >
     <header class="frame-toolbar">
@@ -117,15 +151,15 @@ const mobilePanels: { key: MobilePanel; label: string }[] = [
       <slot name="toolbar"></slot>
       <div class="frame-toolbar-end">
         <slot name="toolbar-end"></slot>
-        <div v-if="left || right" class="pane-toggles" role="group" aria-label="Panels">
+        <fieldset v-if="(left || right) && !narrow" class="pane-toggles" aria-label="Panels">
           <button
             v-if="left"
             type="button"
             class="tool-button tool-button--icon pane-toggle"
-            :aria-pressed="!leftHidden"
+            :class="{ 'is-shown': !leftHidden }"
+            :aria-expanded="!leftHidden"
             :aria-controls="left.id"
-            :aria-label="left.label"
-            :title="`${leftHidden ? 'Show' : 'Hide'} ${left.label}`"
+            :title="toggleLabel(left, leftHidden)"
             @click="setCollapsed(left, !leftHidden)"
           >
             <svg viewBox="0 0 16 16" aria-hidden="true">
@@ -133,15 +167,16 @@ const mobilePanels: { key: MobilePanel; label: string }[] = [
               <path class="pane-toggle-fill" d="M2 3h4v10H2z" />
               <path d="M6.5 2.5v11" />
             </svg>
+            <span class="sr-only">{{ toggleLabel(left, leftHidden) }}</span>
           </button>
           <button
             v-if="right"
             type="button"
             class="tool-button tool-button--icon pane-toggle"
-            :aria-pressed="!rightHidden"
+            :class="{ 'is-shown': !rightHidden }"
+            :aria-expanded="!rightHidden"
             :aria-controls="right.id"
-            :aria-label="right.label"
-            :title="`${rightHidden ? 'Show' : 'Hide'} ${right.label}`"
+            :title="toggleLabel(right, rightHidden)"
             @click="setCollapsed(right, !rightHidden)"
           >
             <svg viewBox="0 0 16 16" aria-hidden="true">
@@ -149,12 +184,13 @@ const mobilePanels: { key: MobilePanel; label: string }[] = [
               <path class="pane-toggle-fill" d="M10 3h4v10h-4z" />
               <path d="M9.5 2.5v11" />
             </svg>
+            <span class="sr-only">{{ toggleLabel(right, rightHidden) }}</span>
           </button>
-        </div>
+        </fieldset>
       </div>
     </header>
 
-    <nav v-if="mobilePanel !== undefined" class="frame-view-switch" :aria-label="mobileLabel">
+    <nav v-if="narrow && mobilePanel !== undefined" class="frame-view-switch" :aria-label="mobileLabel">
       <button
         v-for="panel in mobilePanels"
         :key="panel.key"
@@ -170,15 +206,15 @@ const mobilePanels: { key: MobilePanel; label: string }[] = [
     <div class="frame-body" :style="{ gridTemplateColumns: columns }">
       <template v-if="left">
         <aside
-          v-show="!leftHidden"
+          v-show="paneShown('left')"
           :id="left.id"
           class="frame-pane frame-pane--left"
-          :class="{ 'is-mobile-active': mobilePanel === 'source' }"
           :aria-label="left.label"
         >
           <slot name="left"></slot>
         </aside>
         <PaneSplitter
+          v-if="!narrow"
           :controls="left.id"
           :label="left.label"
           :size="paneState(left)?.size ?? left.defaultSize"
@@ -191,11 +227,12 @@ const mobilePanels: { key: MobilePanel; label: string }[] = [
           @reset="reset(left)"
         />
       </template>
-      <div class="frame-main" :class="{ 'is-mobile-active': mobilePanel === 'preview' }">
+      <div v-show="mainShown" class="frame-main">
         <slot name="main"></slot>
       </div>
       <template v-if="right">
         <PaneSplitter
+          v-if="!narrow"
           :controls="right.id"
           :label="right.label"
           :size="paneState(right)?.size ?? right.defaultSize"
@@ -208,10 +245,9 @@ const mobilePanels: { key: MobilePanel; label: string }[] = [
           @reset="reset(right)"
         />
         <aside
-          v-show="!rightHidden"
+          v-show="paneShown('right')"
           :id="right.id"
           class="frame-pane frame-pane--right"
-          :class="{ 'is-mobile-active': mobilePanel === 'details' }"
           :aria-label="right.label"
         >
           <slot name="right"></slot>

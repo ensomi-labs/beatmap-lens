@@ -1450,8 +1450,8 @@ function handleKeydown(event: KeyboardEvent) {
                     {{ passage.hint }}
                   </span>
                 </div>
-                <div class="toolbar-group" role="group" aria-label="Playback rate">
-                  <span class="toolbar-label">Rate</span>
+                <fieldset class="toolbar-group" aria-label="Playback rate">
+                  <span class="toolbar-label" aria-hidden="true">Rate</span>
                   <div class="segmented">
                     <button
                       v-for="value in playbackRates"
@@ -1463,16 +1463,16 @@ function handleKeydown(event: KeyboardEvent) {
                       {{ value }}×
                     </button>
                   </div>
-                </div>
-                <div class="toolbar-group" role="group" aria-label="Zoom">
-                  <span class="toolbar-label">Zoom</span>
+                </fieldset>
+                <fieldset class="toolbar-group" aria-label="Zoom">
+                  <span class="toolbar-label" aria-hidden="true">Zoom</span>
                   <div class="segmented">
                     <button type="button" aria-label="Zoom out" aria-keyshortcuts="-" title="Zoom out (−)" @click="zoom(2)">−</button>
                     <button type="button" aria-label="Zoom in" aria-keyshortcuts="+" title="Zoom in (+)" @click="zoom(0.5)">+</button>
                     <button type="button" aria-keyshortcuts="0" title="Fit the passage (0)" @click="fitPassage">Fit</button>
                     <button type="button" aria-keyshortcuts="Z" title="0.5 ms per pixel, or back to fit (Z)" @click="toggleFineZoom">Fine</button>
                   </div>
-                </div>
+                </fieldset>
                 <button
                   class="tool-button"
                   type="button"
@@ -1483,13 +1483,13 @@ function handleKeydown(event: KeyboardEvent) {
                 >
                   Follow
                 </button>
-                <div class="toolbar-group" role="group" aria-label="Loop region">
-                  <span class="toolbar-label">Loop</span>
+                <fieldset class="toolbar-group" aria-label="Loop region">
+                  <span class="toolbar-label" aria-hidden="true">Loop</span>
                   <div class="segmented">
-                    <button type="button" aria-keyshortcuts="I" title="Loop starts at the playhead (I)" @click="setLoopEdge('startMs')">In</button>
-                    <button type="button" aria-keyshortcuts="O" title="Loop ends at the playhead (O)" @click="setLoopEdge('endMs')">Out</button>
+                    <button type="button" aria-label="Loop in" aria-keyshortcuts="I" title="Loop starts at the playhead (I)" @click="setLoopEdge('startMs')">In</button>
+                    <button type="button" aria-label="Loop out" aria-keyshortcuts="O" title="Loop ends at the playhead (O)" @click="setLoopEdge('endMs')">Out</button>
                   </div>
-                </div>
+                </fieldset>
               </div>
               <p v-if="rateWarning" class="notice-bar timing-hud-warning" role="status">
                 <span class="health-dot" aria-hidden="true"></span>
@@ -1539,30 +1539,32 @@ function handleKeydown(event: KeyboardEvent) {
 
         <template #right>
           <div class="timing-details">
-            <PanelSection id="timing-marks" title="Marks">
+            <PanelSection id="timing-marks" class="timing-marks-heading" title="Marks">
               <template #meta>
-                {{ selection.length ? `${selection.length} of ${marks.length} selected` : `${marks.length}` }}
+                <span class="rail-count" :title="selection.length ? 'Selected of all marks' : 'Marks'">
+                  {{ selection.length ? `${selection.length} of ${marks.length}` : marks.length }}
+                </span>
               </template>
-              <div class="timing-mark-actions" role="group" aria-label="Mark actions">
+              <fieldset class="timing-mark-actions" aria-label="Mark actions">
                 <button
                   type="button"
-                  class="tool-button"
+                  class="tool-button timing-place"
                   aria-keyshortcuts="B"
                   title="Place a beat at the playhead, or where it is heard while playing (B)"
                   @pointerdown="onMarkButton('beat', $event)"
                   @click="onMarkButton('beat', $event)"
                 >
-                  Beat <kbd>B</kbd>
+                  Beat at playhead <kbd>B</kbd>
                 </button>
                 <button
                   type="button"
-                  class="tool-button"
+                  class="tool-button timing-place"
                   aria-keyshortcuts="N"
                   title="Place an unbeat at the playhead, or where it is heard while playing (N)"
                   @pointerdown="onMarkButton('unbeat', $event)"
                   @click="onMarkButton('unbeat', $event)"
                 >
-                  Unbeat <kbd>N</kbd>
+                  Unbeat at playhead <kbd>N</kbd>
                 </button>
                 <button
                   type="button"
@@ -1604,7 +1606,7 @@ function handleKeydown(event: KeyboardEvent) {
                 >
                   Redo
                 </button>
-              </div>
+              </fieldset>
               <fieldset class="timing-nudge" aria-labelledby="nudge-label">
                 <span id="nudge-label" class="toolbar-label">Move selected, ms</span>
                 <div class="segmented">
@@ -1620,7 +1622,7 @@ function handleKeydown(event: KeyboardEvent) {
                   </button>
                 </div>
               </fieldset>
-              <ol class="timing-mark-list" aria-label="Marks in time order">
+              <ol v-if="marks.length" class="timing-mark-list" aria-label="Marks in time order">
                 <li v-for="mark in marks" :key="mark.id">
                   <button
                     type="button"
@@ -1636,10 +1638,10 @@ function handleKeydown(event: KeyboardEvent) {
                     <span class="timing-mark-kind">{{ mark.kind }}{{ mark.blind ? "" : " · seen" }}</span>
                   </button>
                 </li>
-                <li v-if="!marks.length" class="timing-mark-empty">
-                  No marks yet. Shift+click the waveform or press B.
-                </li>
               </ol>
+              <p v-else class="timing-mark-empty">
+                No marks yet. Shift+click the waveform or press B.
+              </p>
               <details class="timing-help">
                 <summary>Mouse and keys</summary>
                 <p>
@@ -1989,8 +1991,21 @@ function handleKeydown(event: KeyboardEvent) {
 
 .timing-mark-actions {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 4px;
+  min-inline-size: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.timing-mark-actions .tool-button {
+  min-width: 0;
+  padding: 0 4px;
+}
+
+.timing-place {
+  grid-column: span 2;
 }
 
 .timing-nudge {
@@ -2007,12 +2022,6 @@ function handleKeydown(event: KeyboardEvent) {
 .timing-nudge .segmented {
   flex: 1 1 auto;
   max-width: 240px;
-}
-
-.timing-nudge .segmented button {
-  flex: 1 1 0;
-  min-width: 0;
-  padding: 0 2px;
 }
 
 .timing-mark-list,
@@ -2060,6 +2069,12 @@ function handleKeydown(event: KeyboardEvent) {
   color: var(--ink);
   background: var(--signal-soft);
   box-shadow: inset 2px 0 0 var(--signal);
+}
+
+.timing-nudge .segmented button {
+  flex: 1 1 0;
+  min-width: 0;
+  padding: 0 2px;
 }
 
 .timing-mark-glyph {
@@ -2224,7 +2239,7 @@ function handleKeydown(event: KeyboardEvent) {
 }
 
 @media (max-width: 1240px) {
-  .timing-workspace :deep(.toolbar-optional) {
+  .toolbar-optional {
     display: none;
   }
 }

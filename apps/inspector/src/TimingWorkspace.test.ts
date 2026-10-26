@@ -191,12 +191,16 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+/** The toolbar (counter, save state) and the stage header (passage, warnings, errors). */
 function hud(): string {
-  return container.querySelector(".timing-hud")?.textContent?.replace(/\s+/g, " ") ?? "";
+  return [".frame-toolbar", ".timing-hud"]
+    .map((selector) => container.querySelector(selector)?.textContent ?? "")
+    .join(" ")
+    .replace(/\s+/g, " ");
 }
 
 function status(): string {
-  return container.querySelectorAll(".timing-hud .health-status")[1]?.textContent?.trim() ?? "";
+  return container.querySelector(".timing-status")?.textContent?.trim() ?? "";
 }
 
 function key(name: string, target: EventTarget = document.activeElement ?? document.body) {
@@ -328,14 +332,16 @@ it("shows revealed names only beside the passage they were revealed for", async 
   release();
   await vi.waitFor(() => expect(mock.settledResults[reveal]?.type).toBe("fulfilled"));
   await nextTick();
-  expect(hud()).toMatch(/Passage 01 of 2 .* Blind/);
+  expect(hud()).toContain("Passage 01 of 2");
+  expect(container.querySelector(".timing-blind")?.textContent?.trim()).toBe("Blind");
   expect(container.querySelector(".timing-legend")?.textContent).not.toContain("model-a");
 
   // The service recorded the reveal, so the passage it was for reads as revealed.
   passageKey("BracketRight");
   await vi.waitFor(() => expect(hud()).toContain("Passage 02 of 2"));
   await opened();
-  expect(hud()).toMatch(/Passage 02 of 2 .* Revealed/);
+  expect(hud()).toContain("Passage 02 of 2");
+  expect(container.querySelector(".timing-blind")?.textContent?.trim()).toBe("Revealed");
 });
 
 it("brings unsaved marks back when the same session is opened again", async () => {
@@ -364,7 +370,7 @@ it("gives the keyboard back to the shortcuts after a rail control is used with t
   expect(container.querySelector<HTMLInputElement>(".timing-offset-editor input")?.value).toBe("1");
 
   // From the keyboard the control keeps focus and Space stays with it.
-  const follow = button("On");
+  const follow = button("Follow");
   follow.focus();
   follow.click();
   expect(document.activeElement).toBe(follow);
@@ -468,10 +474,8 @@ it("keeps digits typed into the offset and pre-roll fields while playback redraw
     expect(hud()).toContain(`00:00.${positionMs}`);
   };
 
-  const fields = container.querySelectorAll<HTMLInputElement>(
-    ".timing-details input[type='number']",
-  );
-  const [offset, preroll] = fields;
+  const offset = container.querySelector<HTMLInputElement>(".timing-details #timing-offset");
+  const preroll = container.querySelector<HTMLInputElement>(".timing-details #timing-preroll");
   if (!offset || !preroll) throw new Error("No number fields");
   offset.focus();
   for (const [index, text] of ["1", "10", "100"].entries()) {
