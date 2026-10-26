@@ -2,6 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, shallowRef, watch } from "vue";
 import type { Mark } from "./timing/contracts";
 import { nearestSample } from "./timing/format";
+import { marksWithin, type SelectMode } from "./timing/marks";
 import { proposalColour } from "./timing/palette";
 import {
   computeSpectrogram,
@@ -38,7 +39,7 @@ const props = defineProps<{
   view: TimeView;
   proposals: StageProposal[];
   marks: Mark[];
-  selectedId: string | null;
+  selectedIds: string[];
   playheadMs: number;
   loopRegion: TimeRange;
   looping: boolean;
@@ -48,7 +49,7 @@ const emit = defineEmits<{
   "update:view": [view: TimeView];
   resize: [widthPx: number, devicePixelRatio: number];
   place: [kind: Mark["kind"], timeMs: number];
-  select: [id: string];
+  select: [ids: string[], mode: SelectMode];
   seek: [timeMs: number];
   "loop-region": [region: TimeRange];
 }>();
@@ -68,6 +69,8 @@ const size = ref({ width: 0, height: 0, dpr: 1 });
 const spectrogram = shallowRef<Spectrogram>();
 const hoverX = ref<number>();
 const pendingLoop = ref<TimeRange>();
+/** The time range a selection drag covers so far. */
+const pendingSelection = ref<TimeRange>();
 
 const sampleRate = computed(() => props.buffer.sampleRate);
 const channels = computed(() =>
@@ -211,7 +214,7 @@ watch(
     props.view,
     props.proposals,
     props.marks,
-    props.selectedId,
+    props.selectedIds,
     props.loopRegion,
     props.looping,
     props.span,
@@ -219,20 +222,30 @@ watch(
   ],
   () => scheduleBase(),
 );
+// The overlay is drawn at once, not in a later frame. During playback the playhead changes in
+// every animation frame; a redraw requested from there runs a frame late, and one cancelled and
+// requested again on every change never runs at all while the audio plays.
 watch(
-  () => [props.playheadMs, hoverX.value, pendingLoop.value, props.view],
-  () => scheduleOverlay(),
+  () => [props.playheadMs, hoverX.value, pendingLoop.value, pendingSelection.value, props.view],
+  () => drawOverlay(),
+  { flush: "post" },
 );
 watch(spectrogram, () => columnCache.clear());
 
+// A frame already requested draws whatever the props are when it runs, so it is kept, never
+// cancelled and requested again.
 function scheduleBase() {
-  cancelAnimationFrame(baseFrame);
-  baseFrame = requestAnimationFrame(drawBase);
+  baseFrame ||= requestAnimationFrame(() => {
+    baseFrame = 0;
+    drawBase();
+  });
 }
 
 function scheduleOverlay() {
-  cancelAnimationFrame(overlayFrame);
-  overlayFrame = requestAnimationFrame(drawOverlay);
+  overlayFrame ||= requestAnimationFrame(() => {
+    overlayFrame = 0;
+    drawOverlay();
+  });
 }
 
 /** Device-pixel x of a time; rounding happens only where a line is drawn. */
@@ -481,8 +494,9 @@ function drawMarks(context: CanvasRenderingContext2D) {
     context.textBaseline = "middle";
     context.fillText(String(groupCount), groupX + 7 * dpr, glyphY);
   };
+  const selectedIds = new Set(props.selectedIds);
   for (const mark of marks) {
-    const selected = mark.id === props.selectedId;
+    const selected = selectedIds.has(mark.id);
     const x = deviceX(mark.time_ms);
     const lineWidth = Math.max(1, Math.round(dpr)) * (selected ? 2 : 1);
     context.fillStyle = selected ? "#8fb3ff" : "#ffffff";
@@ -558,6 +572,17 @@ function drawOverlay() {
     context.fillStyle = "rgba(255, 255, 255, 0.12)";
     context.fillRect(Math.min(left, right), 0, Math.abs(right - left), L.overview.top * dpr);
   }
+  if (pendingSelection.value) {
+    const left = deviceX(pendingSelection.value.startMs);
+    const right = deviceX(pendingSelection.value.endMs);
+    const top = L.spectrogram.top * dpr;
+    const height = (L.marks.top + L.marks.height - L.spectrogram.top) * dpr;
+    context.fillStyle = "rgba(143, 179, 255, 0.16)";
+    context.fillRect(left, top, right - left, height);
+    context.fillStyle = "rgba(143, 179, 255, 0.7)";
+    vline(context, left, top, height);
+    vline(context, right, top, height);
+  }
   if (hoverX.value !== undefined) {
     const timeMs = xToMs(props.view, hoverX.value);
     const x = hoverX.value * dpr;
@@ -594,8 +619,12 @@ function drawOverlay() {
   context.fillRect(overviewX - dpr, L.overview.top * dpr, 2 * dpr, L.overview.height * dpr);
 }
 
-// Pointer: a press that moves beyond the threshold drags (pan, loop selection, overview jump);
-// otherwise it clicks (seek on the ruler and overview, select or place on the lanes).
+// Pointer: a press that moves beyond the threshold drags, otherwise it clicks.
+// - Spectrogram, waveform and mark lanes: a click selects the mark under it (Cmd toggles it) or
+//   clears the selection; a drag selects every mark in its range (Cmd adds them). Shift+click
+//   places a beat, right-click an unbeat, Shift+drag selects the loop region, right-drag pans.
+// - Ruler and proposal strip: a click seeks, a drag pans (Shift+drag: loop region).
+// - Overview: a click or drag jumps.
 let press:
   | {
       x: number;
@@ -604,10 +633,16 @@ let press:
       /** Right button, or Control+click (the macOS secondary click). */
       secondary: boolean;
       shift: boolean;
+      /** Cmd (or the Windows key): toggle or add to the selection instead of replacing it. */
+      meta: boolean;
       view: TimeView;
       dragging: boolean;
     }
   | undefined;
+
+function isMarkLane(lane: LaneName): boolean {
+  return lane === "spectrogram" || lane === "waveform" || lane === "marks";
+}
 
 function localPoint(event: PointerEvent | WheelEvent | MouseEvent) {
   const rect = overlay.value?.getBoundingClientRect();
@@ -625,6 +660,7 @@ function onPointerDown(event: PointerEvent) {
     lane: laneAt(y),
     secondary: event.button === 2 || (event.button === 0 && event.ctrlKey),
     shift: event.shiftKey,
+    meta: event.metaKey,
     view: props.view,
     dragging: false,
   };
@@ -638,13 +674,16 @@ function onPointerMove(event: PointerEvent) {
   const dx = x - press.x;
   if (!press.dragging && Math.abs(dx) * size.value.dpr < dragThreshold) return;
   press.dragging = true;
+  const range = {
+    startMs: Math.min(xToMs(press.view, press.x), xToMs(press.view, x)),
+    endMs: Math.max(xToMs(press.view, press.x), xToMs(press.view, x)),
+  };
   if (press.lane === "overview") {
     jumpTo(xToMs(overviewView.value, x));
   } else if (press.shift) {
-    pendingLoop.value = {
-      startMs: Math.min(xToMs(press.view, press.x), xToMs(press.view, x)),
-      endMs: Math.max(xToMs(press.view, press.x), xToMs(press.view, x)),
-    };
+    pendingLoop.value = range;
+  } else if (isMarkLane(press.lane) && !press.secondary) {
+    pendingSelection.value = range;
   } else {
     emit("update:view", { startMs: press.view.startMs - dx * press.view.msPerPx, msPerPx: press.view.msPerPx });
   }
@@ -656,7 +695,10 @@ function onPointerUp(event: PointerEvent) {
   if (!current) return;
   if (current.dragging) {
     if (pendingLoop.value) emit("loop-region", pendingLoop.value);
+    if (pendingSelection.value)
+      emit("select", marksWithin(props.marks, pendingSelection.value), current.meta ? "add" : "replace");
     pendingLoop.value = undefined;
+    pendingSelection.value = undefined;
     return;
   }
   const { x } = localPoint(event);
@@ -671,20 +713,28 @@ function onPointerUp(event: PointerEvent) {
     emit("seek", timeMs);
     return;
   }
+  const inside = timeMs >= props.span.startMs && timeMs <= props.span.endMs;
+  if (current.shift && !current.secondary) {
+    if (inside) emit("place", "beat", timeMs);
+    else emit("seek", timeMs);
+    return;
+  }
   const toleranceMs = (dragThreshold / size.value.dpr) * props.view.msPerPx;
   let near: Mark | undefined;
   for (const mark of props.marks) {
     const distance = Math.abs(mark.time_ms - timeMs);
     if (distance <= toleranceMs && (!near || distance < Math.abs(near.time_ms - timeMs))) near = mark;
   }
-  if (near) emit("select", near.id);
-  else if (timeMs < props.span.startMs || timeMs > props.span.endMs) emit("seek", timeMs);
-  else emit("place", current.secondary ? "unbeat" : "beat", timeMs);
+  if (near) emit("select", [near.id], current.meta && !current.secondary ? "toggle" : "replace");
+  else if (!inside) emit("seek", timeMs);
+  else if (current.secondary) emit("place", "unbeat", timeMs);
+  else if (!current.meta) emit("select", [], "replace");
 }
 
 function onPointerCancel() {
   press = undefined;
   pendingLoop.value = undefined;
+  pendingSelection.value = undefined;
 }
 
 /** Centres the view on a time picked in the overview. */
@@ -714,11 +764,12 @@ function onWheel(event: WheelEvent) {
   });
 }
 
-/** Cancels a loop-region drag; returns whether one was in progress. */
+/** Cancels a loop-region or selection drag; returns whether one was in progress. */
 function cancelDrag(): boolean {
   const active = Boolean(press?.dragging);
   press = undefined;
   pendingLoop.value = undefined;
+  pendingSelection.value = undefined;
   return active;
 }
 
@@ -732,7 +783,7 @@ defineExpose({ cancelDrag });
       ref="overlay"
       class="timing-stage-canvas timing-stage-overlay"
       role="img"
-      aria-label="Spectrogram and waveform; click places a beat, right-click an unbeat"
+      aria-label="Spectrogram and waveform; click or drag selects marks, Shift+click places a beat, right-click an unbeat"
       @pointerdown="onPointerDown"
       @pointermove="onPointerMove"
       @pointerup="onPointerUp"

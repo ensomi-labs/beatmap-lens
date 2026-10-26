@@ -239,6 +239,7 @@ function saveBody(target: { session_id: string; passage_index: number }, marks: 
     loudness_applied_db: 0,
     playhead_offset_ms: 12,
     preroll_ms: 120,
+    mark_clicks: false,
     device_rate_hz: 44_100,
     base_latency_ms: 5.8,
     output_latency_ms: 16,

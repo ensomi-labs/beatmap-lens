@@ -30,8 +30,11 @@ import {
   nudgeSelected,
   redo,
   removeSelected,
+  type SelectMode,
   selectedMark,
+  selectedMarks,
   selectMark,
+  selectMarks,
   undo,
 } from "./timing/marks";
 import { prerollStart } from "./timing/output-clock";
@@ -63,6 +66,8 @@ const deviceRates = [44_100, 48_000, 88_200, 96_000] as const;
 /** `Z` toggles between fitting the passage and this many ms per device pixel. */
 const fineMsPerDevicePx = 0.5;
 const markLoopMs = 500;
+/** Milliseconds the nudge buttons move the selected marks. */
+const nudgeStepsMs = [-15, -5, -2, 2, 5, 15] as const;
 
 interface TimingPreferences {
   volume: number;
@@ -72,6 +77,9 @@ interface TimingPreferences {
   prerollMs: number;
   deviceRateHz: number | null;
   setup: string;
+  /** A click at each of the listener's own beat marks while playing. */
+  markClicks: boolean;
+  passagesHidden: boolean;
 }
 
 /** One passage's working marks; kept in memory across passage switches until the page closes. */
@@ -88,6 +96,8 @@ const preferences = ref<TimingPreferences>({
   prerollMs: minimumPrerollMs,
   deviceRateHz: null,
   setup: "",
+  markClicks: false,
+  passagesHidden: false,
   ...readPreferences(),
 });
 
@@ -166,6 +176,11 @@ const bounds = computed<TimeRange>(() => {
 const draft = computed(() => drafts.value.get(passage.value?.id ?? ""));
 const marks = computed(() => draft.value?.state.marks ?? []);
 const selected = computed(() => (draft.value ? selectedMark(draft.value.state) : undefined));
+const selection = computed(() => (draft.value ? selectedMarks(draft.value.state) : []));
+const selectedIds = computed(() => new Set(draft.value?.state.selectedIds ?? []));
+const beatTimes = computed(() =>
+  marks.value.filter((mark) => mark.kind === "beat").map((mark) => mark.time_ms),
+);
 const dirty = computed(() => (draft.value ? isDirty(draft.value) : false));
 const unsavedPassages = computed(() => [...drafts.value.values()].filter(isDirty).length);
 const revealed = computed(() => Boolean(passage.value?.revealed));
@@ -262,6 +277,12 @@ watch(playheadMs, (timeMs) => {
 
 // The gain is per passage, and consecutive passages can share a loaded recording.
 watch(loudnessAppliedDb, (db) => engine?.setLoudnessDb(db));
+watch([beatTimes, () => preferences.value.markClicks], syncClicks);
+
+/** Only the listener's own beats click; proposals are never heard. */
+function syncClicks() {
+  engine?.setClicks(preferences.value.markClicks ? beatTimes.value : null);
+}
 
 function isDirty(entry: Draft): boolean {
   return differsFrom(entry.state, entry.saved);
@@ -507,6 +528,7 @@ async function loadAudio(row: BlindPassageRow) {
   audioBuffer.value = engine.load(deinterleave(bytes, audio.channels, audio.frames), audio.frames);
   engine.setVolume(preferences.value.volume);
   engine.setLoudnessDb(loudnessAppliedDb.value);
+  syncClicks();
   loadedHandle = audio.handle;
   audioState.value = "ready";
 }
@@ -714,6 +736,10 @@ function setLoudnessMatch(value: boolean) {
   loudnessMatch.value = value;
 }
 
+function setMarkClicks(value: boolean) {
+  setPreference("markClicks", value);
+}
+
 function setPlayheadOffset(value: number) {
   if (!Number.isFinite(value)) return;
   setPreference("playheadOffsetMs", Math.round(value * 1000) / 1000);
@@ -785,8 +811,34 @@ function place(kind: MarkKind, timeMs: number, method: MarkMethod) {
   updateMarks((state) => addMark(state, mark));
 }
 
+/**
+ * B and N. While the audio plays, the mark goes at the source time heard when the key went down
+ * (the output clock at the event's time stamp, without the playhead offset, which corrects only
+ * the drawn bar), so it is not up to a frame late; stopped, it goes at the playhead.
+ */
+function placeAtPlayhead(kind: MarkKind, eventTimeMs?: number) {
+  const heard = playing.value ? engine?.position(0, eventTimeMs) : undefined;
+  if (heard !== undefined) place(kind, heard, "key-playing");
+  else place(kind, playheadMs.value, "key-playhead");
+}
+
 function selectById(id: string | null) {
   updateMarks((state) => selectMark(state, id));
+}
+
+function selectFromStage(ids: string[], mode: SelectMode) {
+  updateMarks((state) => selectMarks(state, ids, mode));
+}
+
+/** A row in the mark list: a click selects the mark and seeks to it, Cmd+click toggles it. */
+function selectFromList(mark: Mark, event: MouseEvent) {
+  if (event.metaKey) {
+    updateMarks((state) => selectMarks(state, [mark.id], "toggle"));
+    return;
+  }
+  selectById(mark.id);
+  seek(mark.time_ms);
+  bringIntoView(mark.time_ms);
 }
 
 function selectAdjacent(direction: 1 | -1) {
@@ -799,9 +851,9 @@ function selectAdjacent(direction: 1 | -1) {
   bringIntoView(mark.time_ms);
 }
 
-/** Arrow keys nudge the selected mark, or step the playhead without one. */
+/** Arrow keys nudge the selected marks, or step the playhead without any. */
 function nudge(deltaMs: number) {
-  if (!selected.value) {
+  if (!selection.value.length) {
     stepPlayhead(deltaMs);
     return;
   }
@@ -823,6 +875,7 @@ function playbackSetup(): PlaybackSetup {
     loudness_applied_db: loudnessAppliedDb.value,
     playhead_offset_ms: preferences.value.playheadOffsetMs,
     preroll_ms: preferences.value.prerollMs,
+    mark_clicks: preferences.value.markClicks,
     device_rate_hz: preferences.value.deviceRateHz,
     base_latency_ms: measured.base_latency_ms,
     output_latency_ms: measured.output_latency_ms,
@@ -1041,8 +1094,9 @@ function handleKeydown(event: KeyboardEvent) {
     f: () => {
       follow.value = !follow.value;
     },
-    b: () => place("beat", playheadMs.value, "key-playhead"),
-    n: () => place("unbeat", playheadMs.value, "key-playhead"),
+    b: () => placeAtPlayhead("beat", event.timeStamp),
+    n: () => placeAtPlayhead("unbeat", event.timeStamp),
+    c: () => setMarkClicks(!preferences.value.markClicks),
     "[": () => selectAdjacent(-1),
     "]": () => selectAdjacent(1),
     k: () => updateMarks((state) => flipSelected(state, revealed.value)),
@@ -1145,8 +1199,16 @@ function handleKeydown(event: KeyboardEvent) {
     <template v-else>
       <p class="timing-desktop-note">Timing mode needs a desktop window wider than 920 px.</p>
 
-      <div class="annotation-workspace timing-workspace">
-        <aside class="annotation-rail annotation-source-rail" aria-labelledby="passages-heading">
+      <div
+        class="annotation-workspace timing-workspace"
+        :class="{ 'is-passages-hidden': preferences.passagesHidden }"
+      >
+        <aside
+          v-show="!preferences.passagesHidden"
+          id="timing-passages"
+          class="annotation-rail annotation-source-rail"
+          aria-labelledby="passages-heading"
+        >
           <div class="active-workspace-identity">
             <div class="brand-lockup">
               <span class="brand-mark" aria-hidden="true"></span>
@@ -1232,6 +1294,15 @@ function handleKeydown(event: KeyboardEvent) {
         <section class="annotation-stage timing-stage-column" aria-label="Timing stage">
           <header v-if="passage" class="timing-hud">
             <div class="timing-hud-line">
+              <button
+                type="button"
+                class="timing-hud-toggle"
+                aria-controls="timing-passages"
+                :aria-expanded="!preferences.passagesHidden"
+                @click="setPreference('passagesHidden', !preferences.passagesHidden)"
+              >
+                {{ preferences.passagesHidden ? "Show passages" : "Hide passages" }}
+              </button>
               <strong>
                 Passage {{ String(passageIndex + 1).padStart(2, "0") }} of
                 {{ opened.passages.length }} · {{ formatSourceTime(passage.start_ms) }}–{{
@@ -1279,14 +1350,14 @@ function handleKeydown(event: KeyboardEvent) {
             :view="view"
             :proposals="stageProposals"
             :marks="marks"
-            :selected-id="draft?.state.selectedId ?? null"
+            :selected-ids="draft?.state.selectedIds ?? []"
             :playhead-ms="playheadMs"
             :loop-region="loopRegion"
             :looping="looping"
             @resize="onStageResize"
             @update:view="setView"
             @place="(kind, timeMs) => place(kind, timeMs, 'click')"
-            @select="selectById"
+            @select="selectFromStage"
             @seek="seek"
             @loop-region="setLoopRegion"
           />
@@ -1347,6 +1418,16 @@ function handleKeydown(event: KeyboardEvent) {
                 @click="stop"
               >
                 Stop
+              </button>
+              <button
+                class="transport-button"
+                type="button"
+                :disabled="audioState !== 'ready'"
+                aria-keyshortcuts="B"
+                title="Place a beat at the playhead, or where it is heard while playing (B)"
+                @click="placeAtPlayhead('beat', $event.timeStamp)"
+              >
+                Beat · B
               </button>
             </fieldset>
 
@@ -1410,6 +1491,15 @@ function handleKeydown(event: KeyboardEvent) {
               <p v-if="(passage?.loudness_gain_db ?? 0) > 0" class="setup-note">
                 Gains above 0 dB are shown but not applied.
               </p>
+              <label class="timing-check">
+                <input
+                  type="checkbox"
+                  :checked="preferences.markClicks"
+                  aria-keyshortcuts="C"
+                  @change="setMarkClicks(($event.target as HTMLInputElement).checked)"
+                />
+                <span>Click on my beats · C</span>
+              </label>
             </div>
           </section>
 
@@ -1565,29 +1655,31 @@ function handleKeydown(event: KeyboardEvent) {
           <section class="editor-section" aria-labelledby="marks-heading">
             <div class="editor-section-heading timing-marks-heading">
               <h3 id="marks-heading">Marks</h3>
-              <span class="rail-count">{{ marks.length }}</span>
+              <span class="rail-count">
+                {{ selection.length ? `${selection.length} of ${marks.length}` : marks.length }}
+              </span>
             </div>
             <div class="timing-mark-actions">
               <button
                 type="button"
                 class="button button--quiet"
                 aria-keyshortcuts="B"
-                @click="place('beat', playheadMs, 'key-playhead')"
+                @click="placeAtPlayhead('beat', $event.timeStamp)"
               >
-                Beat at playhead
+                Beat at playhead · B
               </button>
               <button
                 type="button"
                 class="button button--quiet"
                 aria-keyshortcuts="N"
-                @click="place('unbeat', playheadMs, 'key-playhead')"
+                @click="placeAtPlayhead('unbeat', $event.timeStamp)"
               >
-                Unbeat at playhead
+                Unbeat at playhead · N
               </button>
               <button
                 type="button"
                 class="button button--quiet"
-                :disabled="!selected"
+                :disabled="!selection.length"
                 aria-keyshortcuts="K"
                 @click="updateMarks((state) => flipSelected(state, revealed))"
               >
@@ -1596,7 +1688,7 @@ function handleKeydown(event: KeyboardEvent) {
               <button
                 type="button"
                 class="button button--quiet"
-                :disabled="!selected"
+                :disabled="!selection.length"
                 aria-keyshortcuts="Delete"
                 @click="updateMarks(removeSelected)"
               >
@@ -1621,17 +1713,28 @@ function handleKeydown(event: KeyboardEvent) {
                 Redo
               </button>
             </div>
+            <fieldset class="timing-nudge" aria-labelledby="nudge-label">
+              <span id="nudge-label">Move selected, ms</span>
+              <div class="speed-presets" :style="{ '--count': nudgeStepsMs.length }">
+                <button
+                  v-for="step in nudgeStepsMs"
+                  :key="step"
+                  type="button"
+                  :disabled="!selection.length"
+                  :title="`Move the selected marks ${Math.abs(step)} ms ${step > 0 ? 'later' : 'earlier'}`"
+                  @click="nudge(step)"
+                >
+                  {{ step > 0 ? `+${step}` : `−${-step}` }}
+                </button>
+              </div>
+            </fieldset>
             <ol class="timing-mark-list">
               <li v-for="mark in marks" :key="mark.id">
                 <button
                   type="button"
-                  :class="{ 'is-active': mark.id === draft?.state.selectedId }"
-                  :aria-pressed="mark.id === draft?.state.selectedId"
-                  @click="
-                    selectById(mark.id);
-                    seek(mark.time_ms);
-                    bringIntoView(mark.time_ms);
-                  "
+                  :class="{ 'is-active': selectedIds.has(mark.id) }"
+                  :aria-pressed="selectedIds.has(mark.id)"
+                  @click="selectFromList(mark, $event)"
                 >
                   <span aria-hidden="true">{{ mark.kind === "beat" ? "▼" : "⊘" }}</span>
                   <span class="timing-mark-time">{{ formatSourceTime(mark.time_ms, 3) }}</span>
@@ -1643,8 +1746,9 @@ function handleKeydown(event: KeyboardEvent) {
               </li>
             </ol>
             <p class="setup-note">
-              Click places a beat, right-click an unbeat. ←/→ nudge 1 ms (Shift 0.1 ms), , and .
-              one sample. [ and ] visit marks.
+              Click or drag on the waveform selects marks; ⌘-click adds or removes one. Shift+click
+              places a beat, right-click an unbeat. ←/→ nudge 1 ms (Shift 0.1 ms), , and . one
+              sample. [ and ] visit marks. Delete removes the selection.
             </p>
           </section>
 
@@ -1766,7 +1870,43 @@ function handleKeydown(event: KeyboardEvent) {
 }
 
 .details-transport .timing-transport {
-  grid-template-columns: 2fr 1fr 1fr;
+  grid-template-columns: 1.4fr 1fr 1fr 1.2fr;
+}
+
+.timing-workspace.is-passages-hidden {
+  grid-template-columns: minmax(0, 1fr) minmax(320px, 360px);
+}
+
+.timing-hud-toggle {
+  min-height: 24px;
+  padding: 2px 8px;
+  color: inherit;
+  font: inherit;
+  border: 1px solid oklch(42% 0.02 255);
+  border-radius: 4px;
+  background: transparent;
+  cursor: pointer;
+}
+
+.timing-hud-toggle:hover {
+  background: oklch(26% 0.02 255);
+}
+
+.timing-hud-toggle:focus-visible {
+  outline: 2px solid var(--signal);
+  outline-offset: 1px;
+}
+
+.timing-nudge {
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  display: grid;
+  grid-template-columns: 56px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  font-size: 11px;
 }
 
 .details-transport .speed-controls {

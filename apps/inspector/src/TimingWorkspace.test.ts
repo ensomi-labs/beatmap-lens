@@ -11,6 +11,8 @@ const engine = vi.hoisted(() => ({
   loudness: [] as number[],
   positionMs: undefined as number | undefined,
   offsets: [] as number[],
+  positionTimes: [] as (number | undefined)[],
+  clicks: [] as (number[] | null)[],
 }));
 vi.mock("./timing/audio-engine", () => ({
   TimingAudioEngine: class {
@@ -37,9 +39,13 @@ vi.mock("./timing/audio-engine", () => ({
       this.playing = false;
       return undefined;
     }
-    position(offsetMs: number) {
+    position(offsetMs: number, nowMs?: number) {
       engine.offsets.push(offsetMs);
-      return engine.positionMs;
+      engine.positionTimes.push(nowMs);
+      return this.playing ? engine.positionMs : undefined;
+    }
+    setClicks(beats: number[] | null) {
+      engine.clicks.push(beats);
     }
     setVolume() {}
     setLoudnessDb(db: number) {
@@ -51,11 +57,16 @@ vi.mock("./timing/audio-engine", () => ({
     async close() {}
   },
 }));
+const stage = vi.hoisted(() => ({ props: {} as Record<string, unknown> }));
 vi.mock("./TimingStage.vue", () => ({
   default: defineComponent({
-    setup(_, { expose }) {
+    inheritAttrs: false,
+    setup(_, { attrs, expose }) {
       expose({ cancelDrag: () => false });
-      return () => h("div", { class: "stage-stub" });
+      return () => {
+        stage.props = attrs;
+        return h("div", { class: "stage-stub" });
+      };
     },
   }),
 }));
@@ -103,7 +114,14 @@ beforeEach(() => {
     rates: [44_100, 44_100],
     saves: [],
   });
-  Object.assign(engine, { plays: 0, loudness: [], positionMs: undefined, offsets: [] });
+  Object.assign(engine, {
+    plays: 0,
+    loudness: [],
+    positionMs: undefined,
+    offsets: [],
+    positionTimes: [],
+    clicks: [],
+  });
   localStorage.setItem(
     "lens-timing-preferences",
     JSON.stringify({ setup: "DT 270 PRO · 44.1 kHz device", deviceRateHz: 44_100 }),
@@ -498,4 +516,100 @@ it("visits a passage asked for by key while another passage is loading", async (
     .mock.calls.filter(([operation]) => operation === "passage")
     .map(([, body]) => (body as { passage_index: number }).passage_index);
   expect(visited).toEqual([1, 0, 1]);
+});
+
+/** What the stage stub was last given, and a way to send it a stage event. */
+function stageEmit(name: string, ...args: unknown[]) {
+  const handler = stage.props[`on${name[0]?.toUpperCase()}${name.slice(1)}`];
+  if (typeof handler !== "function") throw new Error(`No ${name} handler`);
+  handler(...args);
+}
+
+function markIds(): string[] {
+  return (stage.props.marks as { id: string }[]).map((mark) => mark.id);
+}
+
+it("moves the selected marks by the nudge buttons and deletes a selection made on the stage", async () => {
+  await opened();
+  stageEmit("place", "beat", 300);
+  stageEmit("place", "beat", 400);
+  stageEmit("place", "beat", 500);
+  await nextTick();
+  const [first, second, third] = markIds();
+  stageEmit("select", [first, second], "replace");
+  await nextTick();
+  expect(stage.props["selected-ids"]).toEqual([first, second]);
+  expect(container.querySelector(".timing-marks-heading .rail-count")?.textContent?.trim()).toBe(
+    "2 of 3",
+  );
+  button("+15").click();
+  await nextTick();
+  button("−2").click();
+  await nextTick();
+  const times = () => (stage.props.marks as { time_ms: number }[]).map((mark) => mark.time_ms);
+  expect(times()).toEqual([313, 413, 500]);
+  stageEmit("select", [third], "toggle");
+  await nextTick();
+  key("Delete");
+  await nextTick();
+  expect(markIds()).toEqual([]);
+  window.dispatchEvent(new KeyboardEvent("keydown", { key: "z", metaKey: true }));
+  await nextTick();
+  expect(markIds()).toHaveLength(3);
+});
+
+it("places B while playing at the time heard when the key went down, not at the last frame", async () => {
+  await opened();
+  key(" ");
+  await vi.waitFor(() => expect(engine.plays).toBe(1));
+  engine.positionMs = 456.789;
+  const press = new KeyboardEvent("keydown", { key: "b", bubbles: true });
+  document.body.dispatchEvent(press);
+  await nextTick();
+  expect(engine.offsets.at(-1)).toBe(0);
+  expect(engine.positionTimes.at(-1)).toBe(press.timeStamp);
+  expect(stage.props.marks).toMatchObject([{ time_ms: 456.789, method: "key-playing" }]);
+  // Stopped, B goes at the playhead.
+  key("Escape");
+  key("b");
+  await nextTick();
+  expect((stage.props.marks as { method: string }[]).map((mark) => mark.method)).toContain(
+    "key-playhead",
+  );
+});
+
+it("clicks on the listener's own beats when asked, and records that with the save", async () => {
+  await opened();
+  stageEmit("place", "beat", 300);
+  stageEmit("place", "unbeat", 350);
+  await nextTick();
+  expect(engine.clicks.at(-1)).toBeNull();
+  key("c");
+  await nextTick();
+  expect(engine.clicks.at(-1)).toEqual([300]);
+  stageEmit("place", "beat", 600);
+  await nextTick();
+  expect(engine.clicks.at(-1)).toEqual([300, 600]);
+  key("Enter");
+  await vi.waitFor(() => expect(server.saves).toHaveLength(1));
+  expect(server.saves[0]).toMatchObject({ playback: { mark_clicks: true } });
+  expect(JSON.parse(localStorage.getItem("lens-timing-preferences") ?? "{}")).toMatchObject({
+    markClicks: true,
+  });
+});
+
+it("hides the passage list for a wider stage and remembers it", async () => {
+  await opened();
+  const rail = () => container.querySelector<HTMLElement>("#timing-passages");
+  expect(rail()?.style.display).toBe("");
+  button("Hide passages").click();
+  await nextTick();
+  expect(rail()?.style.display).toBe("none");
+  expect(container.querySelector(".timing-workspace")?.classList).toContain("is-passages-hidden");
+  expect(JSON.parse(localStorage.getItem("lens-timing-preferences") ?? "{}")).toMatchObject({
+    passagesHidden: true,
+  });
+  button("Show passages").click();
+  await nextTick();
+  expect(rail()?.style.display).toBe("");
 });

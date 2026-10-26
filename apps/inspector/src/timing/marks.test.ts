@@ -8,10 +8,14 @@ import {
   flipSelected,
   markNear,
   marksState,
+  marksWithin,
   nudgeSelected,
   redo,
   removeSelected,
+  selectedMark,
+  selectedMarks,
   selectMark,
+  selectMarks,
   undo,
 } from "./marks";
 
@@ -46,12 +50,12 @@ describe("marks history", () => {
 
     state = undo(state);
     expect(state.marks.map((m) => m.id)).toEqual(["b", "a"]);
-    expect(state.selectedId).toBe("a");
+    expect(state.selectedIds).toEqual(["a"]);
     state = undo(state);
     expect(state.marks[0]?.kind).toBe("beat");
     state = undo(state);
     expect(state.marks[0]?.time_ms).toBe(71_000);
-    expect(state.selectedId).toBe("b");
+    expect(state.selectedIds).toEqual(["b"]);
     state = redo(state);
     state = redo(state);
     expect(state.marks[0]).toMatchObject({ kind: "unbeat", time_ms: 71_001, nudged_ms: 1 });
@@ -121,5 +125,64 @@ describe("finding marks", () => {
   it("finds the nearest mark within a tolerance", () => {
     expect(markNear(state, 72_003, 4)?.id).toBe("b");
     expect(markNear(state, 72_005, 4)).toBeUndefined();
+  });
+});
+
+describe("several selected marks", () => {
+  const state = marksState([
+    mark("a", 71_000),
+    mark("b", 72_000),
+    mark("c", 73_000, "unbeat"),
+    mark("d", 84_990),
+  ]);
+
+  it("replaces, adds to and toggles the selection; the last selected is primary", () => {
+    let next = selectMarks(state, ["b", "a"], "replace");
+    expect(selectedMarks(next).map((m) => m.id)).toEqual(["a", "b"]);
+    expect(selectedMark(next)?.id).toBe("a");
+    next = selectMarks(next, ["c", "x"], "add");
+    expect(next.selectedIds).toEqual(["b", "a", "c"]);
+    next = selectMarks(next, ["a"], "toggle");
+    expect(next.selectedIds).toEqual(["b", "c"]);
+    next = selectMarks(next, ["a"], "toggle");
+    expect(selectedMark(next)?.id).toBe("a");
+    expect(selectMarks(next, [], "replace").selectedIds).toEqual([]);
+    // Selection alone is not an undoable change.
+    expect(next.past).toHaveLength(0);
+  });
+
+  it("finds the marks inside a range, ends included", () => {
+    expect(marksWithin(state.marks, { startMs: 72_000, endMs: 73_000 })).toEqual(["b", "c"]);
+    expect(marksWithin(state.marks, { startMs: 73_000.1, endMs: 84_000 })).toEqual([]);
+  });
+
+  it("deletes and flips every selected mark as one undoable change", () => {
+    const chosen = selectMarks(state, ["a", "c"], "replace");
+    const flipped = flipSelected(chosen, false);
+    expect(flipped.marks.map((m) => m.kind)).toEqual(["unbeat", "beat", "beat", "beat"]);
+    const removed = removeSelected(chosen);
+    expect(removed.marks.map((m) => m.id)).toEqual(["b", "d"]);
+    expect(removed.selectedIds).toEqual([]);
+    expect(undo(removed).marks.map((m) => m.id)).toEqual(["a", "b", "c", "d"]);
+    expect(undo(removed).selectedIds).toEqual(["a", "c"]);
+  });
+
+  for (const step of [2, 5, 15, -2, -5, -15]) {
+    it(`moves every selected mark by ${step} ms together`, () => {
+      const moved = nudgeSelected(selectMarks(state, ["a", "b"], "replace"), step, span, false);
+      expect(moved.marks.slice(0, 2).map((m) => m.time_ms)).toEqual([71_000 + step, 72_000 + step]);
+      expect(moved.marks.slice(0, 2).map((m) => m.nudged_ms)).toEqual([step, step]);
+      expect(moved.marks[2]?.time_ms).toBe(73_000);
+      expect(moved.selectedIds).toEqual(["a", "b"]);
+    });
+  }
+
+  it("stops the whole group where its first or last mark meets the passage edge", () => {
+    const group = selectMarks(state, ["b", "d"], "replace");
+    const moved = nudgeSelected(group, 15, span, false);
+    // d can move only 10.5 ms before the end at 85,000.5; b moves the same.
+    expect(moved.marks.find((m) => m.id === "d")?.time_ms).toBe(85_000.5);
+    expect(moved.marks.find((m) => m.id === "b")?.time_ms).toBeCloseTo(72_010.5, 9);
+    expect(nudgeSelected(moved, 2, span, false)).toBe(moved);
   });
 });

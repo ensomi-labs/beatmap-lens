@@ -92,15 +92,24 @@ it listens, and stops with one line naming a missing file.
 Open the printed address; it opens the session directly. Marks append to
 `<session>.timing.marks.jsonl` beside the session.
 
-- Click on the spectrogram or waveform places a beat, right-click an unbeat;
-  <kbd>B</kbd> and <kbd>N</kbd> place them at the playhead. A click near a mark
-  selects it. Marks can be placed only inside the passage; the shaded context
-  around it is for listening.
-- <kbd>←</kbd>/<kbd>→</kbd> nudge the selected mark (or step the playhead) by
-  1 ms, with <kbd>Shift</kbd> 0.1 ms; <kbd>,</kbd>/<kbd>.</kbd> by one sample.
-  <kbd>[</kbd>/<kbd>]</kbd> visit marks, <kbd>K</kbd> flips beat and unbeat,
-  <kbd>Delete</kbd> removes, <kbd>Cmd/Ctrl+Z</kbd> undoes and
-  <kbd>Cmd/Ctrl+Shift+Z</kbd> redoes.
+- On the spectrogram and waveform, a click selects the mark under it (or clears
+  the selection) and a drag selects every mark in its range; with
+  <kbd>Cmd</kbd> a click adds or removes one mark and a drag adds.
+  <kbd>Shift</kbd>+click places a beat, right-click an unbeat. <kbd>B</kbd> and
+  <kbd>N</kbd>, and the **Beat** button, place them at the playhead; while the
+  audio plays they place them at the time heard when the key went down. Marks
+  can be placed only inside the passage; the shaded context around it is for
+  listening.
+- <kbd>←</kbd>/<kbd>→</kbd> nudge the selected marks (or step the playhead) by
+  1 ms, with <kbd>Shift</kbd> 0.1 ms; <kbd>,</kbd>/<kbd>.</kbd> by one sample;
+  the −15 to +15 buttons by 2, 5 or 15 ms. Selected marks move together and stop
+  at the passage edge. <kbd>[</kbd>/<kbd>]</kbd> visit marks, <kbd>K</kbd> flips
+  beat and unbeat, <kbd>Delete</kbd> removes the selection,
+  <kbd>Cmd/Ctrl+Z</kbd> undoes and <kbd>Cmd/Ctrl+Shift+Z</kbd> redoes.
+- **Click on my beats** (<kbd>C</kbd>, off by default) plays a short tick at
+  each of the listener's own beat marks, scheduled on the audio clock, so a
+  mark can be checked by ear; proposals are never heard. Saves record whether
+  it was on.
 - <kbd>Space</kbd> plays or pauses, <kbd>Shift+Space</kbd> plays the loop region
   once, <kbd>L</kbd> loops it, <kbd>I</kbd>/<kbd>O</kbd> set its edges,
   <kbd>Shift</kbd>+drag selects it and <kbd>X</kbd> loops 500 ms around the
@@ -108,8 +117,10 @@ Open the printed address; it opens the session directly. Marks append to
   <kbd>Esc</kbd> stops at once.
 - Wheel pans, <kbd>Ctrl</kbd>+wheel or pinch zooms at the pointer, <kbd>+</kbd>,
   <kbd>−</kbd> and <kbd>0</kbd> zoom around the selected mark or the playhead,
-  <kbd>Z</kbd> toggles 0.5 ms per pixel, and the overview strip jumps. <kbd>F</kbd>
-  toggles follow.
+  <kbd>Z</kbd> toggles 0.5 ms per pixel, and the overview strip jumps. Dragging the
+  ruler or proposal strip, or right-dragging the waveform, pans. <kbd>F</kbd>
+  toggles follow. **Hide passages** in the stage header gives the stage the
+  passage list's width.
 - <kbd>1</kbd>–<kbd>9</kbd> switch proposals, <kbd>P</kbd> hides all of them and
   brings them back. <kbd>Cmd/Ctrl+S</kbd> or <kbd>Enter</kbd> saves; the first save
   needs the playback setup line (headphones, EQ app state, device rate) and the

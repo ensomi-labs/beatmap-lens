@@ -45,6 +45,41 @@ export function heardSourceMs(
   return wrapLoop(raw, anchor.loop);
 }
 
+/**
+ * The context times in [`fromCtxS`, `toCtxS`) at which the source times `beatsMs` are rendered:
+ * the same mapping as `heardSourceMs`, run the other way. A non-looping source plays from its start
+ * to `endMs`; a looping one plays from its start to the loop end, then the loop over and over.
+ */
+export function clickTimes(
+  anchor: PlaybackAnchor,
+  beatsMs: readonly number[],
+  fromCtxS: number,
+  toCtxS: number,
+): number[] {
+  const ctxAt = (passCtxS: number, passSourceMs: number, timeMs: number) =>
+    passCtxS + (timeMs - passSourceMs) / anchor.rate / 1000;
+  const times: number[] = [];
+  const keep = (ctxS: number) => {
+    if (ctxS >= fromCtxS && ctxS < toCtxS) times.push(ctxS);
+  };
+  const firstEndMs = anchor.loop ? anchor.loop.endMs : anchor.endMs;
+  for (const timeMs of beatsMs)
+    if (timeMs >= anchor.startSourceMs && timeMs < firstEndMs)
+      keep(ctxAt(anchor.startCtxS, anchor.startSourceMs, timeMs));
+  const loop = anchor.loop;
+  if (!loop || !(loop.endMs > loop.startMs)) return times;
+  const passS = (loop.endMs - loop.startMs) / anchor.rate / 1000;
+  const wrapCtxS = ctxAt(anchor.startCtxS, anchor.startSourceMs, loop.endMs);
+  for (let pass = Math.max(0, Math.floor((fromCtxS - wrapCtxS) / passS)); ; pass++) {
+    const passCtxS = wrapCtxS + pass * passS;
+    if (passCtxS >= toCtxS) break;
+    for (const timeMs of beatsMs)
+      if (timeMs >= loop.startMs && timeMs < loop.endMs)
+        keep(ctxAt(passCtxS, loop.startMs, timeMs));
+  }
+  return times;
+}
+
 export function wrapLoop(rawMs: number, loop: { startMs: number; endMs: number }): number {
   if (rawMs < loop.endMs) return rawMs;
   return loop.startMs + ((rawMs - loop.endMs) % (loop.endMs - loop.startMs));

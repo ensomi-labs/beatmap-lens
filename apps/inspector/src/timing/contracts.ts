@@ -11,7 +11,11 @@ export const staleSessionError = "StaleSessionError";
 
 export type MarkKind = "beat" | "unbeat";
 
-export type MarkMethod = "click" | "key-playhead";
+/**
+ * `click` at the pointer; `key-playhead` with B or N (or their buttons) at a stopped playhead;
+ * `key-playing` with B or N while the audio plays, at the source time heard when the key went down.
+ */
+export type MarkMethod = "click" | "key-playhead" | "key-playing";
 
 /**
  * One listener placement. `time_ms` is float64 milliseconds on the session clock (`osu`: sample
@@ -112,6 +116,8 @@ export interface PlaybackSetup {
   /** Wall-clock milliseconds, applied before the playback-rate multiplication. */
   playhead_offset_ms: number;
   preroll_ms: number;
+  /** A click sounded at each of the listener's own beat marks. */
+  mark_clicks: boolean;
   /** The output device rate the listener declared, or null when not stated. */
   device_rate_hz: number | null;
   base_latency_ms: number | null;

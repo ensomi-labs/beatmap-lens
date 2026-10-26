@@ -4,7 +4,8 @@ import { TimingAudioEngine } from "./audio-engine";
 /** The Web Audio surface the engine uses, with a resume the test settles by hand. */
 const audio = vi.hoisted(() => ({
   resumes: [] as (() => void)[],
-  sources: [] as { started: boolean; stopped: boolean }[],
+  sources: [] as { started: boolean; stopped: boolean; at?: number }[],
+  context: undefined as { currentTime: number } | undefined,
 }));
 
 beforeEach(() => {
@@ -25,6 +26,7 @@ beforeEach(() => {
       currentTime = 0;
       constructor(options: { sampleRate: number }) {
         this.sampleRate = options.sampleRate;
+        audio.context = this;
       }
       resume() {
         return new Promise<void>((resolve) => {
@@ -33,6 +35,9 @@ beforeEach(() => {
             resolve();
           });
         });
+      }
+      getOutputTimestamp() {
+        return { contextTime: 0, performanceTime: 0 };
       }
       async close() {}
     },
@@ -56,14 +61,18 @@ beforeEach(() => {
   vi.stubGlobal(
     "AudioBufferSourceNode",
     class extends Node {
-      readonly record = { started: false, stopped: false };
+      readonly record: { started: boolean; stopped: boolean; at?: number } = {
+        started: false,
+        stopped: false,
+      };
       onended: (() => void) | null = null;
       constructor() {
         super();
         audio.sources.push(this.record);
       }
-      start() {
+      start(at?: number) {
         this.record.started = true;
+        if (at !== undefined) this.record.at = at;
       }
       stop() {
         this.record.stopped = true;
@@ -107,4 +116,46 @@ it("lets a stop cancel a play that is still waiting, and stops idempotently", as
   expect(audio.sources).toHaveLength(0);
   expect(engine.playing).toBe(false);
   expect(engine.stop()).toBeUndefined();
+});
+
+it("clicks at the listener's beats while playing, and reschedules or stops them on a change", async () => {
+  vi.useFakeTimers();
+  try {
+    const engine = loaded();
+    engine.setClicks([2, 5]);
+    const play = engine.play({ fromMs: 0, endMs: 10, rate: 1, loop: null });
+    audio.resumes[0]?.();
+    expect(await play).toBe(true);
+    // The music source, then a click per beat at its context time (start lead 30 ms).
+    const clicks = () => audio.sources.slice(1);
+    expect(clicks()).toHaveLength(2);
+    expect(clicks()[0]?.at).toBeCloseTo(0.032, 12);
+    expect(clicks()[1]?.at).toBeCloseTo(0.035, 12);
+    // A changed beat cancels the clicks still to come and schedules the new one.
+    engine.setClicks([7]);
+    expect(
+      clicks()
+        .slice(0, 2)
+        .every((click) => click.stopped),
+    ).toBe(true);
+    expect(clicks().at(-1)?.at).toBeCloseTo(0.037, 12);
+    // Off: nothing more is scheduled; stop silences what was.
+    engine.setClicks(null);
+    expect(clicks().every((click) => click.stopped)).toBe(true);
+    const count = audio.sources.length;
+    if (audio.context) audio.context.currentTime = 0.1;
+    vi.advanceTimersByTime(100);
+    expect(audio.sources).toHaveLength(count);
+    engine.stop();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("schedules no clicks while they are off", async () => {
+  const engine = loaded();
+  const play = engine.play({ fromMs: 0, endMs: 10, rate: 1, loop: null });
+  audio.resumes[0]?.();
+  await play;
+  expect(audio.sources).toHaveLength(1);
 });
