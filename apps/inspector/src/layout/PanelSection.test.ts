@@ -7,10 +7,17 @@ let container: HTMLElement;
 let app: ReturnType<typeof createApp> | undefined;
 const reveal = ref(false);
 
-function mount(sections: Record<string, unknown>[]) {
+interface Section {
+  id: string;
+  collapsible?: boolean;
+  defaultOpen?: boolean;
+  reveal?: boolean;
+}
+
+function mount(sections: Section[]) {
   app = createApp(() =>
     sections.map((props) =>
-      h(PanelSection, { key: String(props.id), title: String(props.id), ...props }, () =>
+      h(PanelSection, { key: props.id, title: props.id, ...props }, () =>
         h("p", `${props.id} body`),
       ),
     ),
@@ -18,7 +25,7 @@ function mount(sections: Record<string, unknown>[]) {
   app.mount(container);
 }
 
-function remount(sections: Record<string, unknown>[]) {
+function remount(sections: Section[]) {
   app?.unmount();
   mount(sections);
 }
