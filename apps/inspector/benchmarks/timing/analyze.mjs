@@ -138,17 +138,23 @@ function robustFit(xs, ys) {
 
 // --- Clock reference ----------------------------------------------------------------------------
 
-/** Distinct (performanceTime, contextTime) pairs of a run's stamps, in order. */
+/**
+ * Distinct (performanceTime, contextTime) pairs of a run's stamps, in order, with the page time at
+ * which each was first read (`seenMs`).
+ */
 function distinctStamps(stamps) {
   const out = [];
   let last = 0;
-  for (const [, contextTime, performanceTime] of stamps ?? []) {
+  for (const [seenMs, contextTime, performanceTime] of stamps ?? []) {
     if (!(contextTime > 0 && performanceTime > 0) || contextTime === last) continue;
     last = contextTime;
-    out.push({ perfMs: performanceTime, ctxS: contextTime });
+    out.push({ perfMs: performanceTime, ctxS: contextTime, seenMs });
   }
   return out;
 }
+
+/** The workspace samples the output stamp from its transport timer, every 25 ms while playing. */
+const appSampleMs = 25;
 
 /**
  * The run's output clock as a robust line: offset (context ms − page ms) against page time.
@@ -256,18 +262,37 @@ function labSummary(lab) {
         const points = distinctStamps(o.stamps);
         const cadence = points.slice(1).map((p, i) => (p.ctxS - points[i].ctxS) * 1000);
         const reference = clockReference(o.stamps);
-        // Online comparison at each stamp arrival + 5 ms: the newest stamp alone vs the model.
-        const clock = new OutputClock();
+        // Online comparison at each stamp's time + 5 ms, against the whole-run line: the newest
+        // stamp alone; the clock model as the app feeds it, from a 25 ms timer that reads the
+        // newest stamp the page could see then (the lab polls every millisecond and keeps each
+        // stamp's first reading); and the model fed every stamp, as runs 1-3 reported it.
+        const everyStamp = new OutputClock();
+        const appCadence = new OutputClock();
+        let tickMs = points[0]?.seenMs ?? 0;
+        let seen = -1;
         const latestErr = [];
-        const modelErr = [];
+        const appModelErr = [];
+        const everyModelErr = [];
+        const errorMs = (line, t, truth) =>
+          (line.ctxS + ((t - line.perfMs) * line.ratio) / 1000 - truth) * 1000;
         for (const p of points) {
-          clock.observe({ contextTime: p.ctxS, performanceTime: p.perfMs });
+          everyStamp.observe({ contextTime: p.ctxS, performanceTime: p.perfMs });
           const t = p.perfMs + 5;
+          for (; tickMs <= t; tickMs += appSampleMs) {
+            while (seen + 1 < points.length && points[seen + 1].seenMs <= tickMs) seen++;
+            const newest = points[seen];
+            if (newest)
+              appCadence.observe({ contextTime: newest.ctxS, performanceTime: newest.perfMs });
+          }
           const truth = reference?.ctxAt(t);
-          const line = clock.line();
-          if (truth === undefined || !line) continue;
-          latestErr.push((p.ctxS + (t - p.perfMs) / 1000 - truth) * 1000);
-          modelErr.push((line.ctxS + ((t - line.perfMs) * line.ratio) / 1000 - truth) * 1000);
+          const every = everyStamp.line();
+          const app = appCadence.line();
+          if (truth === undefined) continue;
+          if (every) {
+            latestErr.push((p.ctxS + (t - p.perfMs) / 1000 - truth) * 1000);
+            everyModelErr.push(errorMs(every, t, truth));
+          }
+          if (app) appModelErr.push(errorMs(app, t, truth));
         }
         return {
           latencyHint: o.latencyHint,
@@ -278,7 +303,8 @@ function labSummary(lab) {
           stampResidualMs: reference ? spread(reference.residualsMs) : null,
           ratioPpm: reference ? round((reference.ratio - 1) * 1e6, 1) : null,
           latestStampErrorMs: spread(latestErr.slice(10)),
-          clockModelErrorMs: spread(modelErr.slice(10)),
+          clockModelAppCadenceErrorMs: spread(appModelErr.slice(10)),
+          clockModelEveryStampErrorMs: spread(everyModelErr.slice(10)),
         };
       })
     : options;

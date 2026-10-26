@@ -75,9 +75,11 @@ In isolated lab pages (five repeats):
 - A start, an offset or a loop edge between sample frames is interpolated; on whole frames the
   output is the source bit for bit. A click started between frames has its onset at its
   fractional time. Hence `planPlay`.
-- Online, 5 ms after each output stamp, the clock model is within 0.010-0.030 ms (p95) of the
-  whole-run line, the newest stamp alone within 0.067-0.084 ms: better, and both far inside the
-  target on this timer-driven stream. CoreAudio's stamps may be noisier.
+- Online, 5 ms after each output stamp, the clock model as the workspace feeds it (the newest
+  stamp read every 25 ms) is within 0.016-0.040 ms (p95) of the whole-run line, and within
+  0.010-0.030 ms if fed every stamp; the newest stamp alone is within 0.067-0.084 ms. The model is
+  1.9-4.8 times better at every hint and repeat, and all are far inside the target on this
+  timer-driven stream. CoreAudio's stamps may be noisier.
 - Latency hints change the reported base and output latency (16, 24, 32 ms) and the stamp
   cadence, not the stamps' noise.
 - A Web Animation is presented about a frame sooner than a canvas drawn from the same frame time

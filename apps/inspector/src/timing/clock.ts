@@ -40,7 +40,10 @@ export function perfAt(line: ClockLine, ctxS: number): number {
 
 /** Stamps older than this, in page ms behind the newest, leave the fit. */
 const windowMs = 1000;
-/** Fewer stamps than this (about 60 ms of output) and the newest stamp is used alone. */
+/**
+ * Fewer stamps than this (about 150 ms of the workspace's 25 ms samples) and the newest stamp is
+ * used alone.
+ */
 const minimumPoints = 6;
 /** A first pass keeps stamps within this many ms of the median offset. */
 const gateMs = 5;
@@ -64,8 +67,9 @@ interface Point {
  * crates/generate/src/fitter/mel_phase.rs, lines 101-120 at edf4066, reimplemented): keep points
  * near the median, then twice fit least squares and keep points within
  * `max(floor, 3 · 1.4826 · MAD)` of the line. A step (device change, glitch) is followed after
- * `stepPoints` stamps instead of being averaged away. Stamps arrive once per device callback (about
- * 10 ms), so the fit runs about a hundred times a second on at most a hundred points.
+ * `stepPoints` stamps instead of being averaged away. The output reports a new stamp once per
+ * device callback (5-20 ms); the workspace reads one every 25 ms while playing and at each key, so
+ * the fit runs about forty times a second on about forty points.
  */
 export class OutputClock {
   private points: Point[] = [];

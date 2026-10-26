@@ -164,7 +164,10 @@ export class TimingAudioEngine {
     return true;
   }
 
-  /** Takes the output's latest stamp into the clock model; call it once per frame while playing. */
+  /**
+   * Takes the output's latest stamp into the clock model. The workspace calls it on each transport
+   * step (every 25 ms while playing); `heardAt` calls it before mapping a key.
+   */
   sampleClock() {
     if (this.context.state === "running") this.clock.observe(this.context.getOutputTimestamp());
   }
