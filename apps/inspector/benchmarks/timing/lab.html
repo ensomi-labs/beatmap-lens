@@ -272,7 +272,9 @@
        * x(t) = speed · (t − t0) CSS px from the left edge; the harness reads the presented frames.
        * Web Animation variants also vary what else the page does: `waapi-noraf` runs no animation
        * frame loop at all, `waapi-hud10` changes a text readout every 100 ms (as the Timing HUD
-       * does) and `waapi-hud60` changes it every frame.
+       * does) and `waapi-hud60` changes it every frame. `waapi-timer` runs no frame loop but a
+       * 25 ms timer doing a little script work (as a timer-driven transport would), and
+       * `waapi-timer-hud10` also changes the readout from that timer every 100 ms.
        */
       const speedPxPerMs = 0.5;
       const loads = {
@@ -297,7 +299,10 @@
         const frames = [];
         let draw = () => {};
         let attributes = null;
-        const hudEvery = { "waapi-hud10": 100, "waapi-hud60": 0 }[variant];
+        const hudEvery = { "waapi-hud10": 100, "waapi-hud60": 0, "waapi-timer-hud10": 100 }[
+          variant
+        ];
+        const timerOnly = variant === "waapi-noraf" || variant.startsWith("waapi-timer");
         let hud = null;
         let hudAt = Number.NEGATIVE_INFINITY;
         if (hudEvery !== undefined) {
@@ -344,11 +349,22 @@
           frames.push({ ts, start, end: performance.now(), x: variant.startsWith("waapi") ? null : x });
           requestAnimationFrame(frame);
         };
-        if (variant !== "waapi-noraf") requestAnimationFrame(frame);
+        if (!timerOnly) requestAnimationFrame(frame);
+        const timer = variant.startsWith("waapi-timer")
+          ? setInterval(() => {
+              const now = performance.now();
+              busy(0.2);
+              if (hud && now - hudAt >= hudEvery) {
+                hud.textContent = `${(now - t0).toFixed(1)} ms`;
+                hudAt = now;
+              }
+            }, 25)
+          : undefined;
         const burst = load.burstMs ? setInterval(() => busy(load.burstMs), 500) : undefined;
         await new Promise((done) => setTimeout(done, seconds * 1000));
         running = false;
         clearInterval(burst);
+        clearInterval(timer);
         return { variant, load: loadName, t0, speedPxPerMs, dpr, attributes, frames, timeOrigin: performance.timeOrigin };
       }
 

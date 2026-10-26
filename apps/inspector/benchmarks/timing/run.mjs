@@ -272,7 +272,13 @@ async function runLab() {
         for (const variant of ["canvas-now", "canvas-frame", "dom-frame", "waapi", "canvas-desync"])
           matrix.push([variant, load]);
       for (const load of ["none", "burst"])
-        for (const variant of ["waapi-noraf", "waapi-hud10", "waapi-hud60"])
+        for (const variant of [
+          "waapi-noraf",
+          "waapi-hud10",
+          "waapi-hud60",
+          "waapi-timer",
+          "waapi-timer-hud10",
+        ])
           matrix.push([variant, load]);
       for (const [variant, load] of matrix) {
         let run;
