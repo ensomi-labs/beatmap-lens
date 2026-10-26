@@ -285,6 +285,14 @@ const offsetNeedsCheck = computed(
       preferences.value.offsetRate !== null &&
       preferences.value.offsetRate !== contextRate.value),
 );
+/** Why the playhead offset needs a fresh check, on the stage until the offset is set again. */
+const offsetNotice = computed(() => {
+  if (!offsetNeedsCheck.value) return "";
+  if (deviceChanged.value)
+    return "The output device changed: reopen the audio, then check the playhead offset.";
+  const hz = (value: number | null | undefined) => `${value?.toLocaleString()} Hz`;
+  return `The playhead offset was set with the audio at ${hz(preferences.value.offsetRate)}, and it now runs at ${hz(contextRate.value)}: check the offset.`;
+});
 
 onMounted(() => {
   window.addEventListener("keydown", handleKeydown);
@@ -1490,6 +1498,28 @@ function handleKeydown(event: KeyboardEvent) {
                 <span class="health-dot" aria-hidden="true"></span>
                 {{ rateWarning }}
               </p>
+              <p v-if="offsetNotice" class="notice-bar timing-hud-offset" role="status">
+                <span class="health-dot" aria-hidden="true"></span>
+                <span class="notice-bar-text">{{ offsetNotice }}</span>
+                <button
+                  v-if="deviceChanged"
+                  class="tool-button"
+                  type="button"
+                  :disabled="busy || saving"
+                  title="Open the audio again in a new context, on the current output device"
+                  @click="select(passageIndex)"
+                >
+                  Reopen audio
+                </button>
+                <button
+                  class="tool-button"
+                  type="button"
+                  title="Show the playhead offset under Output and sync"
+                  @click="focusDetailsField('timing-offset')"
+                >
+                  Check offset
+                </button>
+              </p>
               <p v-if="silenceMs !== undefined" class="notice-bar timing-hud-silence">
                 <span class="health-dot" aria-hidden="true"></span>
                 Digital silence at {{ formatSourceTime(silenceMs) }}; an EQ app may soften the next
@@ -1774,7 +1804,7 @@ function handleKeydown(event: KeyboardEvent) {
               </label>
             </PanelSection>
 
-            <PanelSection id="timing-sync" title="Output and sync">
+            <PanelSection id="timing-sync" title="Output and sync" :reveal="offsetNeedsCheck">
               <div class="audio-offset-control">
                 <div class="transport-control-label">
                   <span id="offset-heading">Playhead offset</span>
@@ -1872,8 +1902,13 @@ function handleKeydown(event: KeyboardEvent) {
           >
             {{ conversion }}
           </span>
-          <span class="status-item">
+          <span
+            class="status-item"
+            :class="{ 'status-warning': offsetNeedsCheck }"
+            :title="offsetNeedsCheck ? 'The output changed since the offset was set; check it' : undefined"
+          >
             Offset <b>{{ preferences.playheadOffsetMs }} ms</b>
+            <template v-if="offsetNeedsCheck">· check</template>
           </span>
           <span class="status-item status-item--end status-item--path" :title="opened.marks_path">
             {{ opened.marks_path }}

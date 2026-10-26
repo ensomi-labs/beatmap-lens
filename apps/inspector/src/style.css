@@ -3462,6 +3462,15 @@ fieldset.toolbar-group,
   background: currentColor;
 }
 
+.notice-bar-text {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.notice-bar .tool-button {
+  flex: 0 0 auto;
+}
+
 @media (max-width: 920px) {
   .frame-toolbar {
     height: auto;

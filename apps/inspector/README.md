@@ -144,8 +144,11 @@ Open the printed address; it opens the session directly. Marks append to
 The moving playhead follows the audio output clock and the playhead offset,
 which corrects delay the browser cannot see. It shows which beat is sounding to
 about one display frame; place and check marks on the still waveform. After an
-output device or rate change, choose **Reopen audio after a device change** (or
-the current passage again) and check the offset. The offset can be typed while
+output device or rate change, the stage header says so until the offset is set
+again, with **Reopen audio** and **Check offset** (the latter shows the offset
+under Output and sync); the status bar's offset reads "check" meanwhile. **Reopen
+audio after a device change** in Output and sync, or choosing the current passage
+again, also reopens the audio. The offset can be typed while
 the audio plays; <kbd>Enter</kbd>, <kbd>Tab</kbd> or leaving the field applies
 it, and −1/+1 step it (<kbd>Shift</kbd>: 10 ms). The stage header warns when the
 stated output device rate differs from the recording's, when the recording rate

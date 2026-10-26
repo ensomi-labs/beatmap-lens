@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref } from "vue";
+import { ref, watch } from "vue";
 
 /**
  * A titled section of a side pane. A collapsible one has its title as a disclosure button (the
@@ -11,12 +11,21 @@ const props = withDefaults(
     title: string;
     collapsible?: boolean;
     defaultOpen?: boolean;
+    /** Opens the section when it turns true, for a warning inside it; not remembered. */
+    reveal?: boolean;
   }>(),
-  { collapsible: true, defaultOpen: true },
+  { collapsible: true, defaultOpen: true, reveal: false },
 );
 
 const storageKey = "lens-sections";
 const open = ref(props.collapsible ? (readOpen()[props.id] ?? props.defaultOpen) : true);
+watch(
+  () => props.reveal,
+  (reveal) => {
+    if (reveal) open.value = true;
+  },
+  { immediate: true },
+);
 
 function readOpen(): Record<string, boolean> {
   try {

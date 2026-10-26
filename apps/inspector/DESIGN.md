@@ -74,7 +74,8 @@ on `--signal-fill` 5.6:1. Muted ink on a control would be 3.9:1, so controls use
 - **Rows**: lists use 24 to 26 px rows divided by 1 px lines; the selected row has the accent's soft
   fill and a 2 px accent bar on its leading edge.
 - **Notice bar**: a full-width strip under a view's bar, amber for warnings, red for errors, with a
-  dot and text.
+  dot and text, and at its end the tool buttons that act on it (Timing's Reopen audio). A warning
+  about a setting in a side pane goes here, not only in the pane, which may be hidden or closed.
 - **Status**: a coloured dot plus text; colour is never the only indicator.
 - **Radii**: 3 to 6 px. No cards, no gradients, no glass.
 

@@ -1,5 +1,5 @@
 // @vitest-environment happy-dom
-import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createApp, defineComponent, h, nextTick } from "vue";
 import TimingWorkspace from "./TimingWorkspace.vue";
 import { timingJson, timingRequest } from "./timing/client";
@@ -660,4 +660,71 @@ it("does not repeat a held B or C", async () => {
   await nextTick();
   expect(markIds()).toHaveLength(1);
   expect(engine.clicks.at(-1)).toBeNull();
+});
+
+describe("a change of output", () => {
+  const devices = new EventTarget();
+  beforeEach(() => {
+    Object.defineProperty(navigator, "mediaDevices", { value: devices, configurable: true });
+  });
+  afterEach(() => {
+    Reflect.deleteProperty(navigator, "mediaDevices");
+  });
+
+  const offsetItem = () =>
+    [...container.querySelectorAll(".frame-status .status-item")].find((item) =>
+      item.textContent?.includes("Offset"),
+    );
+  const passageLoads = () =>
+    vi.mocked(timingJson).mock.calls.filter(([operation]) => operation === "passage").length;
+
+  it("is on the stage with Reopen audio until the offset is checked, with the pane closed", async () => {
+    // Output and sync closed, and the details pane hidden.
+    localStorage.setItem("lens-sections", JSON.stringify({ "timing-sync": false }));
+    localStorage.setItem(
+      "lens-layout:timing",
+      JSON.stringify({ "timing-inspector": { size: 320, collapsed: true } }),
+    );
+    await mount({ setup: "DT 270 PRO", deviceRateHz: 44_100, playheadOffsetMs: 12 });
+    const sync = () => container.querySelector<HTMLElement>("#timing-sync-body");
+    expect(sync()?.style.display).toBe("none");
+    expect(offsetItem()?.classList).not.toContain("status-warning");
+
+    devices.dispatchEvent(new Event("devicechange"));
+    await nextTick();
+    expect(hud()).toContain("The output device changed: reopen the audio, then check");
+    expect(offsetItem()?.classList).toContain("status-warning");
+    expect(offsetItem()?.textContent).toContain("check");
+    // The section with the offset opens for it, without remembering that.
+    expect(sync()?.style.display).toBe("");
+    expect(JSON.parse(localStorage.getItem("lens-sections") ?? "{}")).toEqual({
+      "timing-sync": false,
+    });
+
+    const loads = passageLoads();
+    button("Reopen audio").click();
+    await vi.waitFor(() => expect(passageLoads()).toBe(loads + 1));
+    await opened();
+    expect(hud()).toContain("check the playhead offset");
+
+    button("Check offset").click();
+    await vi.waitFor(() => expect(document.activeElement?.id).toBe("timing-offset"));
+    expect(container.querySelector<HTMLElement>("#timing-inspector")?.style.display).toBe("");
+    button("+1").click();
+    await nextTick();
+    expect(container.querySelector(".timing-hud-offset")).toBeNull();
+    expect(offsetItem()?.classList).not.toContain("status-warning");
+    expect(offsetItem()?.textContent).toContain("13 ms");
+  });
+
+  it("asks for a check when the offset was set at another context rate", async () => {
+    await mount({ setup: "DT 270 PRO", deviceRateHz: 44_100, offsetRate: 48_000 });
+    expect(hud()).toContain(
+      "The playhead offset was set with the audio at 48,000 Hz, and it now runs at 44,100 Hz",
+    );
+    expect(container.querySelector(".timing-hud-offset")?.textContent).not.toContain(
+      "Reopen audio",
+    );
+    expect(offsetItem()?.classList).toContain("status-warning");
+  });
 });
