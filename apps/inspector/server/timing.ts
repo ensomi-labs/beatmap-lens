@@ -22,6 +22,7 @@ import {
   revealedNames,
   type SaveEventV1,
   saveEvent,
+  skippedLinesWarning,
   type TimingPassage,
   type TimingSession,
 } from "../src/timing/format.ts";
@@ -116,10 +117,9 @@ async function openSession(input: string, legends: Legends): Promise<Session> {
     if (error.code !== "ENOENT") throw error;
     return "";
   });
-  const { saves, reveals, skipped } = readMarksFile(text, session.id);
-  const marksWarning = skipped.length
-    ? `${basename(marksPath)}: line ${skipped.join(", ")} could not be read and was skipped; the file is left as it is.`
-    : undefined;
+  const read = readMarksFile(text, session.id);
+  const { saves, reveals } = read;
+  const marksWarning = skippedLinesWarning(basename(marksPath), read);
   if (marksWarning) console.warn(`Timing: ${folder}/${marksWarning}`);
   const audio = new Map<string, AudioInputV1>();
   const handles = new Map<string, string>();

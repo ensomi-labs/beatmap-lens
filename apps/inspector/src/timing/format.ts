@@ -227,30 +227,61 @@ export function encodeEvent(event: TimingEvent): string {
   return `${JSON.stringify(event)}\n`;
 }
 
+/** One line of a JSONL file as an object, or undefined when it does not parse to one. */
+function parseRecord(line: string): Record<string, unknown> | undefined {
+  try {
+    const value: unknown = JSON.parse(line);
+    return value && typeof value === "object" && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /**
- * The latest save per passage is current; a passage stays revealed once any reveal is recorded.
- * A line that does not parse, such as the end of an append cut short by a crash, is skipped and
- * its 1-based number returned for the caller to report; the file is never rewritten.
+ * The latest save per passage is current; a passage stays revealed once a `reveal` record names
+ * it. Only a `reveal` record reveals: a line of this session of any other kind is skipped and its
+ * 1-based number returned in `unknown`, so a kind written by a later version never shows names. A
+ * line that does not parse to an object, such as the end of an append cut short by a crash, is
+ * skipped and returned in `skipped`. Lines of other sessions are ignored. The file is never
+ * rewritten.
  */
 export function readMarksFile(text: string, sessionId: string) {
   const saves = new Map<string, SaveEventV1>();
   const reveals = new Set<string>();
   const skipped: number[] = [];
+  const unknown: number[] = [];
   const lines = text.split("\n");
   for (const [index, line] of lines.entries()) {
     if (!line) continue;
-    let event: TimingEvent;
-    try {
-      event = JSON.parse(line);
-    } catch {
+    const record = parseRecord(line);
+    if (!record) {
       skipped.push(index + 1);
       continue;
     }
-    if (event.session_id !== sessionId) continue;
-    if (event.type === "save") saves.set(event.passage_id, event);
-    else reveals.add(event.passage_id);
+    if (record.session_id !== sessionId) continue;
+    const event = record as unknown as TimingEvent;
+    if (typeof event.passage_id !== "string") unknown.push(index + 1);
+    else if (event.type === "save") saves.set(event.passage_id, event);
+    else if (event.type === "reveal") reveals.add(event.passage_id);
+    else unknown.push(index + 1);
   }
-  return { saves, reveals, skipped };
+  return { saves, reveals, skipped, unknown };
+}
+
+/** How the service reports the lines `readMarksFile` skipped; undefined when none were. */
+export function skippedLinesWarning(
+  fileName: string,
+  { skipped, unknown }: { skipped: number[]; unknown: number[] },
+): string | undefined {
+  const lines = (numbers: number[]) => `line${numbers.length > 1 ? "s" : ""} ${numbers.join(", ")}`;
+  const parts = [
+    ...(skipped.length ? [`${lines(skipped)} could not be read`] : []),
+    ...(unknown.length ? [`${lines(unknown)} of a kind this version does not know`] : []),
+  ];
+  if (!parts.length) return undefined;
+  return `${fileName}: ${parts.join("; ")}; skipped, and the file is left as it is.`;
 }
 
 /** Back from a record to the page's mark: the derived sample is dropped, `time_ms` is kept. */

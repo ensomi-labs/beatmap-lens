@@ -1,5 +1,14 @@
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
+import {
+  appendFile,
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rename,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -180,6 +189,53 @@ it("skips a marks line cut short with a warning, never rewriting the file", asyn
     passage_index: 0,
   });
   expect(latest.saved?.save_id).toBe(saved.save_id);
+});
+
+it("reveals only on a reveal record: a line of an unknown kind is skipped and reported", async () => {
+  const f = await fixture();
+  const first: OpenTiming = await f.post("open", { session_path: f.sessionPath });
+  const target = { session_id: first.session_id, passage_index: 0 };
+  await f.post("save", saveBody(target, [mark("m1", "beat", 72_468.9342)]));
+  // A record of a kind a later version might write, naming the saved passage.
+  const later = {
+    version: 1,
+    type: "note",
+    id: "n1",
+    session_id: "session-01",
+    passage_id: "passage-01",
+    time: "2026-10-27T09:12:03.120Z",
+    text: "pulse unclear after the break",
+  };
+  await appendFile(first.marks_path, `${JSON.stringify(later)}\n`);
+  const before = await readFile(first.marks_path, "utf8");
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+  const opened: OpenTiming = await f.post("open", { session_path: f.sessionPath });
+  expect(opened.passages[0]).toMatchObject({ saved: true, revealed: false });
+  expect(opened.marks_warning).toBe(
+    "session-01.timing.marks.jsonl: line 2 of a kind this version does not know; skipped, and the file is left as it is.",
+  );
+  expect(warn).toHaveBeenCalledOnce();
+  const shown: BlindPassage = await f.post("passage", {
+    session_id: opened.session_id,
+    passage_index: 0,
+  });
+  expect(shown.names).toBeUndefined();
+  expect(shown.saved?.marks.map((m) => m.id)).toEqual(["m1"]);
+  expect(JSON.stringify([opened, shown])).not.toContain("secret-model");
+  expect(await readFile(first.marks_path, "utf8")).toBe(before);
+});
+
+it("skips and reports a line that parses to no object instead of failing to open", async () => {
+  const f = await fixture();
+  const first: OpenTiming = await f.post("open", { session_path: f.sessionPath });
+  const target = { session_id: first.session_id, passage_index: 0 };
+  await f.post("save", saveBody(target, [mark("m1", "beat", 72_468.9342)]));
+  await appendFile(first.marks_path, "null\n[]\n");
+  vi.spyOn(console, "warn").mockImplementation(() => {});
+  const opened: OpenTiming = await f.post("open", { session_path: f.sessionPath });
+  expect(opened.passages[0]).toMatchObject({ saved: true, revealed: false });
+  expect(opened.marks_warning).toContain("lines 2, 3 could not be read");
 });
 
 it("keeps an unsaved passage's legend when the session is opened again", async () => {
