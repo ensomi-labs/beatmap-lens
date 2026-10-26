@@ -15,13 +15,16 @@ const engine = vi.hoisted(() => ({
   offsets: [] as number[],
   positionTimes: [] as (number | undefined)[],
   clicks: [] as (number[] | null)[],
+  instance: undefined as { onEnded?: (positionMs: number) => void } | undefined,
 }));
 vi.mock("./timing/audio-engine", () => ({
   TimingAudioEngine: class {
     readonly sampleRate: number;
     playing = false;
+    onEnded: ((positionMs: number) => void) | undefined;
     constructor(sampleRate: number) {
       this.sampleRate = sampleRate;
+      engine.instance = this;
     }
     load(channels: Float32Array[], frames: number) {
       return {
@@ -742,4 +745,16 @@ it("hands the stage a loop's motion again once its compositor piece has run 32 p
   vi.advanceTimersByTime(1500);
   await nextTick();
   expect(stage.props["playhead-motion"]).toBe(again);
+});
+
+it("ends a play that ran out inside the passage's bounds, holding the playhead there", async () => {
+  await opened();
+  key(" ");
+  await vi.waitFor(() => expect(engine.plays).toBe(1));
+  // The frame really played ends a fraction of a sample after the bounds (1000 ms here).
+  engine.instance?.onEnded?.(1000.0113);
+  await nextTick();
+  expect(stage.props["playhead-ms"]).toBe(1000);
+  expect(stage.props["playhead-motion"]).toBeUndefined();
+  expect(hud()).toContain("00:01.000");
 });

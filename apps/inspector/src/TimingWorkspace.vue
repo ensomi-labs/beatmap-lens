@@ -549,11 +549,12 @@ async function loadAudio(row: BlindPassageRow) {
     engine = new TimingAudioEngine(audio.sample_rate);
     if (previousRate !== undefined && previousRate !== engine.sampleRate) rateChanged.value = true;
     reopenNeeded.value = false;
+    // The end is the frame really played, up to half a sample past the end asked for.
     engine.onEnded = (positionMs) => {
       clearTimeout(transportTimer);
       playing.value = false;
       motion.value = undefined;
-      playheadMs.value = positionMs;
+      playheadMs.value = clampToBounds(positionMs);
     };
     contextRate.value = engine.sampleRate;
   }
