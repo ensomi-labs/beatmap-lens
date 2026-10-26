@@ -22,6 +22,16 @@ import {
   type SaveResponse,
   staleSessionError,
 } from "./timing/contracts";
+import {
+  followView,
+  loopReanchorDue,
+  motionAt,
+  needsResync,
+  nextFollowCheckMs,
+  type PlayheadMotion,
+  readoutIntervalMs,
+  transportDelayMs,
+} from "./timing/display";
 import { nearestSample } from "./timing/format";
 import {
   addMark,
@@ -40,7 +50,6 @@ import {
   selectMarks,
   undo,
 } from "./timing/marks";
-import { prerollStart } from "./timing/output-clock";
 import { proposalColour } from "./timing/palette";
 import { deinterleave } from "./timing/pcm";
 import {
@@ -54,7 +63,8 @@ import {
   zoomAt,
   zoomLimits,
 } from "./timing/time-view";
-import { digitalSilence } from "./timing/waveform";
+import { prerollStart } from "./timing/transport";
+import { nearSilence } from "./timing/waveform";
 import WorkspaceModeSwitch from "./WorkspaceModeSwitch.vue";
 import type { WorkspaceMode } from "./workspace-mode";
 
@@ -169,7 +179,13 @@ let queuedPassage: number | undefined;
 // Playback
 const audioState = ref<"none" | "loading" | "ready">("none");
 const audioBuffer = shallowRef<AudioBuffer>();
+/**
+ * Where the playhead is. Stopped, it is exact; while playing it is refreshed for the HUD at most
+ * every `readoutIntervalMs`, and the stage draws the playhead from `motion` instead.
+ */
 const playheadMs = ref(0);
+/** How the playhead moves while playing, for the compositor; undefined when it stands still. */
+const motion = shallowRef<PlayheadMotion>();
 const playing = ref(false);
 const looping = ref(false);
 const loopRegion = ref<TimeRange>({ startMs: 0, endMs: 0 });
@@ -197,7 +213,12 @@ let fitPending = true;
 
 let engine: TimingAudioEngine | undefined;
 let loadedHandle = "";
-let frame = 0;
+/** The transport's next run while playing (a timer, never an animation-frame loop). */
+let transportTimer: ReturnType<typeof setTimeout> | undefined;
+/** Page time of the last HUD readout while playing. */
+let readoutAtMs = Number.NEGATIVE_INFINITY;
+/** Page time at which the stage was last handed a motion (and started its loop piece). */
+let motionPlacedAtMs = Number.NEGATIVE_INFINITY;
 let disposed = false;
 
 const passage = computed(() => opened.value?.passages[passageIndex.value]);
@@ -324,19 +345,9 @@ onBeforeUnmount(() => {
   window.removeEventListener("change", releasePressed);
   window.removeEventListener("beforeunload", guardUnload);
   navigator.mediaDevices?.removeEventListener?.("devicechange", markDeviceChanged);
-  cancelAnimationFrame(frame);
+  clearTimeout(transportTimer);
   void engine?.close();
   engine = undefined;
-});
-
-// While playing, the view jumps (never scrolls) to keep the playhead in sight.
-watch(playheadMs, (timeMs) => {
-  if (!playing.value || !follow.value || !stageWidth.value) return;
-  const x = msToX(view.value, timeMs);
-  // The pre-roll may start just left of the view; that alone does not move it.
-  const prerollPx = preferences.value.prerollMs / view.value.msPerPx;
-  if (x < -prerollPx - 1 || x > stageWidth.value)
-    setView(placeAt(view.value, timeMs, stageWidth.value, 0.15));
 });
 
 // The gain is per passage, and consecutive passages can share a loaded recording.
@@ -533,12 +544,11 @@ async function select(index: number) {
     playheadMs.value = row.start_ms;
     const buffer = audioBuffer.value;
     silenceMs.value = buffer
-      ? digitalSilence(
+      ? nearSilence(
           Array.from({ length: buffer.numberOfChannels }, (_, c) => buffer.getChannelData(c)),
           buffer.sampleRate,
           row.start_ms,
           row.end_ms,
-          200,
         )
       : undefined;
     fitPending = true;
@@ -579,10 +589,12 @@ async function loadAudio(row: BlindPassageRow) {
     engine = new TimingAudioEngine(audio.sample_rate);
     if (previousRate !== undefined && previousRate !== engine.sampleRate) rateChanged.value = true;
     reopenNeeded.value = false;
+    // The end is the frame really played, up to half a sample past the end asked for.
     engine.onEnded = (positionMs) => {
-      cancelAnimationFrame(frame);
+      clearTimeout(transportTimer);
       playing.value = false;
-      playheadMs.value = positionMs;
+      motion.value = undefined;
+      playheadMs.value = clampToBounds(positionMs);
     };
     contextRate.value = engine.sampleRate;
   }
@@ -649,7 +661,7 @@ function fitPassage() {
 
 /** Keys zoom around the selected mark, or the playhead without one. */
 function zoomAnchor(): number {
-  return selected.value?.time_ms ?? playheadMs.value;
+  return selected.value?.time_ms ?? shownPlayheadMs();
 }
 
 function zoom(factor: number) {
@@ -689,18 +701,61 @@ async function start(fromMs: number, endMs: number, loop: boolean) {
     latencies.value = engine.latencies();
     playing.value = true;
     if (preferences.value.markClicks) noteClicksHeard();
-    cancelAnimationFrame(frame);
-    frame = requestAnimationFrame(tick);
+    readoutAtMs = Number.NEGATIVE_INFINITY;
+    clearTimeout(transportTimer);
+    transportStep();
   } catch (cause) {
     report(cause);
   }
 }
 
-function tick() {
+/**
+ * The transport's bookkeeping while playing, on a timer: feeds the clock model, hands the stage a
+ * new motion only when the playhead would move by more than the resync tolerance or a loop's
+ * compositor piece has run `loopReanchorPasses` passes, follows the playhead and refreshes the
+ * HUD readout every `readoutIntervalMs`. It runs every `transportIntervalMs`, and exactly when the
+ * playhead will leave the view or wrap, so a follow jump is on time. Nothing here runs per frame:
+ * the compositor moves the playhead, and an animation-frame loop would make it wait for the main
+ * thread.
+ */
+function transportStep() {
+  transportTimer = undefined;
   if (!engine?.playing) return;
-  const position = engine.position(preferences.value.playheadOffsetMs);
-  if (position !== undefined) playheadMs.value = position;
-  frame = requestAnimationFrame(tick);
+  const nowMs = performance.now();
+  const offsetMs = preferences.value.playheadOffsetMs;
+  engine.sampleClock();
+  const next = engine.motion(offsetMs);
+  if (!next) motion.value = undefined;
+  else if (
+    needsResync(motion.value, next, nowMs) ||
+    loopReanchorDue(motion.value, motionPlacedAtMs, nowMs)
+  ) {
+    motion.value = next;
+    motionPlacedAtMs = nowMs;
+  }
+  const current = motion.value;
+  const shownMs = current ? motionAt(current, nowMs) : engine.shownAt(nowMs, offsetMs);
+  if (shownMs !== undefined) {
+    if (follow.value && stageWidth.value) {
+      const jump = followView(view.value, shownMs, stageWidth.value, preferences.value.prerollMs);
+      if (jump) setView(jump);
+    }
+    if (!current || nowMs - readoutAtMs >= readoutIntervalMs) {
+      playheadMs.value = shownMs;
+      readoutAtMs = nowMs;
+    }
+  }
+  const followAt =
+    current && follow.value && stageWidth.value
+      ? nextFollowCheckMs(current, view.value, stageWidth.value, nowMs) + 0.5
+      : Number.POSITIVE_INFINITY;
+  transportTimer = setTimeout(transportStep, transportDelayMs(nowMs, followAt));
+}
+
+/** The playhead's position now: exact while playing, between the HUD's readouts. */
+function shownPlayheadMs(): number {
+  if (!playing.value || !engine) return playheadMs.value;
+  return engine.shownAt(performance.now(), preferences.value.playheadOffsetMs) ?? playheadMs.value;
 }
 
 /**
@@ -728,9 +783,10 @@ function playRegionOnce() {
 
 /** Stops at once, without a fade, and keeps the position that was being heard. */
 function stop() {
-  cancelAnimationFrame(frame);
-  const heard = engine?.stop(preferences.value.playheadOffsetMs);
-  if (playing.value && heard !== undefined) playheadMs.value = clampToBounds(heard);
+  clearTimeout(transportTimer);
+  const shown = engine?.stop(preferences.value.playheadOffsetMs);
+  if (playing.value && shown !== undefined) playheadMs.value = clampToBounds(shown);
+  motion.value = undefined;
   playing.value = false;
 }
 
@@ -771,7 +827,7 @@ function setLoopRegion(region: TimeRange) {
 }
 
 function setLoopEdge(edge: "startMs" | "endMs") {
-  setLoopRegion({ ...loopRegion.value, [edge]: playheadMs.value });
+  setLoopRegion({ ...loopRegion.value, [edge]: shownPlayheadMs() });
 }
 
 /** X loops from 500 ms before the first selected mark to 500 ms after the last. */
@@ -937,7 +993,7 @@ function selectFromList(mark: Mark, event: MouseEvent) {
 function selectAdjacent(direction: 1 | -1) {
   const state = draft.value?.state;
   if (!state) return;
-  const mark = adjacentMark(state, direction, playheadMs.value);
+  const mark = adjacentMark(state, direction, shownPlayheadMs());
   if (!mark) return;
   selectById(mark.id);
   if (!playing.value) playheadMs.value = mark.time_ms;
@@ -1556,6 +1612,7 @@ function handleKeydown(event: KeyboardEvent) {
               :marks="marks"
               :selected-ids="draft?.state.selectedIds ?? []"
               :playhead-ms="playheadMs"
+              :playhead-motion="motion"
               :loop-region="loopRegion"
               :looping="looping"
               @resize="onStageResize"

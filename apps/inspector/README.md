@@ -142,13 +142,16 @@ Open the printed address; it opens the session directly. Marks append to
   **Output device rate** field. Both are remembered by the browser.
 
 The moving playhead follows the audio output clock and the playhead offset,
-which corrects delay the browser cannot see. It shows which beat is sounding to
-about one display frame; place and check marks on the still waveform. After an
-output device or rate change, the stage header says so until the offset is set
-again, with **Reopen audio** and **Check offset** (the latter shows the offset
-under Output and sync); the status bar's offset reads "check" meanwhile. **Reopen
-audio after a device change** in Output and sync, or choosing the current passage
-again, also reopens the audio. The offset can be typed while
+which corrects delay the browser cannot see. It runs on its own compositor
+layer from each frame's time stamp, so a busy page holds it for about a frame
+at most instead of freezing it; the engine and its measurements are described
+in [Timing engine latency](../../docs/inspector/timing-latency.md). It shows
+which beat is sounding to about one display frame; place and check marks on the
+still waveform. After an output device or rate change, the stage header says so
+until the offset is set again, with **Reopen audio** and **Check offset** (the
+latter shows the offset under Output and sync); the status bar's offset reads
+"check" meanwhile. **Reopen audio after a device change** in Output and sync, or
+choosing the current passage again, also reopens the audio. The offset can be typed while
 the audio plays; <kbd>Enter</kbd>, <kbd>Tab</kbd> or leaving the field applies
 it, and −1/+1 step it (<kbd>Shift</kbd>: 10 ms). The stage header warns when the
 stated output device rate differs from the recording's, when the recording rate
@@ -167,7 +170,8 @@ conversion, the playhead offset and the marks file.
 | `src/layout/` | The frame every workspace shares: toolbar, resizable side panes, inspector sections, status bar |
 | `src/annotation/` | Annotation contracts, dataset storage, playback clocks, scene buffering |
 | `src/compare/` | Comparison contracts, excerpt proposals, audio envelope |
-| `src/timing/` | Timing formats, time axis, marks, spectrogram, audio engine and output clock |
+| `src/timing/` | Timing formats, time axis, marks, spectrogram, and the Timing engine: clock model, transport, display and input paths, audio engine, playhead layer |
+| `benchmarks/timing/` | The Timing engine latency harness (lab experiments, app scenarios, analysis) |
 | `server/local-service.ts` | Localhost-only request guard and helpers shared by both services |
 | `server/local-files.ts` | Full-path dataset, catalog and corpus access for Annotate |
 | `server/comparisons.ts` | Blind comparison sessions and verdict files for Compare |

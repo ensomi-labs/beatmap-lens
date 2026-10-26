@@ -1,9 +1,11 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, shallowRef, watch } from "vue";
 import type { Mark } from "./timing/contracts";
+import type { PlayheadMotion } from "./timing/display";
 import { nearestSample } from "./timing/format";
 import { marksWithin, type SelectMode } from "./timing/marks";
 import { proposalColour } from "./timing/palette";
+import { PlayheadLayer } from "./timing/playhead-layer";
 import {
   computeSpectrogram,
   cropSamples,
@@ -41,6 +43,8 @@ const props = defineProps<{
   marks: Mark[];
   selectedIds: string[];
   playheadMs: number;
+  /** While playing: how the playhead moves; it then ignores `playheadMs`. */
+  playheadMotion?: PlayheadMotion | undefined;
   loopRegion: TimeRange;
   looping: boolean;
 }>();
@@ -83,6 +87,8 @@ const markHitPx = 6;
 const host = ref<HTMLDivElement>();
 const base = ref<HTMLCanvasElement>();
 const overlay = ref<HTMLCanvasElement>();
+const playheadLine = ref<HTMLDivElement>();
+const playheadOverview = ref<HTMLDivElement>();
 const size = ref({ width: 0, height: 0, dpr: 1 });
 const spectrogram = shallowRef<Spectrogram>();
 const hoverX = ref<number>();
@@ -196,7 +202,12 @@ let observer: ResizeObserver | undefined;
 let baseFrame = 0;
 let overlayFrame = 0;
 
+let lineLayer: PlayheadLayer | undefined;
+let overviewLayer: PlayheadLayer | undefined;
+
 onMounted(() => {
+  if (playheadLine.value) lineLayer = new PlayheadLayer(playheadLine.value);
+  if (playheadOverview.value) overviewLayer = new PlayheadLayer(playheadOverview.value);
   observer = new ResizeObserver(() => resize());
   if (host.value) observer.observe(host.value);
   resize();
@@ -207,6 +218,8 @@ onBeforeUnmount(() => {
   worker?.terminate();
   cancelAnimationFrame(baseFrame);
   cancelAnimationFrame(overlayFrame);
+  lineLayer?.cancel();
+  overviewLayer?.cancel();
 });
 
 function resize() {
@@ -240,14 +253,30 @@ watch(
   ],
   () => scheduleBase(),
 );
-// The overlay is drawn at once, not in a later frame. During playback the playhead changes in
-// every animation frame; a redraw requested from there runs a frame late, and one cancelled and
-// requested again on every change never runs at all while the audio plays. While a base frame is
+// The overlay (hover line, drags) is drawn at once, not in a later frame. While a base frame is
 // pending (the view moved), the overlay is drawn with it, so the two layers never disagree.
 watch(
-  () => [props.playheadMs, hoverX.value, pendingLoop.value, pendingSelection.value, props.view],
+  () => [hoverX.value, pendingLoop.value, pendingSelection.value, props.view],
   () => {
     if (!baseFrame) drawOverlay();
+  },
+  { flush: "post" },
+);
+// The playhead is not drawn on a canvas: it is an element on its own compositor layer, moved by a
+// transform (see `PlayheadLayer`). While playing it is placed again only when its motion, the view
+// or the stage changes, not every frame. While a base frame is pending (the view moved), it is
+// placed with that frame, so it never shows the new view over the old picture.
+watch(
+  () => [
+    props.playheadMotion,
+    props.playheadMotion ? 0 : props.playheadMs,
+    props.view,
+    size.value,
+    lanes.value,
+    overviewView.value,
+  ],
+  () => {
+    if (!baseFrame) placePlayhead();
   },
   { flush: "post" },
 );
@@ -321,6 +350,7 @@ function drawBase() {
   if (right < canvas.width) context.fillRect(Math.max(0, right), shadeTop, canvas.width, shadeHeight);
   drawOverview(context);
   drawOverlay();
+  placePlayhead();
 }
 
 /** The grey ramp as packed RGBA words (little-endian canvas memory: 0xAABBGGRR). */
@@ -638,22 +668,49 @@ function drawOverlay() {
     context.fillStyle = "#fff";
     context.fillText(label, textX, textY);
   }
-  // One CSS pixel, translucent so a bar or mark at the same time still shows through it, and
-  // placed like a mark of the same width so the two coincide; the ruler triangle makes it easy to
-  // find.
-  const playX = deviceX(props.playheadMs);
-  context.fillStyle = "#ff4d4f";
-  context.globalAlpha = 0.75;
-  vline(context, playX, L.ruler.top * dpr, L.overview.top * dpr, Math.max(1, Math.round(dpr)));
-  context.globalAlpha = 1;
-  context.beginPath();
-  context.moveTo(playX - 5 * dpr, L.ruler.top * dpr);
-  context.lineTo(playX + 5 * dpr, L.ruler.top * dpr);
-  context.lineTo(playX, (L.ruler.top + 7) * dpr);
-  context.closePath();
-  context.fill();
-  const overviewX = Math.round(deviceX(props.playheadMs, overviewView.value));
-  context.fillRect(overviewX - dpr, L.overview.top * dpr, 2 * dpr, L.overview.height * dpr);
+}
+
+/**
+ * The playhead: one CSS pixel (whole device pixels), translucent so a bar or mark at the same time
+ * still shows through it, with the ruler triangle that makes it easy to find, and a 2 px marker in
+ * the overview. Standing still, it is placed like a mark of the same width so the two coincide;
+ * moving, it is centred on its time without rounding, so it glides rather than stepping a pixel at
+ * a time.
+ */
+/** What the playhead was last placed for; a base redraw that changes none of it leaves it alone. */
+let placed: unknown[] = [];
+
+function placePlayhead() {
+  const line = playheadLine.value;
+  const marker = playheadOverview.value;
+  if (!line || !marker || !lineLayer || !overviewLayer) return;
+  const motion = props.playheadMotion;
+  const inputs = [
+    motion,
+    motion ? 0 : props.playheadMs,
+    props.view,
+    size.value,
+    lanes.value,
+    overviewView.value,
+  ];
+  if (inputs.every((value, index) => value === placed[index])) return;
+  placed = inputs;
+  const { dpr } = size.value;
+  const L = lanes.value;
+  const width = Math.max(1, Math.round(dpr));
+  line.style.top = `${L.ruler.top}px`;
+  line.style.height = `${L.overview.top - L.ruler.top}px`;
+  line.style.width = `${width / dpr}px`;
+  marker.style.top = `${L.overview.top}px`;
+  marker.style.height = `${L.overview.height}px`;
+  const overview = overviewView.value;
+  if (motion) {
+    lineLayer.run(motion, (timeMs) => (deviceX(timeMs) - width / 2) / dpr);
+    overviewLayer.run(motion, (timeMs) => deviceX(timeMs, overview) / dpr - 1);
+    return;
+  }
+  lineLayer.hold(lineLeft(deviceX(props.playheadMs), width) / dpr);
+  overviewLayer.hold((Math.round(deviceX(props.playheadMs, overview)) - dpr) / dpr);
 }
 
 // Pointer: a press that moves beyond the threshold drags, otherwise it clicks.
@@ -823,6 +880,8 @@ defineExpose({ cancelDrag });
 <template>
   <div ref="host" class="timing-stage">
     <canvas ref="base" class="timing-stage-canvas" aria-hidden="true"></canvas>
+    <div ref="playheadLine" class="timing-stage-playhead" aria-hidden="true"></div>
+    <div ref="playheadOverview" class="timing-stage-playhead-overview" aria-hidden="true"></div>
     <canvas
       ref="overlay"
       class="timing-stage-canvas timing-stage-overlay"
@@ -859,6 +918,35 @@ defineExpose({ cancelDrag });
 .timing-stage-overlay {
   cursor: crosshair;
   touch-action: none;
+}
+
+/* The playhead's compositor layers, moved only by transform (TimingStage placePlayhead). */
+.timing-stage-playhead,
+.timing-stage-playhead-overview {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 2px;
+  z-index: 1;
+  pointer-events: none;
+  will-change: transform;
+  background: #ff4d4f;
+}
+
+.timing-stage-playhead {
+  background: rgb(255 77 79 / 0.75);
+}
+
+.timing-stage-playhead::before {
+  position: absolute;
+  top: 0;
+  left: 50%;
+  width: 10px;
+  height: 7px;
+  margin-left: -5px;
+  clip-path: polygon(0 0, 100% 0, 50% 100%);
+  background: #ff4d4f;
+  content: "";
 }
 
 .timing-stage-note {
