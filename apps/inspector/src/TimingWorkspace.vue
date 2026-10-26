@@ -1446,7 +1446,7 @@ function handleKeydown(event: KeyboardEvent) {
                     {{ formatSourceTime(passage.start_ms) }}–{{ formatSourceTime(passage.end_ms) }}
                   </span>
                   <span v-for="flag in passage.flags" :key="flag" class="stage-flag">{{ flag }}</span>
-                  <span v-if="passage.hint" class="timing-hud-hint" :title="passage.hint">
+                  <span v-if="passage.hint" class="stage-hint" :title="passage.hint">
                     {{ passage.hint }}
                   </span>
                 </div>
@@ -1860,13 +1860,13 @@ function handleKeydown(event: KeyboardEvent) {
 
         <template #status>
           <span class="status-item">Zoom <b>{{ zoomLabel }}</b></span>
-          <span class="status-item">Follow <b>{{ follow ? "on" : "off" }}</b></span>
+          <span class="status-item status-optional">Follow <b>{{ follow ? "on" : "off" }}</b></span>
           <span class="status-item">
             Loop <b>{{ looping ? "on" : "off" }}</b>
             <b>{{ formatSourceTime(loopRegion.startMs) }}–{{ formatSourceTime(loopRegion.endMs) }}</b>
           </span>
           <span class="status-item">Rate <b>{{ rate }}×</b></span>
-          <span v-if="passage" class="status-item">
+          <span v-if="passage" class="status-item status-optional">
             <b>{{ passage.audio.sample_rate.toLocaleString() }} Hz · {{ passage.audio.channels }} ch</b>
           </span>
           <span
@@ -1898,62 +1898,12 @@ function handleKeydown(event: KeyboardEvent) {
 
 .timing-hud {
   flex: 0 0 auto;
-  border-bottom: 1px solid var(--seam);
-}
-
-.stage-toolbar {
-  display: flex;
-  min-height: 32px;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 4px 12px;
-  padding: 3px 8px;
-  background: var(--surface-2);
-}
-
-.stage-identity {
-  display: flex;
-  min-width: 180px;
-  flex: 1 1 220px;
-  align-items: baseline;
-  gap: 8px;
-  overflow: hidden;
-  font-size: var(--text-xs);
-  white-space: nowrap;
-}
-
-.stage-identity strong {
-  font-weight: 650;
-}
-
-.stage-identity .data {
-  color: var(--ink-secondary);
-}
-
-.stage-flag {
-  padding: 1px 5px;
-  color: var(--ink-secondary);
-  border-radius: 3px;
-  background: var(--surface-3);
-  font-size: var(--text-2xs);
-}
-
-.timing-hud-hint {
-  min-width: 0;
-  overflow: hidden;
-  color: var(--ink-muted);
-  text-overflow: ellipsis;
 }
 
 .timing-transport {
   margin: 0;
   padding: 0;
   border: 0;
-}
-
-.tool-icon-fill {
-  fill: currentColor;
-  stroke: none;
 }
 
 .timing-identity {
@@ -1975,12 +1925,6 @@ function handleKeydown(event: KeyboardEvent) {
 
 .timing-passage-list {
   flex: 1 1 auto;
-}
-
-.pane-footer {
-  flex: 0 0 auto;
-  padding: 8px;
-  border-top: 1px solid var(--seam);
 }
 
 .timing-details {

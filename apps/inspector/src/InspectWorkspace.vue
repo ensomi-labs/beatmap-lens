@@ -6,8 +6,11 @@ import {
 } from "beatmap-lens";
 import { computed, nextTick, onMounted, ref } from "vue";
 import { readTailShortenMs } from "./annotation/session-store";
+import PanelSection from "./layout/PanelSection.vue";
+import type { PaneSpec } from "./layout/pane-layout";
+import type { MobilePanel } from "./layout/WorkspaceFrame.vue";
+import WorkspaceFrame from "./layout/WorkspaceFrame.vue";
 import { renderStaticPreviewSvg } from "./static-preview";
-import WorkspaceModeSwitch from "./WorkspaceModeSwitch.vue";
 import type { WorkspaceMode } from "./workspace-mode";
 
 const emit = defineEmits<{
@@ -38,7 +41,14 @@ type ChartSummary = {
   diagnosticCount: number;
 };
 
-type MobilePanel = "source" | "preview" | "details";
+const sourcePane: PaneSpec = { id: "inspect-source", label: "Source", defaultSize: 420, min: 240, max: 720 };
+const detailsPane: PaneSpec = {
+  id: "inspect-details",
+  label: "Details",
+  defaultSize: 300,
+  min: 220,
+  max: 480,
+};
 
 const sampleMap = `osu file format v14
 
@@ -92,7 +102,6 @@ const healthTone = ref<HealthTone>("idle");
 const facts = ref<Fact[]>([]);
 const statuses = ref<StatusItem[]>([]);
 const renderTime = ref("0.0 ms");
-const detailsVisible = ref(true);
 const activeMobilePanel = ref<MobilePanel>("preview");
 const expandedStatus = ref<number | null>(null);
 const chartSummary = ref<ChartSummary>({
@@ -283,106 +292,54 @@ function formatError(error: unknown): string {
 </script>
 
 <template>
-  <main id="main-content" class="bench" tabindex="-1">
-    <header class="app-bar">
-      <div class="brand-lockup">
-        <span class="brand-mark" aria-hidden="true"></span>
-        <div>
-          <p class="brand-name">Beatmap Lens</p>
-          <p class="brand-edition">Inspector</p>
+  <main id="main-content" class="bench has-active-workspace" tabindex="-1">
+    <WorkspaceFrame
+      v-model:mobile-panel="activeMobilePanel"
+      class="inspect-workspace"
+      layout-key="inspect"
+      mode="inspect"
+      :left="sourcePane"
+      :right="detailsPane"
+      @change-mode="emit('change-mode', $event)"
+    >
+      <template #toolbar>
+        <div class="toolbar-identity toolbar-optional">
+          <strong>{{ chartSummary.title }}</strong>
+          <span>{{ chartSummary.version }}</span>
         </div>
-      </div>
-
-      <div class="chart-context">
-        <span class="chart-context-label">Current chart</span>
-        <strong>{{ chartSummary.title }}</strong>
-        <span aria-hidden="true">·</span>
-        <span>{{ chartSummary.version }}</span>
-      </div>
-
-      <WorkspaceModeSwitch
-        model-value="inspect"
-        @update:model-value="emit('change-mode', $event)"
-      />
-
-      <div class="app-actions">
-        <div class="run-state" aria-live="polite">
-          <span class="health-status" :class="`health-status--${healthTone}`">
-            <span class="health-dot" aria-hidden="true"></span>
-            {{ healthText }}
-          </span>
-          <span class="run-id">{{ runId }}</span>
-        </div>
-
+        <span class="toolbar-divider" aria-hidden="true"></span>
         <button
-          class="button button--quiet details-toggle"
-          :class="{ 'is-active': detailsVisible }"
-          type="button"
-          :aria-expanded="detailsVisible"
-          aria-controls="details-panel"
-          :aria-label="detailsVisible ? 'Hide details' : 'Show details'"
-          @click="detailsVisible = !detailsVisible"
-        >
-          <svg aria-hidden="true" viewBox="0 0 16 16">
-            <path d="M3 3.5h10M3 8h10M3 12.5h10" />
-          </svg>
-          Details
-        </button>
-
-        <button
-          class="button button--primary run-button"
+          class="tool-button tool-button--primary run-button"
           type="button"
           aria-keyshortcuts="Control+Enter Meta+Enter"
+          title="Parse and render the source (Cmd/Ctrl+Enter)"
           @click="runPipeline"
         >
-          <svg class="play-icon" aria-hidden="true" viewBox="0 0 16 16">
-            <path d="m5.25 3.4 7.1 4.1a.58.58 0 0 1 0 1l-7.1 4.1a.58.58 0 0 1-.87-.5V3.9a.58.58 0 0 1 .87-.5Z" />
+          <svg viewBox="0 0 16 16" aria-hidden="true">
+            <path class="tool-icon-fill" d="M5 3.3v9.4L12.6 8z" />
           </svg>
           Run
-          <span class="button-shortcut" aria-hidden="true">⌘↵</span>
+          <kbd aria-hidden="true">⌘↵</kbd>
         </button>
-      </div>
-    </header>
+      </template>
 
-    <nav class="mobile-view-switcher" aria-label="Workspace views">
-      <button
-        v-for="panel in (['source', 'preview', 'details'] as const)"
-        :key="panel"
-        class="mobile-view-button"
-        :class="{ 'is-active': activeMobilePanel === panel }"
-        type="button"
-        :aria-pressed="activeMobilePanel === panel"
-        @click="activeMobilePanel = panel"
-      >
-        {{ panel }}
-      </button>
-    </nav>
+      <template #toolbar-end>
+        <span class="health-status" :class="`health-status--${healthTone}`" aria-live="polite">
+          <span class="health-dot" aria-hidden="true"></span>
+          {{ healthText }}
+        </span>
+      </template>
 
-    <div
-      class="workspace-shell"
-      :class="{ 'workspace-shell--details-hidden': !detailsVisible }"
-    >
-      <section
-        class="workspace-column source-column"
-        :class="{ 'is-mobile-active': activeMobilePanel === 'source' }"
-        aria-labelledby="source-heading"
-      >
-        <header class="column-header source-header">
-          <div class="section-heading">
-            <span class="section-number">01</span>
-            <div>
-              <h2 id="source-heading">Source</h2>
-              <p>osu!mania · source text</p>
-            </div>
-          </div>
-          <button class="button button--quiet reset-button" type="button" @click="resetSource">
+      <template #left>
+        <header class="pane-header">
+          <h2 id="source-heading">Source</h2>
+          <button class="tool-button reset-button" type="button" @click="resetSource">
             <svg aria-hidden="true" viewBox="0 0 16 16">
               <path d="M13 4.75V1.9m0 2.85h-2.85M12.55 8A5 5 0 1 1 11.1 4.45" />
             </svg>
             Reset
           </button>
         </header>
-
         <div class="editor-shell">
           <label class="sr-only" for="source-input">osu! beatmap source</label>
           <textarea
@@ -396,104 +353,52 @@ function formatError(error: unknown): string {
             @keydown="handleSourceKeydown"
           ></textarea>
         </div>
-
         <footer id="source-help" class="source-footer">
           <span>{{ sourceLineCount }} lines</span>
           <span class="keyboard-hint"><kbd>⌘ / Ctrl</kbd><kbd>↵</kbd> to run</span>
         </footer>
-      </section>
+      </template>
 
-      <section
-        class="workspace-column preview-column"
-        :class="{ 'is-mobile-active': activeMobilePanel === 'preview' }"
-        aria-labelledby="preview-heading"
-      >
-        <header class="column-header preview-header">
-          <div class="preview-title">
-            <p class="section-kicker"><span class="section-number">02</span> Chart preview</p>
-            <h1 id="preview-heading">{{ chartSummary.title }}</h1>
-            <p class="chart-byline">
-              <strong>{{ chartSummary.artist }}</strong>
-              <span aria-hidden="true">·</span>
-              {{ chartSummary.version }}
-            </p>
+      <template #main>
+        <section class="inspect-view" aria-labelledby="preview-heading">
+          <div class="stage-toolbar">
+            <div class="stage-identity">
+              <h1 id="preview-heading">{{ chartSummary.title }}</h1>
+              <span>{{ chartSummary.artist }}</span>
+              <span class="data">{{ chartSummary.version }}</span>
+            </div>
+            <dl class="metric-strip">
+              <div><dt>Keys</dt><dd>{{ chartSummary.keyCount }}K</dd></div>
+              <div><dt>Objects</dt><dd>{{ chartSummary.noteCount }}</dd></div>
+              <div><dt>Holds</dt><dd>{{ chartSummary.longNoteCount }}</dd></div>
+              <div><dt>Warnings</dt><dd>{{ chartSummary.diagnosticCount }}</dd></div>
+            </dl>
           </div>
-          <div class="render-timing">
-            <span>renderSvg</span>
-            <strong>{{ renderTime }}</strong>
-          </div>
-        </header>
-
-        <div class="metric-rail">
-          <div class="metric-item">
-            <span>Keys</span>
-            <strong>{{ chartSummary.keyCount }}K</strong>
-          </div>
-          <div class="metric-item">
-            <span>Objects</span>
-            <strong>{{ chartSummary.noteCount }}</strong>
-          </div>
-          <div class="metric-item">
-            <span>Holds</span>
-            <strong>{{ chartSummary.longNoteCount }}</strong>
-          </div>
-          <div class="metric-item">
-            <span>Warnings</span>
-            <strong>{{ chartSummary.diagnosticCount }}</strong>
-          </div>
-        </div>
-
-        <div class="preview-body" :aria-busy="healthText === 'Running'">
-          <div class="preview-frame">
-            <div
-              ref="svgOutput"
-              class="svg-output"
-              aria-live="polite"
-            ></div>
-          </div>
-        </div>
-      </section>
-
-      <aside
-        id="details-panel"
-        class="workspace-column details-column"
-        :class="{ 'is-mobile-active': activeMobilePanel === 'details' }"
-        aria-labelledby="details-heading"
-      >
-        <header class="column-header details-header">
-          <div class="section-heading">
-            <span class="section-number">03</span>
-            <div>
-              <h2 id="details-heading">Details</h2>
-              <p>Facts and pipeline</p>
+          <div class="preview-body" :aria-busy="healthText === 'Running'">
+            <div class="preview-frame">
+              <div ref="svgOutput" class="svg-output" aria-live="polite"></div>
             </div>
           </div>
-        </header>
+        </section>
+      </template>
 
-        <section class="details-section" aria-labelledby="facts-heading">
-          <h3 id="facts-heading">Chart facts</h3>
-          <dl class="facts-list">
-            <div v-for="fact in facts" :key="fact.label" class="fact-item">
+      <template #right>
+        <PanelSection id="inspect-facts" title="Chart facts">
+          <dl class="compact-facts">
+            <div v-for="fact in facts" :key="fact.label">
               <dt>{{ fact.label }}</dt>
               <dd>{{ fact.value }}</dd>
             </div>
           </dl>
-        </section>
+        </PanelSection>
 
-        <section class="details-section pipeline-section" aria-labelledby="diagnostic-heading">
-          <h3 id="diagnostic-heading">Pipeline</h3>
+        <PanelSection id="inspect-pipeline" title="Pipeline">
           <div class="diagnostic-list">
-            <template
-              v-for="(item, index) in statuses"
-              :key="`${item.label}-${index}`"
-            >
+            <template v-for="(item, index) in statuses" :key="`${item.label}-${index}`">
               <button
                 v-if="item.detail"
                 class="diagnostic has-detail"
-                :class="[
-                  `diagnostic--${item.tone}`,
-                  { 'is-expanded': expandedStatus === index },
-                ]"
+                :class="[`diagnostic--${item.tone}`, { 'is-expanded': expandedStatus === index }]"
                 type="button"
                 :aria-expanded="expandedStatus === index"
                 @click="toggleStatus(index)"
@@ -504,11 +409,7 @@ function formatError(error: unknown): string {
                 </div>
                 <span class="diagnostic-result">
                   <span class="diagnostic-value">{{ item.value }}</span>
-                  <svg
-                    class="diagnostic-chevron"
-                    aria-hidden="true"
-                    viewBox="0 0 12 12"
-                  >
+                  <svg class="diagnostic-chevron" aria-hidden="true" viewBox="0 0 12 12">
                     <path d="m3 4.5 3 3 3-3" />
                   </svg>
                 </span>
@@ -527,8 +428,46 @@ function formatError(error: unknown): string {
               </div>
             </template>
           </div>
-        </section>
-      </aside>
-    </div>
+        </PanelSection>
+      </template>
+
+      <template #status>
+        <span class="status-item">Run <b>{{ runId.replace("run ", "") }}</b></span>
+        <span class="status-item">renderSvg <b>{{ renderTime }}</b></span>
+        <span class="status-item">Source <b>{{ sourceLineCount }} lines</b></span>
+      </template>
+    </WorkspaceFrame>
   </main>
 </template>
+
+<style scoped>
+.inspect-view {
+  display: flex;
+  min-height: 0;
+  flex: 1 1 auto;
+  flex-direction: column;
+}
+
+.metric-strip {
+  display: flex;
+  gap: 14px;
+  margin: 0;
+  font-size: var(--text-xs);
+}
+
+.metric-strip > div {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+}
+
+.metric-strip dt {
+  color: var(--ink-muted);
+}
+
+.metric-strip dd {
+  margin: 0;
+  font-family: var(--font-data);
+  font-variant-numeric: tabular-nums;
+}
+</style>

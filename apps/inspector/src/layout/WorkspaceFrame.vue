@@ -88,6 +88,16 @@ const columns = computed(() => {
   return [...left, "minmax(0, 1fr)", ...right].join(" ");
 });
 
+/**
+ * Grid columns of the body's children, placed explicitly: a pane hidden with `display: none`
+ * leaves the grid, and auto-placement would shift the main view into the pane's column.
+ */
+const placement = computed(() => {
+  if (narrow.value) return {};
+  const main = props.left ? 3 : 1;
+  return { left: 1, leftSplitter: 2, main, rightSplitter: main + 1, right: main + 2 };
+});
+
 /** Whether a pane is on screen: by its hidden state on desktop, by the view switch when narrow. */
 function paneShown(side: "left" | "right"): boolean {
   if (narrow.value && props.mobilePanel !== undefined)
@@ -209,12 +219,14 @@ const toggleLabel = (spec: PaneSpec, hidden: boolean) =>
           v-show="paneShown('left')"
           :id="left.id"
           class="frame-pane frame-pane--left"
+          :style="{ gridColumn: placement.left }"
           :aria-label="left.label"
         >
           <slot name="left"></slot>
         </aside>
         <PaneSplitter
           v-if="!narrow"
+          :style="{ gridColumn: placement.leftSplitter }"
           :controls="left.id"
           :label="left.label"
           :size="paneState(left)?.size ?? left.defaultSize"
@@ -227,12 +239,13 @@ const toggleLabel = (spec: PaneSpec, hidden: boolean) =>
           @reset="reset(left)"
         />
       </template>
-      <div v-show="mainShown" class="frame-main">
+      <div v-show="mainShown" class="frame-main" :style="{ gridColumn: placement.main }">
         <slot name="main"></slot>
       </div>
       <template v-if="right">
         <PaneSplitter
           v-if="!narrow"
+          :style="{ gridColumn: placement.rightSplitter }"
           :controls="right.id"
           :label="right.label"
           :size="paneState(right)?.size ?? right.defaultSize"
@@ -248,6 +261,7 @@ const toggleLabel = (spec: PaneSpec, hidden: boolean) =>
           v-show="paneShown('right')"
           :id="right.id"
           class="frame-pane frame-pane--right"
+          :style="{ gridColumn: placement.right }"
           :aria-label="right.label"
         >
           <slot name="right"></slot>

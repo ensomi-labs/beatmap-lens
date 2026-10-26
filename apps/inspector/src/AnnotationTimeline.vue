@@ -820,17 +820,17 @@ function timelineGestureSnapshot(
   min-inline-size: 0;
   margin: 0;
   padding: 0;
-  color: oklch(21% 0.018 255);
-  background: oklch(100% 0 0);
+  color: var(--ink);
+  background: var(--surface-1);
   border-block: 0;
-  border-inline: 1px solid oklch(88% 0.01 255);
+  border-inline: 1px solid var(--seam);
   cursor: grab;
   touch-action: none;
   user-select: none;
 }
 
 .annotation-timeline:focus-visible {
-  outline: 2px solid oklch(57% 0.21 258);
+  outline: 2px solid var(--signal);
   outline-offset: -2px;
 }
 
@@ -863,25 +863,25 @@ function timelineGestureSnapshot(
 }
 
 .annotation-timeline__ground {
-  fill: oklch(99% 0.004 255);
+  fill: var(--surface-1);
 }
 
 .annotation-timeline__density {
-  fill: oklch(43% 0.018 255 / 0.16);
+  fill: oklch(78% 0.01 255 / 0.3);
 }
 
 .annotation-timeline__viewport-window {
-  fill: oklch(57% 0.21 258 / 0.09);
-  stroke: oklch(57% 0.21 258 / 0.36);
+  fill: oklch(72% 0.14 255 / 0.12);
+  stroke: oklch(72% 0.14 255 / 0.55);
   stroke-width: 1;
 }
 
 .annotation-timeline__saved-band {
-  fill: oklch(59% 0.15 153 / 0.38);
+  fill: oklch(76% 0.15 153 / 0.32);
 }
 
 .annotation-timeline__selection-highlight {
-  fill: oklch(57% 0.21 258 / 0.2);
+  fill: oklch(72% 0.14 255 / 0.26);
 }
 
 .annotation-timeline__selection-hit-zone {
@@ -889,21 +889,21 @@ function timelineGestureSnapshot(
 }
 
 .annotation-timeline__playhead {
-  stroke: oklch(60% 0.2 27);
+  stroke: var(--danger);
   stroke-width: 2;
   vector-effect: non-scaling-stroke;
 }
 
 .annotation-timeline__out-of-view {
-  fill: oklch(43% 0.018 255 / 0.56);
+  fill: oklch(78% 0.01 255 / 0.56);
 }
 
 .annotation-timeline__out-of-view--selection {
-  fill: oklch(57% 0.21 258 / 0.72);
+  fill: oklch(72% 0.14 255 / 0.8);
 }
 
 .annotation-timeline__out-of-view--playhead {
-  fill: oklch(60% 0.2 27 / 0.78);
+  fill: oklch(72% 0.17 25 / 0.85);
 }
 
 .annotation-timeline__selection-label-layer {
@@ -916,19 +916,11 @@ function timelineGestureSnapshot(
 .annotation-timeline__selection-caption {
   position: absolute;
   inset-inline: 4px;
-  border-radius: 4px;
-  background: oklch(100% 0 0 / 0.92);
-  box-shadow:
-    0 0 0 1px oklch(88% 0.01 255 / 0.78),
-    0 1px 3px rgb(0 0 0 / 0.1);
-  color: oklch(21% 0.018 255);
-  font-family:
-    "Azeret Mono Variable",
-    ui-monospace,
-    SFMono-Regular,
-    Menlo,
-    Consolas,
-    monospace;
+  border-radius: 3px;
+  background: oklch(17% 0.012 255 / 0.92);
+  box-shadow: 0 0 0 1px var(--line-strong);
+  color: var(--ink);
+  font-family: var(--font-data);
   font-size: 9px;
   font-variant-numeric: tabular-nums;
   font-weight: 650;
