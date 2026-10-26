@@ -7,7 +7,7 @@
  *
  *   node fixtures.mjs DIR
  *   PLAYWRIGHT_DIR=... node shoot.mjs --app BUNDLE --inputs DIR --out SHOTS \
- *     [--port 4191] [--dev http://127.0.0.1:4192] [--only timing,checks,modes]
+ *     [--port 4191] [--dev http://127.0.0.1:4192] [--only timing,checks,fixes,modes]
  *
  * Writes JPEG screenshots and `results.json` (checks and layout measurements) into SHOTS.
  */
@@ -25,7 +25,7 @@ const { values } = parseArgs({
     out: { type: "string" },
     port: { type: "string", default: "4191" },
     dev: { type: "string" },
-    only: { type: "string", default: "timing,checks,modes" },
+    only: { type: "string", default: "timing,checks,fixes,modes" },
   },
 });
 if (!values.app || !values.inputs || !values.out) {
@@ -469,6 +469,313 @@ async function timingChecks() {
   }
 }
 
+/** The passage shown, its view bar's height and the stage's top, after the stage has drawn. */
+async function passageLayout(page) {
+  return page.evaluate(() => {
+    const bar = document.querySelector(".stage-toolbar")?.getBoundingClientRect();
+    const stage = document.querySelector(".timing-stage-overlay")?.getBoundingClientRect();
+    const identity = document.querySelector(".stage-identity")?.getBoundingClientRect();
+    const hint = document.querySelector(".stage-hint");
+    const flags = [...document.querySelectorAll(".stage-flag")].map((flag) => {
+      const r = flag.getBoundingClientRect();
+      return {
+        text: flag.textContent.trim(),
+        right: Math.round(r.right),
+        left: Math.round(r.left),
+      };
+    });
+    return {
+      passage: document.querySelector(".stage-identity strong")?.textContent.trim(),
+      barHeight: bar ? Math.round(bar.height) : null,
+      stageTop: stage ? Math.round(stage.top) : null,
+      identityRight: identity ? Math.round(identity.right) : null,
+      identityTitle: document.querySelector(".stage-identity")?.getAttribute("title") ?? null,
+      hintWidth:
+        hint && getComputedStyle(hint).display !== "none"
+          ? Math.round(hint.getBoundingClientRect().width)
+          : 0,
+      flags,
+    };
+  });
+}
+
+async function nextPassage(page) {
+  const before = (await passageLayout(page)).passage;
+  await page.keyboard.press("Shift+BracketRight");
+  await page.waitForFunction(
+    (text) =>
+      document.querySelector(".stage-identity strong")?.textContent.trim() !== text &&
+      document.querySelector(".timing-stage-overlay") &&
+      !document.querySelector(".timing-stage-note"),
+    before,
+    { timeout: 20000 },
+  );
+  await sleep(400);
+}
+
+/** Every passage in turn, from the one open: the view bar's height and the stage's top in each. */
+async function visitPassages(page) {
+  const seen = [await passageLayout(page)];
+  for (let i = 1; i < 6; i++) {
+    await nextPassage(page);
+    seen.push(await passageLayout(page));
+  }
+  return seen;
+}
+
+/** The boundary of the details pane at its widest: its value, the pane drawn, and one step back. */
+async function widestBoundary(page, width) {
+  const splitter = page.locator('[role="separator"][aria-controls="timing-inspector"]');
+  const pane = () => page.locator("#timing-inspector").boundingBox();
+  await splitter.focus();
+  await page.keyboard.press("End");
+  await sleep(150);
+  const valueNow = Number(await splitter.getAttribute("aria-valuenow"));
+  const valueMax = Number(await splitter.getAttribute("aria-valuemax"));
+  const drawn = (await pane()).width;
+  await page.keyboard.press("ArrowRight");
+  await sleep(150);
+  const stepValue = Number(await splitter.getAttribute("aria-valuenow"));
+  const stepDrawn = (await pane()).width;
+  await splitter.dblclick();
+  await page.evaluate(() => document.activeElement?.blur());
+  await sleep(150);
+  const expected = Math.min(520, Math.floor(width * 0.38));
+  return {
+    ok:
+      valueNow === expected &&
+      valueMax === expected &&
+      Math.abs(drawn - valueNow) <= 1 &&
+      stepValue === valueNow - 16 &&
+      Math.abs(stepDrawn - stepValue) <= 1,
+    expected,
+    valueNow,
+    valueMax,
+    drawn,
+    stepValue,
+    stepDrawn,
+  };
+}
+
+/** Checks for the fixes of the review of 32261e7 (research note inspector-daw-ui-20261026, §7). */
+async function timingFixChecks() {
+  const server = await startTimingServer();
+  try {
+    {
+      const { context, page, errors } = await newPage(1440, 900, 2);
+      try {
+        await openTiming(page);
+        await check(
+          "1440: the view bar and the stage keep their place across passages",
+          async () => {
+            const seen = await visitPassages(page);
+            const heights = [...new Set(seen.map((entry) => entry.barHeight))];
+            const tops = [...new Set(seen.map((entry) => entry.stageTop))];
+            return { ok: heights.length === 1 && tops.length === 1, heights, tops, seen };
+          },
+        );
+
+        await check(
+          "the counter keeps its width as the sample index grows and while playing",
+          async () => {
+            const counter = async () =>
+              page.evaluate(() => ({
+                width: document.querySelector(".timing-counter").getBoundingClientRect().width,
+                text: document
+                  .querySelector(".timing-counter")
+                  .textContent.replace(/\s+/g, " ")
+                  .trim(),
+                next: Math.round(
+                  document.querySelector(".timing-blind").getBoundingClientRect().left,
+                ),
+              }));
+            const seen = [];
+            await page.keyboard.press("Home");
+            await sleep(150);
+            seen.push(await counter());
+            await page.keyboard.press("End");
+            await sleep(150);
+            seen.push(await counter());
+            await page.keyboard.press("z");
+            await sleep(200);
+            seen.push(await counter());
+            await page.keyboard.press("z");
+            await page.keyboard.press("Home");
+            await page.keyboard.press("Space");
+            for (let i = 0; i < 4; i++) {
+              await sleep(300);
+              seen.push(await counter());
+            }
+            await page.keyboard.press("Escape");
+            const widths = [...new Set(seen.map((entry) => Math.round(entry.width * 100) / 100))];
+            const next = [...new Set(seen.map((entry) => entry.next))];
+            return { ok: widths.length === 1 && next.length === 1, widths, next, seen };
+          },
+        );
+
+        await check("1440: a boundary's drawn width equals its value at the widest", () =>
+          widestBoundary(page, 1440),
+        );
+
+        await check("the boundaries' grab areas stay off the stage", async () => {
+          const stage = await page.locator(".timing-stage-overlay").boundingBox();
+          const y = stage.y + stage.height / 2;
+          const at = (x) =>
+            page.evaluate(
+              ([px, py]) => {
+                const element = document.elementFromPoint(px, py);
+                return element?.closest(".pane-splitter") ? "boundary" : (element?.className ?? "");
+              },
+              [x, y],
+            );
+          const probes = {
+            stageLeft: await at(stage.x + 1),
+            stageRight: await at(stage.x + stage.width - 2),
+            paneLeft: await at(stage.x - 4),
+            paneRight: await at(stage.x + stage.width + 4),
+          };
+          return {
+            ok:
+              probes.stageLeft !== "boundary" &&
+              probes.stageRight !== "boundary" &&
+              probes.paneLeft === "boundary" &&
+              probes.paneRight === "boundary",
+            ...probes,
+          };
+        });
+
+        await check(
+          "Space and Enter reach the shortcuts after a click on the help disclosure",
+          async () => {
+            const lines = () =>
+              existsSync(marksFile) ? readFileSync(marksFile, "utf8").trim().split("\n").length : 0;
+            await page.locator(".timing-help summary").click();
+            await sleep(100);
+            const focused = await page.evaluate(() => document.activeElement?.tagName);
+            const open = await page.locator(".timing-help").evaluate((element) => element.open);
+            await page.keyboard.press("Space");
+            await sleep(500);
+            const playing = await page
+              .locator(".timing-transport .tool-button--play")
+              .getAttribute("aria-pressed");
+            await page.keyboard.press("Space");
+            await sleep(150);
+            await page.keyboard.press("b");
+            await sleep(100);
+            const before = lines();
+            await page.keyboard.press("Enter");
+            await sleep(700);
+            const after = lines();
+            await page.locator(".timing-help summary").click();
+            return {
+              ok: focused !== "SUMMARY" && open && playing === "true" && after === before + 1,
+              focused,
+              open,
+              playing,
+              saves: [before, after],
+            };
+          },
+        );
+
+        await check("a device change shows on the stage with Output and sync closed", async () => {
+          const toggle = page.locator("#timing-sync .panel-section-toggle");
+          if ((await toggle.getAttribute("aria-expanded")) === "true") await toggle.click();
+          const closed = (await toggle.getAttribute("aria-expanded")) === "false";
+          await page.evaluate(() =>
+            navigator.mediaDevices.dispatchEvent(new Event("devicechange")),
+          );
+          await sleep(250);
+          const notice = await page.locator(".timing-hud-offset").boundingBox();
+          const text = (await page.locator(".timing-hud-offset").innerText()).replace(/\s+/g, " ");
+          const flagged = await page
+            .locator(".frame-status .status-item.status-warning", { hasText: "Offset" })
+            .innerText();
+          const revealed = await toggle.getAttribute("aria-expanded");
+          await shot(page, "timing-1440-device-change");
+          await page.getByRole("button", { name: "Reopen audio", exact: true }).click();
+          // The stage closes while the audio reopens; wait for it to be back.
+          await sleep(300);
+          await page.waitForFunction(
+            () =>
+              document.querySelector(".timing-stage-overlay") &&
+              !document.querySelector(".timing-stage-note"),
+            null,
+            { timeout: 20000 },
+          );
+          await sleep(500);
+          const afterReopen = await page.locator(".timing-hud-offset").count();
+          await page.getByRole("button", { name: "Check offset", exact: true }).click();
+          await sleep(200);
+          const focused = await page.evaluate(() => document.activeElement?.id);
+          await page.fill("#timing-offset", "0");
+          await page.keyboard.press("Enter");
+          await sleep(200);
+          const cleared = (await page.locator(".timing-hud-offset").count()) === 0;
+          const unflagged = await page
+            .locator(".frame-status .status-item.status-warning", { hasText: "Offset" })
+            .count();
+          await page.evaluate(() => document.activeElement?.blur());
+          return {
+            ok:
+              closed &&
+              Boolean(notice) &&
+              notice.y >= 0 &&
+              notice.y + notice.height <= 900 &&
+              /check/.test(flagged) &&
+              revealed === "true" &&
+              afterReopen === 1 &&
+              focused === "timing-offset" &&
+              cleared &&
+              unflagged === 0,
+            closed,
+            notice,
+            text,
+            flagged,
+            revealed,
+            afterReopen,
+            focused,
+            cleared,
+          };
+        });
+        record("no page errors in the fix checks at 1440", errors.length === 0, { errors });
+      } finally {
+        await context.close();
+      }
+    }
+    {
+      const { context, page, errors } = await newPage(1100, 800, 2);
+      try {
+        await openTiming(page);
+        await check("1100: the view bar keeps one height, its flags and its hint", async () => {
+          const seen = await visitPassages(page);
+          const heights = [...new Set(seen.map((entry) => entry.barHeight))];
+          const tops = [...new Set(seen.map((entry) => entry.stageTop))];
+          const flagsWhole = seen.every((entry) =>
+            entry.flags.every((flag) => flag.right <= entry.identityRight),
+          );
+          const hinted = seen.every(
+            (entry) => entry.hintWidth > 0 && entry.identityTitle?.includes("·"),
+          );
+          return {
+            ok: heights.length === 1 && tops.length === 1 && flagsWhole && hinted,
+            heights,
+            tops,
+            seen,
+          };
+        });
+        await check("1100: a boundary's drawn width equals its value at the widest", () =>
+          widestBoundary(page, 1100),
+        );
+        record("no page errors in the fix checks at 1100", errors.length === 0, { errors });
+      } finally {
+        await context.close();
+      }
+    }
+  } finally {
+    server.kill();
+  }
+}
+
 // Other modes -------------------------------------------------------------------------------------
 
 async function openMode(page, base, mode) {
@@ -544,6 +851,33 @@ async function modeShots(base) {
         }
         await open(page, base);
         await shot(page, `${name}-${width}`);
+        if (name === "review" && width === 1440) {
+          await check("review: a disabled Save looks disabled; the status line has a title", () =>
+            page.evaluate(() => {
+              const save = [...document.querySelectorAll("button")].find(
+                (button) => button.textContent.trim() === "Save section judgments",
+              );
+              const probe = document.createElement("div");
+              probe.style.background = "var(--signal-fill)";
+              document.body.append(probe);
+              const fill = getComputedStyle(probe).backgroundColor;
+              probe.remove();
+              const status = document.querySelector(".review-status");
+              const background = save ? getComputedStyle(save).backgroundColor : null;
+              return {
+                ok:
+                  Boolean(save?.disabled) &&
+                  background !== fill &&
+                  Boolean(status?.title) &&
+                  status.title === status.textContent.trim(),
+                disabled: save?.disabled,
+                background,
+                fill,
+                title: status?.title,
+              };
+            }),
+          );
+        }
         if (width === 1440) {
           const hide = page.getByRole("button", { name: /^Hide / });
           if (await hide.count()) {
@@ -593,6 +927,7 @@ async function modeShots(base) {
 try {
   if (only.has("timing")) await timingShots();
   if (only.has("checks")) await timingChecks();
+  if (only.has("fixes")) await timingFixChecks();
   if (only.has("modes") && values.dev) await modeShots(values.dev.replace(/\/$/, ""));
 } finally {
   await browser.close();
