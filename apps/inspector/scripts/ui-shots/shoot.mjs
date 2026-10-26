@@ -7,7 +7,7 @@
  *
  *   node fixtures.mjs DIR
  *   PLAYWRIGHT_DIR=... node shoot.mjs --app BUNDLE --inputs DIR --out SHOTS \
- *     [--port 4191] [--dev http://127.0.0.1:4192] [--only timing,checks,fixes,modes]
+ *     [--port 4191] [--dev http://127.0.0.1:4192] [--only timing,checks,fixes,requests,modes]
  *
  * Writes JPEG screenshots and `results.json` (checks and layout measurements) into SHOTS.
  */
@@ -25,7 +25,7 @@ const { values } = parseArgs({
     out: { type: "string" },
     port: { type: "string", default: "4191" },
     dev: { type: "string" },
-    only: { type: "string", default: "timing,checks,fixes,modes" },
+    only: { type: "string", default: "timing,checks,fixes,requests,modes" },
   },
 });
 if (!values.app || !values.inputs || !values.out) {
@@ -44,6 +44,9 @@ const { chromium } = require("playwright");
 
 const session = join(inputs, "music", "sessions", "music.timing.json");
 const marksFile = join(inputs, "music", "sessions", "music.timing.marks.jsonl");
+const notesFile = join(inputs, "music", "sessions", "music.timing.notes.jsonl");
+/** Another session's marks file in the same folder, whose last save the setup is carried from. */
+const siblingFile = join(inputs, "music", "sessions", "earlier.timing.marks.jsonl");
 const fixtures = join(inputs, "fixtures");
 const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
 const results = { checks: [], measurements: {}, errors: {} };
@@ -70,13 +73,13 @@ const browser = await chromium.launch({
   args: ["--mute-audio", "--autoplay-policy=no-user-gesture-required"],
 });
 
-async function newPage(width, height, dpr = 1) {
+async function newPage(width, height, dpr = 1, { fresh = false } = {}) {
   const context = await browser.newContext({
     viewport: { width, height },
     deviceScaleFactor: dpr,
   });
-  await context.addInitScript(() => {
-    if (!localStorage.getItem("lens-timing-preferences"))
+  await context.addInitScript((fresh) => {
+    if (!fresh && !localStorage.getItem("lens-timing-preferences"))
       localStorage.setItem(
         "lens-timing-preferences",
         JSON.stringify({ setup: "DT 270 PRO · FineTune bypassed", deviceRateHz: 48000 }),
@@ -87,7 +90,7 @@ async function newPage(width, height, dpr = 1) {
       window.__starts.push({ when: args[0], offset: args[1], length: this.buffer?.length });
       return start.apply(this, args);
     };
-  });
+  }, fresh);
   const page = await context.newPage();
   const errors = [];
   page.on("pageerror", (error) => errors.push(String(error)));
@@ -776,6 +779,538 @@ async function timingFixChecks() {
   }
 }
 
+// The owner's requests of 2026-10-26: locate, a prefilled setup, notes -------------------------------
+
+const readLines = (file) =>
+  existsSync(file)
+    ? readFileSync(file, "utf8")
+        .trim()
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line))
+    : [];
+
+/** Locate with the middle button and Option+click, the setup in a fresh browser, and notes. */
+async function timingRequestChecks() {
+  rmSync(notesFile, { force: true });
+  // An earlier session's save in the same folder: the setup and rate a fresh browser carries.
+  const earlier = {
+    version: 1,
+    type: "save",
+    id: "earlier-save-1",
+    session_id: "earlier",
+    passage_id: "passage-01",
+    time: "2026-10-24T08:37:00.000Z",
+    setup: "DT270pro 3%",
+    playback: { device_rate_hz: 44100 },
+    marks: [],
+  };
+  writeFileSync(siblingFile, `${JSON.stringify(earlier)}\n`);
+  const server = await startTimingServer();
+  const { context, page, errors } = await newPage(1440, 900, 2, { fresh: true });
+  try {
+    await page.addInitScript(() => {
+      window.__presses = [];
+      for (const type of ["pointerdown", "mousedown", "auxclick"])
+        window.addEventListener(type, (event) => {
+          if (event.button === 1 || event.altKey)
+            window.__presses.push({
+              type,
+              button: event.button,
+              prevented: event.defaultPrevented,
+            });
+        });
+    });
+    let box = await openTiming(page);
+    const playheadLeft = () =>
+      page.evaluate(() => {
+        const r = document.querySelector(".timing-stage-playhead").getBoundingClientRect();
+        return r.left + r.width / 2;
+      });
+    const counter = () =>
+      page.evaluate(() =>
+        document.querySelector(".timing-counter").textContent.replace(/\s+/g, " ").trim(),
+      );
+    const markCount = () => page.locator(".timing-mark-list li").count();
+    const heading = async () =>
+      (await page.locator(".timing-marks-heading .rail-count").innerText()).trim();
+    const musicStarts = () =>
+      page.evaluate(() => window.__starts.filter((start) => start.length > 2000));
+    const seconds = (text) => {
+      const match = /(\d+):(\d+\.\d+)/.exec(text);
+      return match ? Number(match[1]) * 60 + Number(match[2]) : null;
+    };
+    const lanes = () => ({
+      ruler: box.y + 10,
+      waveform: box.y + box.height * 0.55,
+      marks: box.y + box.height - 30 - 9,
+      overview: box.y + box.height - 15,
+    });
+
+    await check(
+      "setup in a fresh browser: carried from the last save, the rate detected",
+      async () => {
+        const value = await page.inputValue("#timing-setup");
+        const origin = (await page.locator(".timing-setup-source").innerText()).trim();
+        const option = (
+          await page.locator("#timing-device-rate option").first().innerText()
+        ).trim();
+        const detectedHz = await page.evaluate(() => {
+          const probe = new AudioContext();
+          const hz = probe.sampleRate;
+          void probe.close();
+          return hz;
+        });
+        const status = (await page.locator(".timing-setup-status").innerText()).replace(
+          /\s+/g,
+          " ",
+        );
+        await page.locator("#timing-save").scrollIntoViewIfNeeded();
+        await page
+          .locator(".frame-pane--right")
+          .screenshot({ path: join(out, "requests-setup-fresh.jpg"), type: "jpeg", quality: 88 });
+        await shot(page, "requests-timing-fresh-1440");
+        return {
+          ok:
+            value === "DT270pro 3%" &&
+            /From the last save, .* · earlier/.test(origin) &&
+            option === `Detected: ${detectedHz.toLocaleString("en")} Hz` &&
+            /DT270pro 3% · last save/.test(status),
+          value,
+          origin,
+          option,
+          detectedHz,
+          status,
+        };
+      },
+    );
+
+    await check(
+      "Save in a fresh browser records where the setup and the rate came from",
+      async () => {
+        await page.keyboard.press("0");
+        await page.keyboard.down("Shift");
+        await page.mouse.click(box.x + box.width * 0.3, lanes().waveform);
+        await page.keyboard.up("Shift");
+        await page.keyboard.press("Enter");
+        await sleep(700);
+        const saved = readLines(marksFile).at(-1);
+        const playback = saved?.playback ?? {};
+        return {
+          ok:
+            saved?.setup === "DT270pro 3%" &&
+            saved?.setup_source === "last-save" &&
+            saved?.setup_from?.session_id === "earlier" &&
+            saved?.setup_from?.save_id === "earlier-save-1" &&
+            playback.device_rate_source === "detected" &&
+            playback.device_rate_hz === playback.device_rate_detected_hz &&
+            typeof playback.device_rate_detected_at === "string" &&
+            saved?.note === null,
+          setup: saved?.setup,
+          setup_source: saved?.setup_source,
+          setup_from: saved?.setup_from,
+          device_rate: [
+            playback.device_rate_hz,
+            playback.device_rate_source,
+            playback.device_rate_detected_hz,
+            playback.device_rate_detected_at,
+          ],
+        };
+      },
+    );
+
+    await check(
+      "a typed setup is saved as typed and carried from that save after a reload",
+      async () => {
+        await page.fill("#timing-setup", "HD 600 · FineTune off · 20%");
+        const typed = (await page.locator(".timing-setup-source").innerText()).trim();
+        await page.keyboard.press("Escape");
+        await page.keyboard.press("Enter");
+        await sleep(700);
+        const saved = readLines(marksFile).at(-1);
+        await page.reload();
+        box = await openTiming(page);
+        const value = await page.inputValue("#timing-setup");
+        const origin = (await page.locator(".timing-setup-source").innerText()).trim();
+        return {
+          ok:
+            typed === "Typed now" &&
+            saved?.setup === "HD 600 · FineTune off · 20%" &&
+            saved?.setup_source === "typed" &&
+            value === "HD 600 · FineTune off · 20%" &&
+            /From the last save, .* · music/.test(origin),
+          typed,
+          saved: [saved?.setup, saved?.setup_source],
+          value,
+          origin,
+        };
+      },
+    );
+
+    await check(
+      "middle-click and Option+click locate on every lane, stopped, changing no selection",
+      async () => {
+        // The reload opened the first unsaved passage, 02: two marks, the first selected.
+        await page.keyboard.press("0");
+        await sleep(150);
+        await page.keyboard.down("Shift");
+        await page.mouse.click(box.x + box.width * 0.3, lanes().waveform);
+        await page.mouse.click(box.x + box.width * 0.6, lanes().waveform);
+        await page.keyboard.up("Shift");
+        // Select the mark at 0.3 alone.
+        await page.mouse.click(box.x + box.width * 0.3, lanes().waveform);
+        await sleep(100);
+        const before = { marks: await markCount(), heading: await heading() };
+        const seen = [];
+        for (const [lane, f, options] of [
+          ["ruler", 0.42, { button: "middle" }],
+          ["waveform", 0.6, { button: "middle" }],
+          ["marks", 0.3, { button: "middle" }],
+          ["waveform", 0.5, { button: "middle", modifiers: ["Shift"] }],
+          ["waveform", 0.6, { modifiers: ["Alt"] }],
+          ["marks", 0.45, { modifiers: ["Alt", "Shift"] }],
+        ]) {
+          const x = box.x + box.width * f;
+          await page.mouse.move(x, lanes()[lane]);
+          for (const key of options.modifiers ?? []) await page.keyboard.down(key);
+          await page.mouse.click(x, lanes()[lane], { button: options.button ?? "left" });
+          for (const key of options.modifiers ?? []) await page.keyboard.up(key);
+          await sleep(120);
+          seen.push({
+            lane,
+            x: Math.round(x * 10) / 10,
+            playhead: Math.round((await playheadLeft()) * 10) / 10,
+          });
+        }
+        await page.mouse.click(box.x + box.width * 0.5, lanes().overview, { button: "middle" });
+        await sleep(200);
+        const centre = box.x + box.width / 2;
+        const overview = await playheadLeft();
+        await shot(page, "requests-locate-stopped");
+        const after = { marks: await markCount(), heading: await heading() };
+        const presses = await page.evaluate(() => window.__presses);
+        const starts = await musicStarts();
+        return {
+          ok:
+            seen.every((entry) => Math.abs(entry.playhead - entry.x) <= 1.5) &&
+            Math.abs(overview - centre) <= 2 &&
+            after.marks === before.marks &&
+            after.heading === before.heading &&
+            before.heading === "1 of 2" &&
+            presses.length > 0 &&
+            presses.every((press) => press.prevented) &&
+            starts.length === 0,
+          before,
+          after,
+          seen,
+          overview: { playhead: overview, centre },
+          presses: presses.length,
+          prevented: presses.every((press) => press.prevented),
+          starts: starts.length,
+        };
+      },
+    );
+
+    await check(
+      "a stopped middle drag moves the playhead with the pointer; Esc puts it back",
+      async () => {
+        const y = lanes().waveform;
+        const start = await playheadLeft();
+        await page.mouse.move(box.x + box.width * 0.35, y);
+        await page.mouse.down({ button: "middle" });
+        await page.mouse.move(box.x + box.width * 0.45, y, { steps: 5 });
+        const during = await playheadLeft();
+        await page.keyboard.press("Escape");
+        await page.mouse.up({ button: "middle" });
+        await sleep(100);
+        const cancelled = await playheadLeft();
+        await page.mouse.move(box.x + box.width * 0.35, y);
+        await page.mouse.down({ button: "middle" });
+        await page.mouse.move(box.x + box.width * 0.55, y, { steps: 5 });
+        const midway = await playheadLeft();
+        await page.mouse.move(box.x + box.width * 0.4, y, { steps: 5 });
+        await page.mouse.up({ button: "middle" });
+        await sleep(100);
+        const released = await playheadLeft();
+        const starts = await musicStarts();
+        return {
+          ok:
+            Math.abs(during - (box.x + box.width * 0.45)) <= 1.5 &&
+            Math.abs(cancelled - start) <= 0.5 &&
+            Math.abs(midway - (box.x + box.width * 0.55)) <= 1.5 &&
+            Math.abs(released - (box.x + box.width * 0.4)) <= 1.5 &&
+            starts.length === 0,
+          start,
+          during,
+          cancelled,
+          midway,
+          released,
+          starts: starts.length,
+        };
+      },
+    );
+
+    await check(
+      "playing: a middle drag shows the target and the release restarts once, after the pre-roll",
+      async () => {
+        const y = lanes().waveform;
+        const target = box.x + box.width * 0.62;
+        // The time under the target, as the page maps it, from a stopped locate there.
+        await page.mouse.click(target, y, { button: "middle" });
+        await sleep(100);
+        const targetS = seconds(await counter());
+        await page.mouse.click(box.x + box.width * 0.25, y, { button: "middle" });
+        await page.keyboard.press("Space");
+        await sleep(600);
+        await page.evaluate(() => {
+          window.__starts = [];
+        });
+        await page.mouse.move(box.x + box.width * 0.5, y);
+        await page.mouse.down({ button: "middle" });
+        await page.mouse.move(target, y, { steps: 6 });
+        await sleep(150);
+        await shot(page, "requests-locate-playing-drag");
+        const duringDrag = (await musicStarts()).length;
+        await page.mouse.up({ button: "middle" });
+        await sleep(700);
+        const starts = await musicStarts();
+        const playing = await page
+          .locator(".timing-transport .tool-button--play")
+          .getAttribute("aria-pressed");
+        const prerollS = 0.12;
+        const offsetError = starts[0] ? starts[0].offset - (targetS - prerollS) : null;
+        const shown = seconds(await counter());
+        await page.keyboard.press("Escape");
+        return {
+          ok:
+            duringDrag === 0 &&
+            starts.length === 1 &&
+            Math.abs(offsetError) < 0.001 &&
+            playing === "true" &&
+            shown > targetS - prerollS,
+          targetS,
+          duringDrag,
+          starts: starts.map((start) => start.offset),
+          offsetError,
+          shownAfter: shown,
+        };
+      },
+    );
+
+    await check("playing: Option+click restarts once at the click", async () => {
+      const y = lanes().waveform;
+      const x = box.x + box.width * 0.5;
+      await page.mouse.click(x, y, { button: "middle" });
+      await sleep(100);
+      const targetS = seconds(await counter());
+      await page.mouse.click(box.x + box.width * 0.25, y, { button: "middle" });
+      await page.keyboard.press("Space");
+      await sleep(500);
+      await page.evaluate(() => {
+        window.__starts = [];
+      });
+      const marks = await markCount();
+      await page.keyboard.down("Alt");
+      await page.mouse.click(x, y);
+      await page.keyboard.up("Alt");
+      await sleep(600);
+      const starts = await musicStarts();
+      await page.keyboard.press("Escape");
+      return {
+        ok:
+          starts.length === 1 &&
+          Math.abs(starts[0].offset - (targetS - 0.12)) < 0.001 &&
+          (await markCount()) === marks,
+        targetS,
+        starts: starts.map((start) => start.offset),
+      };
+    });
+
+    await check("passage and session notes: typed, saved, reopened", async () => {
+      await page.locator("#timing-notes").scrollIntoViewIfNeeded();
+      await page.click("#timing-passage-note");
+      await page.keyboard.type("Pulse unclear after the break.");
+      const unsaved = (await page.locator(".timing-status").innerText()).trim();
+      await page.keyboard.press("Meta+s");
+      await sleep(700);
+      const saved = readLines(marksFile).at(-1);
+      await page.click("#timing-session-note");
+      await page.keyboard.type("Tired by the end; headphones slipped once.");
+      await page.getByRole("button", { name: "Save session note" }).click();
+      await sleep(500);
+      const sessionNotes = readLines(notesFile);
+      const savedLines = readLines(marksFile).length;
+      await page.reload();
+      box = await openTiming(page);
+      // The reload opens the first unsaved passage; go back to 02, which has the note.
+      const opened = await page.locator(".stage-identity strong").innerText();
+      await page.locator(".timing-passage-list .task-row").nth(1).click();
+      await page.waitForFunction(
+        (text) =>
+          document.querySelector(".stage-identity strong")?.textContent.trim() !== text &&
+          document.querySelector(".timing-stage-overlay") &&
+          !document.querySelector(".timing-stage-note"),
+        opened.trim(),
+        { timeout: 20000 },
+      );
+      await sleep(300);
+      box = await page.locator(".timing-stage-overlay").boundingBox();
+      await page.locator("#timing-notes").scrollIntoViewIfNeeded();
+      const passageNote = await page.inputValue("#timing-passage-note");
+      const sessionNote = await page.inputValue("#timing-session-note");
+      await page
+        .locator(".frame-pane--right")
+        .screenshot({ path: join(out, "requests-notes.jpg"), type: "jpeg", quality: 88 });
+      await shot(page, "requests-notes-1440");
+      return {
+        ok:
+          /^Unsaved/.test(unsaved) &&
+          saved?.note?.text === "Pulse unclear after the break." &&
+          saved?.note?.blind === true &&
+          sessionNotes.length === 1 &&
+          sessionNotes[0].text === "Tired by the end; headphones slipped once." &&
+          !("passage_id" in sessionNotes[0]) &&
+          readLines(marksFile).length === savedLines &&
+          passageNote === "Pulse unclear after the break." &&
+          sessionNote === "Tired by the end; headphones slipped once.",
+        unsaved,
+        passageNoteSaved: saved?.note,
+        sessionNotes,
+        reopened: [passageNote, sessionNote],
+      };
+    });
+
+    await check(
+      "B, N, Space and Enter typed in a note stay in it; after Esc they mark again",
+      async () => {
+        const before = { marks: await markCount(), lines: readLines(marksFile).length };
+        await page.click("#timing-passage-note");
+        await page.keyboard.press("End");
+        await page.keyboard.type(" bn");
+        await page.keyboard.press("Space");
+        await page.keyboard.press("Enter");
+        await page.keyboard.type("x");
+        await sleep(300);
+        const value = await page.inputValue("#timing-passage-note");
+        const playing = await page
+          .locator(".timing-transport .tool-button--play")
+          .getAttribute("aria-pressed");
+        const inside = { marks: await markCount(), lines: readLines(marksFile).length, playing };
+        await page.keyboard.press("Escape");
+        const focused = await page.evaluate(
+          () => document.activeElement?.id ?? document.activeElement?.tagName,
+        );
+        await page.keyboard.press("b");
+        await sleep(150);
+        const after = {
+          marks: await markCount(),
+          value: await page.inputValue("#timing-passage-note"),
+        };
+        // Put the note back as saved, so the passage is not left unsaved.
+        await page.fill("#timing-passage-note", "Pulse unclear after the break.");
+        await page.keyboard.press("Escape");
+        await page.keyboard.press("Delete");
+        return {
+          ok:
+            value === "Pulse unclear after the break. bn \nx" &&
+            inside.marks === before.marks &&
+            inside.lines === before.lines &&
+            playing === "false" &&
+            focused !== "timing-passage-note" &&
+            after.marks === before.marks + 1 &&
+            after.value === value,
+          value,
+          before,
+          inside,
+          focused,
+          after,
+        };
+      },
+    );
+
+    await check(
+      "an IME composition (emulated through CDP) in a note keeps its Enter and Esc",
+      async () => {
+        const client = await context.newCDPSession(page);
+        await page.click("#timing-session-note");
+        await page.keyboard.press("End");
+        const lines = readLines(marksFile).length;
+        await client.send("Input.imeSetComposition", {
+          text: "へっど",
+          selectionStart: 3,
+          selectionEnd: 3,
+        });
+        await page.keyboard.press("Enter");
+        await page.keyboard.press("Escape");
+        const focusedDuring = await page.evaluate(() => document.activeElement?.id);
+        await client.send("Input.insertText", { text: "ヘッド" });
+        await sleep(150);
+        const value = await page.inputValue("#timing-session-note");
+        const state = (
+          await page.locator(".timing-note-actions .timing-note-state").innerText()
+        ).trim();
+        await page.fill("#timing-session-note", "Tired by the end; headphones slipped once.");
+        await page.keyboard.press("Escape");
+        return {
+          ok:
+            readLines(marksFile).length === lines &&
+            value.includes("ヘッド") &&
+            state === "Unsaved",
+          focusedDuring,
+          value,
+          state,
+        };
+      },
+    );
+
+    await check(
+      "nothing is revealed by a saved note, for this build or 4954249's reader",
+      async () => {
+        const blind = (await page.locator(".timing-blind").innerText()).trim();
+        const marks = readLines(marksFile);
+        const notes = readLines(notesFile);
+        const kinds = [...new Set(marks.map((line) => line.type))];
+        const { readMarksFile } = await import(
+          new URL("../../server/fixtures/build-4954249/src/timing/format.ts", import.meta.url)
+        );
+        const deployed = (text) =>
+          [...readMarksFile(text, "music").reveals].filter((id) => typeof id === "string");
+        const marksText = readFileSync(marksFile, "utf8");
+        const notesText = readFileSync(notesFile, "utf8");
+        const found = {
+          marks: deployed(marksText),
+          notes: deployed(notesText),
+          both: deployed(marksText + notesText),
+        };
+        return {
+          ok:
+            blind === "Blind" &&
+            kinds.length === 1 &&
+            kinds[0] === "save" &&
+            notes.every((line) => line.type === "session-note") &&
+            found.marks.length === 0 &&
+            found.notes.length === 0 &&
+            found.both.length === 0,
+          blind,
+          kinds,
+          noteLines: notes.length,
+          deployedReveals: found,
+        };
+      },
+    );
+
+    await check("no horizontal page scroll with the Notes section", async () => {
+      const overflow = await page.evaluate(() => document.documentElement.scrollWidth - innerWidth);
+      return { ok: overflow <= 0, overflow };
+    });
+    record("no page errors in the request checks", errors.length === 0, { errors });
+  } finally {
+    await context.close();
+    server.kill();
+    rmSync(siblingFile, { force: true });
+  }
+}
+
 // Other modes -------------------------------------------------------------------------------------
 
 async function openMode(page, base, mode) {
@@ -928,6 +1463,7 @@ try {
   if (only.has("timing")) await timingShots();
   if (only.has("checks")) await timingChecks();
   if (only.has("fixes")) await timingFixChecks();
+  if (only.has("requests")) await timingRequestChecks();
   if (only.has("modes") && values.dev) await modeShots(values.dev.replace(/\/$/, ""));
 } finally {
   await browser.close();
