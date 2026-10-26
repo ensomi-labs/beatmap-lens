@@ -2838,6 +2838,7 @@ fieldset.toolbar-group,
   background: var(--signal-fill);
 }
 
+/* A key hint is quieter than its label but keeps 4.5:1 on every button fill (5.1:1 on a control). */
 .tool-button kbd,
 .button kbd {
   padding: 0;
@@ -2847,7 +2848,7 @@ fieldset.toolbar-group,
   font-family: var(--font-data);
   font-size: var(--text-2xs);
   font-weight: 500;
-  opacity: 0.62;
+  opacity: 0.85;
 }
 
 .pane-toggle .pane-toggle-fill {
@@ -2899,6 +2900,12 @@ fieldset.toolbar-group,
 .segmented button:disabled {
   cursor: not-allowed;
   opacity: 0.4;
+}
+
+/* A primary action that cannot act loses its fill, so it does not look ready. */
+.tool-button--primary:disabled {
+  color: var(--ink-secondary);
+  background: var(--surface-3);
 }
 
 /* Segmented choices (rate, view, zoom): one well with lit segments. */
@@ -2977,6 +2984,16 @@ fieldset.toolbar-group,
 .time-counter-sub {
   color: var(--ink-muted);
   font-size: var(--text-2xs);
+}
+
+/* Timing's counter has room for a fine-zoom digit and an eight-digit sample index, so it keeps
+   its width while the index grows during playback (the font's figures are all one width). */
+.timing-counter .time-counter-main {
+  min-width: calc(10ch + 0.1em);
+}
+
+.timing-counter .time-counter-sub {
+  min-width: 10ch;
 }
 
 .frame-toolbar .tool-button,
