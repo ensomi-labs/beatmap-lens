@@ -3031,7 +3031,11 @@ fieldset.toolbar-group,
   background: var(--well);
 }
 
-/* A 1 px seam with a 9 px grab area; lit after a short hover, at once on focus or drag. */
+/*
+ * A 1 px seam with a 9 px grab area; lit after a short hover, at once on focus or drag. The grab
+ * area lies over the pane, so the main view keeps its edge pixels for its own gestures; beside a
+ * hidden pane, which has no width, it lies over the main view.
+ */
 
 .pane-splitter {
   position: relative;
@@ -3046,8 +3050,21 @@ fieldset.toolbar-group,
 
 .pane-splitter::before {
   position: absolute;
-  inset: 0 -4px;
+  top: 0;
+  bottom: 0;
   content: "";
+}
+
+.pane-splitter--start::before,
+.pane-splitter--end.is-collapsed::before {
+  right: 0;
+  left: -8px;
+}
+
+.pane-splitter--end::before,
+.pane-splitter--start.is-collapsed::before {
+  right: -8px;
+  left: 0;
 }
 
 .pane-splitter::after {

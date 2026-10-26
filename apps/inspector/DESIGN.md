@@ -92,7 +92,8 @@ Every open workspace is a `WorkspaceFrame` (`src/layout/`):
 
 - The main view cannot be hidden. Side panes are hidden from the toolbar toggles, by Enter on their
   boundary, or by dragging the boundary 56 px past the narrowest width.
-- Pane widths (CSS px, default, min to max; at most 38 % of the window):
+- Pane widths (CSS px, default, min to max; at most 38 % of the window, a limit the boundary's
+  widest width and reported value follow, so no key press or drag goes unseen):
 
   | Mode | Left | Right |
   | --- | --- | --- |
@@ -131,8 +132,9 @@ Every open workspace is a `WorkspaceFrame` (`src/layout/`):
 - **Boundaries** (`PaneSplitter.vue`) are the APG window splitter: a focusable `separator` whose
   value is the pane width, with `aria-controls` naming the pane. Left and Right resize by 16 px
   (Shift: 64 px), Home and End go to the narrowest and widest width, Enter hides and restores the
-  pane, double-click restores the default width. The 1 px seam has a 9 px grab area and lights
-  after a 200 ms hover, at once on focus or while dragging. Drags resize at most once per frame.
+  pane, double-click restores the default width. The 1 px seam has a 9 px grab area over the pane,
+  never the main view (beside a hidden pane it lies over the main view), and lights after a 200 ms
+  hover, at once on focus or while dragging. Drags resize at most once per frame.
 - A mouse press on a boundary does not take keyboard focus, so a workspace's window-wide shortcuts
   (Timing's arrows and Enter) keep working after a drag.
 - Panel toggles are icon buttons named "Hide <pane>" / "Show <pane>" with `aria-expanded`.

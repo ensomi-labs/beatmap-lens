@@ -53,6 +53,28 @@ function paneState(spec: PaneSpec | undefined) {
   return spec ? layout.state.value[spec.id] : undefined;
 }
 
+/** A side pane is at most this share of the window wide. */
+const windowShare = 0.38;
+const windowWidth = ref(window.innerWidth);
+const onWindowResize = () => {
+  windowWidth.value = window.innerWidth;
+};
+window.addEventListener("resize", onWindowResize, { passive: true });
+onBeforeUnmount(() => window.removeEventListener("resize", onWindowResize));
+
+/** The widest a pane may be in this window: its own maximum, or 38 % of the window if less. */
+function widest(spec: PaneSpec): number {
+  return Math.max(spec.min, Math.min(spec.max, Math.floor(windowWidth.value * windowShare)));
+}
+
+/**
+ * The width a pane is drawn at, which its boundary also reports and steps from: the stored width,
+ * within `widest`. The stored width is kept, so the pane widens again in a wider window.
+ */
+function shownSize(spec: PaneSpec): number {
+  return Math.min(paneState(spec)?.size ?? spec.defaultSize, widest(spec));
+}
+
 const leftHidden = computed(() =>
   props.leftCollapsed !== undefined
     ? props.leftCollapsed
@@ -81,9 +103,7 @@ function reset(spec: PaneSpec) {
 const columns = computed(() => {
   if (narrow.value) return "minmax(0, 1fr)";
   const width = (spec: PaneSpec | undefined, hidden: boolean) =>
-    spec
-      ? [hidden ? "0px" : `min(${paneState(spec)?.size ?? spec.defaultSize}px, 38vw)`, "1px"]
-      : [];
+    spec ? [hidden ? "0px" : `${shownSize(spec)}px`, "1px"] : [];
   const left = width(props.left, leftHidden.value);
   const right = width(props.right, rightHidden.value).reverse();
   return [...left, "minmax(0, 1fr)", ...right].join(" ");
@@ -230,9 +250,9 @@ const toggleLabel = (spec: PaneSpec, hidden: boolean) =>
           :style="{ gridColumn: placement.leftSplitter }"
           :controls="left.id"
           :label="left.label"
-          :size="paneState(left)?.size ?? left.defaultSize"
+          :size="shownSize(left)"
           :min="left.min"
-          :max="left.max"
+          :max="widest(left)"
           :collapsed="leftHidden"
           edge="start"
           @resize="resize(left, $event)"
@@ -249,9 +269,9 @@ const toggleLabel = (spec: PaneSpec, hidden: boolean) =>
           :style="{ gridColumn: placement.rightSplitter }"
           :controls="right.id"
           :label="right.label"
-          :size="paneState(right)?.size ?? right.defaultSize"
+          :size="shownSize(right)"
           :min="right.min"
-          :max="right.max"
+          :max="widest(right)"
           :collapsed="rightHidden"
           edge="end"
           @resize="resize(right, $event)"
