@@ -42,7 +42,8 @@ Colour has roles. The accent marks focus, selection and toggles that are on. Pla
 it plays. Amber warns and red is an error or the playhead. On a data view, hue belongs to the data:
 Timing's proposal palette (`src/timing/palette.ts`, which leaves out red, white and grey) and the
 listener's own marks in white. A selected Timing mark is white, heavier and cased in the seam
-colour, with an accent plate behind its glyph; it is never a palette colour.
+colour, with a faint accent wash either side of its line (as a selection drag) and an accent plate
+behind its glyph; the line itself is never a palette colour.
 
 Measured contrast on `--surface-1`: ink 13.6:1, secondary 8.4:1, muted 5.0:1, signal 6.7:1; white
 on `--signal-fill` 5.6:1. Muted ink on a control would be 3.9:1, so controls use secondary ink.

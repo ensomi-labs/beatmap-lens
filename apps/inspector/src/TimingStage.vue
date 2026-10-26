@@ -522,6 +522,10 @@ function drawMarks(context: CanvasRenderingContext2D) {
     const x = deviceX(mark.time_ms);
     const lineWidth = Math.max(1, Math.round(dpr)) * (selected ? 2 : 1);
     if (selected) {
+      // A faint wash of the selection colour either side, as while dragging a selection, so the
+      // line reads as selected on the dark well too; it leaves the onset under the line visible.
+      context.fillStyle = selectionDragFill;
+      context.fillRect(x - 4.5 * dpr, lineTop, 9 * dpr, lineHeight);
       const casing = lineWidth + 2 * Math.max(1, Math.round(dpr));
       context.fillStyle = markCasingColour;
       if (mark.kind === "unbeat")
