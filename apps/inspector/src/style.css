@@ -2980,6 +2980,7 @@ fieldset.toolbar-group,
 }
 
 .frame-toolbar .tool-button,
+.frame-toolbar .toolbar-group,
 .frame-toolbar .segmented,
 .frame-toolbar .time-counter,
 .pane-toggles {
