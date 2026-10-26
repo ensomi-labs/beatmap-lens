@@ -27,7 +27,7 @@ import {
   nextFollowCheckMs,
   type PlayheadMotion,
   readoutIntervalMs,
-  transportIntervalMs,
+  transportDelayMs,
 } from "./timing/display";
 import { nearestSample } from "./timing/format";
 import {
@@ -709,10 +709,7 @@ function transportStep() {
     current && follow.value && stageWidth.value
       ? nextFollowCheckMs(current, view.value, stageWidth.value, nowMs) + 0.5
       : Number.POSITIVE_INFINITY;
-  transportTimer = setTimeout(
-    transportStep,
-    Math.max(0, Math.min(transportIntervalMs, followAt - nowMs)),
-  );
+  transportTimer = setTimeout(transportStep, transportDelayMs(nowMs, followAt));
 }
 
 /** The playhead's position now: exact while playing, between the HUD's readouts. */

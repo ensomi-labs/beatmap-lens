@@ -11,6 +11,7 @@ import {
   nextFollowCheckMs,
   type PlayheadMotion,
   planMotion,
+  transportDelayMs,
 } from "./display";
 
 // The output reported context time 10 s at page time 5000 ms; the audio clock runs 30 ppm slow.
@@ -244,5 +245,22 @@ describe("nextFollowCheckMs", () => {
     expect(nextFollowCheckMs(once, view, 1000, 1100)).toBe(Number.POSITIVE_INFINITY);
     expect(nextFollowCheckMs(once, view, 250, 1100)).toBe(1150);
     expect(nextFollowCheckMs(once, view, 250, 1400)).toBe(Number.POSITIVE_INFINITY);
+  });
+});
+
+describe("transportDelayMs", () => {
+  it("never lets a whole-millisecond timer run the follow check before it is due", () => {
+    for (let dueMs = 0.05; dueMs < 30; dueMs += 0.37) {
+      const delay = transportDelayMs(1000.3, 1000.3 + dueMs);
+      // setTimeout drops the fraction of its delay.
+      expect(Math.trunc(delay)).toBe(delay);
+      expect(delay).toBe(Math.min(25, Math.ceil(dueMs)));
+      if (dueMs <= 25) expect(1000.3 + delay).toBeGreaterThanOrEqual(1000.3 + dueMs);
+    }
+  });
+
+  it("waits the transport interval with no check, and not at all for one overdue", () => {
+    expect(transportDelayMs(1000, Number.POSITIVE_INFINITY)).toBe(25);
+    expect(transportDelayMs(1000, 990)).toBe(0);
   });
 });

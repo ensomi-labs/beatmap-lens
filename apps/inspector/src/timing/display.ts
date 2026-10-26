@@ -175,6 +175,16 @@ export const readoutIntervalMs = 100;
 export const transportIntervalMs = 25;
 
 /**
+ * The delay until the transport's next step: `transportIntervalMs`, or less for a follow check due
+ * at page time `checkAtMs`. A timer's delay is whole milliseconds (a fraction is dropped), so it is
+ * rounded up: a step that ran before the check was due would only arm another, and nested timers
+ * wait at least 4 ms.
+ */
+export function transportDelayMs(nowMs: number, checkAtMs: number): number {
+  return Math.max(0, Math.min(transportIntervalMs, Math.ceil(checkAtMs - nowMs)));
+}
+
+/**
  * The next page time after `nowMs` at which following could need a jump: when the shown position
  * crosses the view's right edge, or when a loop wraps (it may land left of the view). Infinity when
  * nothing will change: a non-looping play that has ended, or one whose rest stays in view.
