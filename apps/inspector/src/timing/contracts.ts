@@ -197,7 +197,7 @@ export interface PlaybackSetup {
   preroll_ms: number;
   /** A click sounded at each of the listener's own beat marks. */
   mark_clicks: boolean;
-  /** The clicks' peak as a fraction of full scale, before the volume, at save. */
+  /** The click's peak as a fraction of full scale, before the volume, at save. */
   click_volume: number;
   /** The output device rate the page worked with, or null when not known. */
   device_rate_hz: number | null;

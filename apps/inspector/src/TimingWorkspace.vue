@@ -146,7 +146,7 @@ interface TimingPreferences {
   setupAt: string | null;
   /** A click at each of the listener's own beat marks while playing. */
   markClicks: boolean;
-  /** The clicks' peak as a fraction of full scale, before the volume. */
+  /** The click's peak as a fraction of full scale, before the volume. */
   clickVolume: number;
   passagesHidden: boolean;
 }
@@ -2223,6 +2223,7 @@ function handleKeydown(event: KeyboardEvent) {
               </label>
               <AudioVolumeControl
                 label="Click volume"
+                :disabled="!preferences.markClicks"
                 :model-value="preferences.clickVolume"
                 @update:model-value="setClickVolume"
               />

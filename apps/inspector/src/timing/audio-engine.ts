@@ -18,13 +18,14 @@ const clickIntervalMs = 100;
 const clickMarginMinimumS = 0.02;
 
 /**
- * A 2 kHz tick at full scale on its first sample, decaying with a 2 ms time constant over 12 ms,
- * so what is heard starts exactly at the mark. The click volume scales it.
+ * A 2 kHz tick at full scale on its first sample, decaying with a 5 ms time constant over 25 ms,
+ * so what is heard starts exactly at the mark and carries over a loud mix. The click volume scales
+ * it.
  */
 export function clickSamples(sampleRate: number): Float32Array<ArrayBuffer> {
-  return Float32Array.from({ length: Math.round(sampleRate * 0.012) }, (_, index) => {
+  return Float32Array.from({ length: Math.round(sampleRate * 0.025) }, (_, index) => {
     const t = index / sampleRate;
-    return Math.cos(2 * Math.PI * 2000 * t) * Math.exp(-t / 0.002);
+    return Math.cos(2 * Math.PI * 2000 * t) * Math.exp(-t / 0.005);
   });
 }
 
@@ -260,7 +261,7 @@ export class TimingAudioEngine {
     this.volume.gain.value = value;
   }
 
-  /** The clicks' peak as a fraction of full scale, before the volume. */
+  /** The click's peak as a fraction of full scale, before the volume. */
   setClickVolume(value: number) {
     this.clickLevel.gain.value = value;
   }
@@ -328,7 +329,7 @@ export class TimingAudioEngine {
       this.clicks.push({ node, atS });
     }
     this.clickedUntilS = window.toS;
-    // Clicks that have sounded are dropped; the click buffer lasts 12 ms.
+    // Clicks that have sounded are dropped; the click buffer lasts 25 ms.
     this.clicks = this.clicks.filter((click) => click.atS > now - 0.05);
   }
 

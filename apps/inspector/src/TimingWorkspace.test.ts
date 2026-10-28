@@ -879,6 +879,11 @@ it("sets the click volume against the music, remembers it, and saves it with the
   expect(engine.clickVolumes.at(-1)).toBe(0.6);
   const input = container.querySelector<HTMLInputElement>('input[aria-label="Click volume"]');
   if (!input) throw new Error("No click volume control");
+  // It sets something only heard with the clicks on.
+  expect(input.disabled).toBe(true);
+  key("c");
+  await nextTick();
+  expect(input.disabled).toBe(false);
   input.value = "90";
   input.dispatchEvent(new Event("input"));
   await nextTick();
