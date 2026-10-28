@@ -10,15 +10,10 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, it } from "vitest";
-import type {
-  BlindPassage,
-  Mark,
-  OpenTiming,
-  PageProvenance,
-  PlaybackSetup,
-} from "../src/timing/contracts";
+import type { BlindPassage, Mark, OpenTiming, PageProvenance } from "../src/timing/contracts";
 import type { SessionFileV1 } from "../src/timing/format";
 import { createTimingMiddleware as deployedMiddleware } from "./fixtures/build-4954249/server/timing";
+import type { PlaybackSetup } from "./fixtures/build-4954249/src/timing/contracts";
 import { readMarksFile as deployedReader } from "./fixtures/build-4954249/src/timing/format";
 import { createTimingMiddleware } from "./timing";
 
