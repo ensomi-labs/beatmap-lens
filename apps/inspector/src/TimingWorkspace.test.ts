@@ -17,6 +17,7 @@ const engine = vi.hoisted(() => ({
   plays: 0,
   /** Where each play was asked to start, pre-roll included. */
   starts: [] as number[],
+  rates: [] as number[],
   /** While set, a play waits for it, as for a suspended context. */
   resume: undefined as Promise<void> | undefined,
   loudness: [] as number[],
@@ -25,6 +26,7 @@ const engine = vi.hoisted(() => ({
   offsets: [] as number[],
   positionTimes: [] as (number | undefined)[],
   clicks: [] as (number[] | null)[],
+  clickVolumes: [] as number[],
   instance: undefined as { onEnded: ((positionMs: number) => void) | undefined } | undefined,
 }));
 vi.mock("./timing/audio-engine", () => ({
@@ -46,9 +48,10 @@ vi.mock("./timing/audio-engine", () => ({
     }
     starting = false;
     token = 0;
-    async play(options: { fromMs: number }) {
+    async play(options: { fromMs: number; rate: number }) {
       engine.plays++;
       engine.starts.push(options.fromMs);
+      engine.rates.push(options.rate);
       const token = ++this.token;
       if (engine.resume) {
         this.starting = true;
@@ -86,6 +89,9 @@ vi.mock("./timing/audio-engine", () => ({
       engine.clicks.push(beats);
     }
     setVolume() {}
+    setClickVolume(value: number) {
+      engine.clickVolumes.push(value);
+    }
     setLoudnessDb(db: number) {
       engine.loudness.push(db);
     }
@@ -230,6 +236,7 @@ beforeEach(() => {
   Object.assign(engine, {
     plays: 0,
     starts: [],
+    rates: [],
     resume: undefined,
     loudness: [],
     positionMs: undefined,
@@ -237,6 +244,7 @@ beforeEach(() => {
     offsets: [],
     positionTimes: [],
     clicks: [],
+    clickVolumes: [],
   });
   localStorage.setItem(
     "lens-timing-preferences",
@@ -864,6 +872,34 @@ it("clicks on the listener's own beats when asked, and records that with the sav
   expect(JSON.parse(localStorage.getItem("lens-timing-preferences") ?? "{}")).toMatchObject({
     markClicks: true,
   });
+});
+
+it("sets the click volume against the music, remembers it, and saves it with the playback", async () => {
+  await opened();
+  expect(engine.clickVolumes.at(-1)).toBe(0.6);
+  const input = container.querySelector<HTMLInputElement>('input[aria-label="Click volume"]');
+  if (!input) throw new Error("No click volume control");
+  input.value = "90";
+  input.dispatchEvent(new Event("input"));
+  await nextTick();
+  expect(engine.clickVolumes.at(-1)).toBe(0.9);
+  expect(JSON.parse(localStorage.getItem("lens-timing-preferences") ?? "{}")).toMatchObject({
+    clickVolume: 0.9,
+  });
+  key("b");
+  key("Enter");
+  await vi.waitFor(() => expect(server.saves).toHaveLength(1));
+  expect(server.saves[0]).toMatchObject({ playback: { volume: 0.5, click_volume: 0.9 } });
+});
+
+it("plays at a quarter of the speed", async () => {
+  await opened();
+  button("0.25×").click();
+  await nextTick();
+  expect(button("0.25×").getAttribute("aria-pressed")).toBe("true");
+  key(" ");
+  await vi.waitFor(() => expect(engine.plays).toBe(1));
+  expect(engine.rates).toEqual([0.25]);
 });
 
 it("hides the passage list for a wider stage and remembers it", async () => {

@@ -18,13 +18,13 @@ const clickIntervalMs = 100;
 const clickMarginMinimumS = 0.02;
 
 /**
- * A 2 kHz tick at full level on its first sample, decaying with a 2 ms time constant over 12 ms,
- * so what is heard starts exactly at the mark.
+ * A 2 kHz tick at full scale on its first sample, decaying with a 2 ms time constant over 12 ms,
+ * so what is heard starts exactly at the mark. The click volume scales it.
  */
 export function clickSamples(sampleRate: number): Float32Array<ArrayBuffer> {
   return Float32Array.from({ length: Math.round(sampleRate * 0.012) }, (_, index) => {
     const t = index / sampleRate;
-    return 0.3 * Math.cos(2 * Math.PI * 2000 * t) * Math.exp(-t / 0.002);
+    return Math.cos(2 * Math.PI * 2000 * t) * Math.exp(-t / 0.002);
   });
 }
 
@@ -33,8 +33,9 @@ export function clickSamples(sampleRate: number): Float32Array<ArrayBuffer> {
  * play is a new `AudioBufferSourceNode` (start, loop and stop planned on whole frames by
  * `transport.ts`) into a loudness gain and a volume gain, then the destination. Nothing else is in
  * the music's path: no compressor, limiter or analyser. When the listener turns them on, clicks at
- * their own beats are separate sources, scheduled on the same context clock and mixed in after the
- * loudness gain.
+ * their own beats are separate sources, scheduled on the same context clock, through their own
+ * click gain into the volume gain: the click volume sets their level against the music, the volume
+ * sets both.
  *
  * The engine feeds the output stamps into the clock model (`clock.ts`) and answers the display
  * path (`motion`, `shownAt`) and the input path (`heardAt`) from it and the playing anchor.
@@ -43,6 +44,7 @@ export class TimingAudioEngine {
   readonly context: AudioContext;
   private readonly loudness: GainNode;
   private readonly volume: GainNode;
+  private readonly clickLevel: GainNode;
   private readonly clock = new OutputClock();
   private buffer: AudioBuffer | undefined;
   private source: AudioBufferSourceNode | undefined;
@@ -75,6 +77,8 @@ export class TimingAudioEngine {
     this.loudness = new GainNode(context);
     this.volume = new GainNode(context);
     this.loudness.connect(this.volume).connect(context.destination);
+    this.clickLevel = new GainNode(context);
+    this.clickLevel.connect(this.volume);
   }
 
   get sampleRate(): number {
@@ -256,6 +260,11 @@ export class TimingAudioEngine {
     this.volume.gain.value = value;
   }
 
+  /** The clicks' peak as a fraction of full scale, before the volume. */
+  setClickVolume(value: number) {
+    this.clickLevel.gain.value = value;
+  }
+
   /** Attenuation only: positive gains are not applied. */
   setLoudnessDb(db: number) {
     this.loudness.gain.value = 10 ** (Math.min(0, db) / 20);
@@ -314,7 +323,7 @@ export class TimingAudioEngine {
     this.clickBuffer ??= this.newClickBuffer();
     for (const atS of clickTimes(anchor, beats, window.fromS, window.toS)) {
       const node = new AudioBufferSourceNode(this.context, { buffer: this.clickBuffer });
-      node.connect(this.volume);
+      node.connect(this.clickLevel);
       node.start(atS);
       this.clicks.push({ node, atS });
     }

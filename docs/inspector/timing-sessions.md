@@ -118,7 +118,8 @@ this file, so those builds can open it safely.
   "setup_from": { "session_id": "session-01", "save_id": "…", "time": "2026-10-25T01:02:00.000Z" },
   "playback": { "rate": 1, "volume": 0.5, "loudness_match": false, "loudness_gain_db": -12.9,
                 "loudness_applied_db": 0, "playhead_offset_ms": 12, "preroll_ms": 120,
-                "mark_clicks": false, "device_rate_hz": 44100, "device_rate_source": "detected",
+                "mark_clicks": false, "click_volume": 0.6, "device_rate_hz": 44100,
+                "device_rate_source": "detected",
                 "device_rate_from": null, "device_rate_detected_hz": 44100,
                 "device_rate_detected_at": "2026-10-25T01:11:58.004Z",
                 "base_latency_ms": 5.8, "output_latency_ms": 16.0 },
@@ -137,6 +138,7 @@ this file, so those builds can open it safely.
 | --- | --- |
 | `playback.playhead_offset_ms` | The listener's moving-bar correction in wall-clock milliseconds, applied before the playback rate; positive moves the bar earlier. It affects only the drawn playhead, never a mark. |
 | `playback.mark_clicks` | `true` when any playback of this passage in the page, before this save, had clicks on the listener's own beat marks. Absent from saves made before the option existed. |
+| `playback.click_volume` | The click's peak as a fraction of full scale, before `volume`, in force at this save. Absent from saves made before it was adjustable, when the peak was 0.3. |
 | `setup` | The listener's line about the playback setup: headphones, EQ app state, volume. Empty only with `setup_source: "none"`. |
 | `setup_source` | Where `setup` came from: `typed` (entered or changed in the page since the session was opened), `last-save` (carried unchanged from the save in `setup_from`), `browser` (carried unchanged from the value this browser remembered), `none` (no setup stated). Absent from saves made before it was recorded: the listener stated the setup, possibly remembered by the browser or copied from an earlier save. |
 | `setup_from` | `{ session_id, save_id, time }` of the save a `last-save` value came from, possibly another session's in the same folder; `null` otherwise. |

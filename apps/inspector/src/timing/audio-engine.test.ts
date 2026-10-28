@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { TimingAudioEngine } from "./audio-engine";
+import { clickSamples, TimingAudioEngine } from "./audio-engine";
 
 /** What the test sees of an `AudioBufferSourceNode`: its options, start and stop. */
 interface SourceRecord {
@@ -9,6 +9,8 @@ interface SourceRecord {
   offset?: number;
   stopAt?: number;
   options?: AudioBufferSourceOptions;
+  /** The node the source plays into. */
+  to?: unknown;
 }
 
 /** The Web Audio surface the engine uses, with a resume the test settles by hand. */
@@ -32,7 +34,10 @@ beforeEach(() => {
   audio.sources = [];
   audio.listeners = [];
   class Node {
+    /** The node this one was last connected to. */
+    to: unknown;
     connect<T>(next: T): T {
+      this.to = next;
       return next;
     }
     disconnect() {}
@@ -90,6 +95,10 @@ beforeEach(() => {
         super();
         if (options) this.record.options = options;
         audio.sources.push(this.record);
+      }
+      override connect<T>(next: T): T {
+        this.record.to = next;
+        return super.connect(next);
       }
       start(at?: number, offset?: number) {
         this.record.started = true;
@@ -173,6 +182,26 @@ it("clicks at the listener's beats while playing, and reschedules or stops them 
   } finally {
     vi.useRealTimers();
   }
+});
+
+it("plays full-scale clicks through their own level into the music's volume", async () => {
+  expect(clickSamples(44_100)[0]).toBe(1);
+  const engine = loaded();
+  engine.setClickVolume(0.8);
+  engine.setClicks([2]);
+  const play = engine.play({ fromMs: 0, endMs: 10, rate: 1, loop: null });
+  audio.resumes[0]?.();
+  await play;
+  type Gain = { gain: { value: number }; to: unknown };
+  const [music, click] = audio.sources;
+  const loudness = music?.to as Gain;
+  const level = click?.to as Gain;
+  expect(level.gain.value).toBe(0.8);
+  expect(level).not.toBe(loudness);
+  // Both reach the one volume gain, so the volume sets both and the click volume only the clicks.
+  expect(level.to).toBe(loudness.to);
+  expect((loudness.to as Gain).to).toBe(engine.context.destination);
+  engine.stop();
 });
 
 it("schedules no clicks while they are off", async () => {

@@ -86,7 +86,7 @@ const emit = defineEmits<{ "change-mode": [mode: WorkspaceMode] }>();
 
 const rememberedSession = "lens-timing-session";
 const preferencesKey = "lens-timing-preferences";
-const playbackRates = [1, 0.75, 0.5] as const;
+const playbackRates = [1, 0.75, 0.5, 0.25] as const;
 /** At least this much real preceding audio is played before every start. */
 const minimumPrerollMs = 120;
 const deviceRates = [44_100, 48_000, 88_200, 96_000] as const;
@@ -146,6 +146,8 @@ interface TimingPreferences {
   setupAt: string | null;
   /** A click at each of the listener's own beat marks while playing. */
   markClicks: boolean;
+  /** The clicks' peak as a fraction of full scale, before the volume. */
+  clickVolume: number;
   passagesHidden: boolean;
 }
 
@@ -174,6 +176,7 @@ const preferences = ref<TimingPreferences>({
   setup: "",
   setupAt: null,
   markClicks: false,
+  clickVolume: 0.6,
   passagesHidden: false,
   ...readPreferences(),
 });
@@ -777,6 +780,7 @@ async function loadAudio(row: BlindPassageRow) {
   if (disposed || !engine) return;
   audioBuffer.value = engine.load(deinterleave(bytes, audio.channels, audio.frames), audio.frames);
   engine.setVolume(preferences.value.volume);
+  engine.setClickVolume(preferences.value.clickVolume);
   engine.setLoudnessDb(loudnessAppliedDb.value);
   syncClicks();
   loadedHandle = audio.handle;
@@ -1073,6 +1077,11 @@ function setMarkClicks(value: boolean) {
   if (value && playing.value) noteClicksHeard();
 }
 
+function setClickVolume(value: number) {
+  setPreference("clickVolume", value);
+  engine?.setClickVolume(value);
+}
+
 /** Saves record whether the listener heard clicks on this passage, not the toggle at save time. */
 function noteClicksHeard() {
   const row = passage.value;
@@ -1239,6 +1248,7 @@ function playbackSetup(): PlaybackSetup {
     playhead_offset_ms: preferences.value.playheadOffsetMs,
     preroll_ms: preferences.value.prerollMs,
     mark_clicks: Boolean(draft.value?.clicksHeard),
+    click_volume: preferences.value.clickVolume,
     device_rate_hz: outputRate.value.hz,
     device_rate_source: outputRate.value.source,
     device_rate_from: outputRate.value.from,
@@ -2211,6 +2221,11 @@ function handleKeydown(event: KeyboardEvent) {
                 <span>Click on my beats</span>
                 <kbd>C</kbd>
               </label>
+              <AudioVolumeControl
+                label="Click volume"
+                :model-value="preferences.clickVolume"
+                @update:model-value="setClickVolume"
+              />
               <label class="prop-row" for="timing-preroll">
                 <span>Pre-roll, ms (≥ {{ minimumPrerollMs }})</span>
                 <DraftNumberInput

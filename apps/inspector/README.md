@@ -132,8 +132,10 @@ Open the printed address; it opens the session directly. Marks append to
   <kbd>Cmd/Ctrl+Z</kbd> undoes and <kbd>Cmd/Ctrl+Shift+Z</kbd> redoes.
 - **Click on my beats** (<kbd>C</kbd>, off by default) plays a short tick at
   each of the listener's own beat marks, scheduled on the audio clock, so a
-  mark can be checked by ear; proposals are never heard. A save records whether
-  any playback of the passage in the page had the clicks on.
+  mark can be checked by ear; proposals are never heard. **Click volume** sets
+  the tick against the music (100% peaks at full scale), and the volume sets
+  both. A save records whether any playback of the passage in the page had the
+  clicks on, and the click volume.
 - <kbd>Space</kbd> plays or pauses, <kbd>Shift+Space</kbd> plays the loop region
   once, <kbd>L</kbd> loops it, <kbd>I</kbd>/<kbd>O</kbd> set its edges,
   <kbd>Shift</kbd>+drag selects it and <kbd>X</kbd> loops from 500 ms before the

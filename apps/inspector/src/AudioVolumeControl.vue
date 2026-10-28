@@ -1,17 +1,19 @@
 <script setup lang="ts">
-defineProps<{ modelValue: number; disabled?: boolean }>();
+withDefaults(defineProps<{ modelValue: number; disabled?: boolean; label?: string }>(), {
+  label: "Volume",
+});
 const emit = defineEmits<{ "update:modelValue": [value: number] }>();
 </script>
 
 <template>
   <label class="audio-volume-control">
-    <span>Volume <output>{{ Math.round(modelValue * 100) }}%</output></span>
+    <span>{{ label }} <output>{{ Math.round(modelValue * 100) }}%</output></span>
     <input
       type="range"
       min="0"
       max="100"
       step="1"
-      aria-label="Volume"
+      :aria-label="label"
       :aria-valuetext="`${Math.round(modelValue * 100)}%`"
       :value="Math.round(modelValue * 100)"
       :disabled="disabled"
