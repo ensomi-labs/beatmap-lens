@@ -52,8 +52,10 @@ import {
   openWorkspaceFolder,
   recomputeSong,
   rejectOffer,
+  setClientWorkspaceDir,
   setHoldOffers,
   suggestSongSnaps,
+  type TempoHoldOffersResponse,
   type TempoSongSessionPayload,
   type TempoSongSummary,
   uploadAudioFiles,
@@ -220,6 +222,10 @@ const selectedOfferId = ref<string | null>(null);
 const holdingAlt = ref(false);
 const activeAuditionWindow = ref<ActiveAuditionCoverage | null>(null);
 const pendingEntityTimeSec = reactive(new Map<string, number>());
+const inFlightPlacedBeats = reactive(
+  new Map<string, { songId: string; id: string; timeSec: number }>(),
+);
+const audioLoadSettledForSongId = ref<string | null>(null);
 const flamSavedState = ref<{
   rate: (typeof playbackRates)[number];
   looping: boolean;
@@ -246,12 +252,18 @@ const loopRegion = ref<TimeRange>({ startMs: 0, endMs: 0 });
 const rate = ref<(typeof playbackRates)[number]>(1);
 
 let songEpoch = 0;
+let appliedLastSeq = -1;
 let holdOwnerSongId: string | null = null;
+const holdChains = new Map<string, Promise<void>>();
 let localSnapSeq = 0;
 let editChain: Promise<void> = Promise.resolve();
 const queuedEntityNudges = new Map<string, QueuedNudge>();
 const activeNudgeDrains = new Map<string, Promise<void>>();
 let inFlightAuditionTarget: ActiveAuditionCoverage | null = null;
+
+function entityNudgeKey(songId: string, kind: "beat" | "unbeat" | "sound", id: string): string {
+  return `${songId}::${kind}:${id}`;
+}
 
 let engine: StageAudioEngine | undefined;
 let mixChannels: Float32Array[] | null = null;
@@ -274,7 +286,8 @@ const isSongReadyForActions = computed(
   () =>
     loadedSongId.value !== null &&
     loadedSongId.value === selectedSongId.value &&
-    sessionPayload.value !== null,
+    sessionPayload.value !== null &&
+    audioLoadSettledForSongId.value === selectedSongId.value,
 );
 
 const canUndo = computed(() => Boolean(sessionPayload.value?.canUndo));
@@ -304,25 +317,47 @@ const segments = computed<Segment[]>(() => sessionPayload.value?.state.segments 
 const spans = computed<Span[]>(() => sessionPayload.value?.state.spans ?? []);
 const beats = computed<Beat[]>(() => {
   const raw = sessionPayload.value?.state.beats ?? [];
-  if (pendingEntityTimeSec.size === 0) return raw;
-  return raw.map((b) => {
-    const pending = pendingEntityTimeSec.get(`beat:${b.id}`);
-    return pending !== undefined ? { ...b, timeSec: pending } : b;
+  const curSong = loadedSongId.value;
+  const seenIds = new Set<string>();
+  const mapped = raw.map((b) => {
+    seenIds.add(b.id);
+    const pending = curSong
+      ? pendingEntityTimeSec.get(entityNudgeKey(curSong, "beat", b.id))
+      : undefined;
+    const optimistic = curSong ? inFlightPlacedBeats.get(`${curSong}::${b.id}`) : undefined;
+    const nextSec = pending ?? optimistic?.timeSec;
+    return nextSec !== undefined ? { ...b, timeSec: nextSec } : b;
   });
+  if (curSong && inFlightPlacedBeats.size > 0) {
+    for (const entry of inFlightPlacedBeats.values()) {
+      if (entry.songId === curSong && !seenIds.has(entry.id)) {
+        mapped.push({
+          id: entry.id,
+          timeSec: entry.timeSec,
+          source: "user",
+          revision: 1,
+        });
+      }
+    }
+    mapped.sort((a, b) => a.timeSec - b.timeSec || a.id.localeCompare(b.id));
+  }
+  return mapped;
 });
 const unbeats = computed<UnbeatCue[]>(() => {
   const raw = sessionPayload.value?.state.unbeats ?? [];
-  if (pendingEntityTimeSec.size === 0) return raw;
+  const curSong = loadedSongId.value;
+  if (!curSong || pendingEntityTimeSec.size === 0) return raw;
   return raw.map((u) => {
-    const pending = pendingEntityTimeSec.get(`unbeat:${u.id}`);
+    const pending = pendingEntityTimeSec.get(entityNudgeKey(curSong, "unbeat", u.id));
     return pending !== undefined ? { ...u, timeSec: pending } : u;
   });
 });
 const sounds = computed<SoundAnchor[]>(() => {
   const raw = sessionPayload.value?.state.sounds ?? [];
-  if (pendingEntityTimeSec.size === 0) return raw;
+  const curSong = loadedSongId.value;
+  if (!curSong || pendingEntityTimeSec.size === 0) return raw;
   return raw.map((s) => {
-    const pending = pendingEntityTimeSec.get(`sound:${s.id}`);
+    const pending = pendingEntityTimeSec.get(entityNudgeKey(curSong, "sound", s.id));
     return pending !== undefined ? { ...s, timeSec: pending } : s;
   });
 });
@@ -613,12 +648,16 @@ async function loadSongAudio(
       Math.min(bounds.value.endMs, (decoded.frames * 1000) / loaded.sampleRate),
     );
     audioState.value = "ready";
+    audioLoadSettledForSongId.value = songId;
     if (subMode.value === "audition" && auditionFilter.value !== "mix") {
       void syncAuditionBuffer();
     }
   } catch (cause) {
     if (isAbortError(cause) || signal.aborted || capturedEpoch !== songEpoch) return;
     audioState.value = "none";
+    if (selectedSongId.value === songId) {
+      audioLoadSettledForSongId.value = songId;
+    }
     reportError(cause);
   }
 }
@@ -811,18 +850,42 @@ function clearSnapState() {
   snapState.value = null;
 }
 
+function enqueueHoldRequest(
+  songId: string,
+  hold: boolean,
+  onResult?: (res: TempoHoldOffersResponse) => void,
+): Promise<void> {
+  const wsDir = workspaceDir.value;
+  const prev = holdChains.get(songId) ?? Promise.resolve();
+  const next = prev
+    .catch(() => {})
+    .then(async () => {
+      const res = await setHoldOffers(songId, hold, undefined, wsDir);
+      onResult?.(res);
+    });
+  const tracked = next.catch(() => {});
+  holdChains.set(songId, tracked);
+  tracked.finally(() => {
+    if (holdChains.get(songId) === tracked) {
+      holdChains.delete(songId);
+    }
+  });
+  return next;
+}
+
 function releaseHoldOwnerSynchronously() {
   const owner = holdOwnerSongId;
   holdingAlt.value = false;
   holdOwnerSongId = null;
   if (owner) {
-    void setHoldOffers(owner, false).catch(() => {});
+    void enqueueHoldRequest(owner, false).catch(() => {});
   }
 }
 
 function resetActiveSongContext() {
   releaseHoldOwnerSynchronously();
   songEpoch += 1;
+  appliedLastSeq = -1;
 
   songOpenAbort?.abort();
   songOpenAbort = null;
@@ -842,15 +905,19 @@ function resetActiveSongContext() {
   mixFrames = 0;
   silenceMs.value = undefined;
   audioState.value = "none";
+  audioLoadSettledForSongId.value = null;
   activeEngineFilterKey = "mix";
   flamSavedState.value = null;
 
   loadedSongId.value = null;
   sessionPayload.value = null;
+  openingSong.value = false;
+  recomputing.value = false;
+  exportingFormat.value = null;
   inFlightEditCount.value = 0;
   queuedEntityNudges.clear();
-  activeNudgeDrains.clear();
   pendingEntityTimeSec.clear();
+  inFlightPlacedBeats.clear();
 
   selection.value = { kind: "none" };
   activeRange.value = null;
@@ -871,6 +938,15 @@ function syncSummaryIntoSongsList(summary: TempoSongSummary) {
 }
 
 function applyPayload(payload: TempoSongSessionPayload, options?: { checkLocalInvalidation?: boolean }) {
+  if (
+    loadedSongId.value === payload.song.songId &&
+    sessionPayload.value?.song.songId === payload.song.songId &&
+    payload.state.lastSeq < appliedLastSeq
+  ) {
+    return;
+  }
+  appliedLastSeq = payload.state.lastSeq;
+
   const prevValidLocalCount =
     sessionPayload.value?.state.offers.filter(
       (o) => o.scopeKind === "local" && (o.status === "valid" || o.status === "stale"),
@@ -916,6 +992,7 @@ async function initializeWorkspace() {
     );
     if (disposed) return;
     workspaceDir.value = ws.workspaceDir;
+    setClientWorkspaceDir(ws.workspaceDir);
     folderPathInput.value = ws.workspaceDir ?? "";
     songs.value = ws.songs;
     const initialSong = ws.activeSongId ?? ws.songs[0]?.songId ?? null;
@@ -941,6 +1018,7 @@ async function handleOpenFolder() {
     const ws = await openWorkspaceFolder(dir);
     if (disposed) return;
     workspaceDir.value = ws.workspaceDir;
+    setClientWorkspaceDir(ws.workspaceDir);
     songs.value = ws.songs;
     const url = new URL(window.location.href);
     if (ws.workspaceDir) url.searchParams.set("dir", ws.workspaceDir);
@@ -973,10 +1051,14 @@ async function onImportFilesSelected(event: Event) {
   loadingWorkspace.value = true;
   error.value = "";
   try {
-    // Do NOT pass `?dir=` when uploading into an already-open workspace so custom stateDir is preserved!
-    const uploaded = await uploadAudioFiles(fileList);
+    // Do NOT pass `?dir=` when uploading into an already-open workspace so custom stateDir is preserved;
+    // send `X-Tempo-Workspace-Dir` header when workspaceDir is non-empty to guard against multi-tab switches!
+    const uploaded = await uploadAudioFiles(fileList, {
+      workspaceDir: workspaceDir.value,
+    });
     if (disposed) return;
     workspaceDir.value = uploaded.workspaceDir;
+    setClientWorkspaceDir(uploaded.workspaceDir);
     folderPathInput.value = uploaded.workspaceDir ?? "";
     songs.value = uploaded.songs;
     const nextId = uploaded.songId ?? uploaded.activeSongId ?? uploaded.songs[0]?.songId ?? null;
@@ -1464,7 +1546,7 @@ function scheduleEntityNudge(kind: "beat" | "unbeat" | "sound", id: string, next
   if (kind === "beat") {
     clearSnapState();
   }
-  const entityKey = `${kind}:${id}`;
+  const entityKey = entityNudgeKey(capturedSongId, kind, id);
   pendingEntityTimeSec.set(entityKey, nextTimeSec);
   queuedEntityNudges.set(entityKey, { kind, id, timeSec: nextTimeSec });
   cuesDirty.value = true;
@@ -1473,7 +1555,8 @@ function scheduleEntityNudge(kind: "beat" | "unbeat" | "sound", id: string, next
     return;
   }
 
-  const drainPromise = (async () => {
+  let drainPromise: Promise<void> | undefined;
+  drainPromise = (async () => {
     try {
       while (queuedEntityNudges.has(entityKey)) {
         if (
@@ -1558,7 +1641,9 @@ function scheduleEntityNudge(kind: "beat" | "unbeat" | "sound", id: string, next
         }
       }
     } finally {
-      activeNudgeDrains.delete(entityKey);
+      if (activeNudgeDrains.get(entityKey) === drainPromise) {
+        activeNudgeDrains.delete(entityKey);
+      }
     }
   })();
 
@@ -1695,38 +1780,59 @@ function structuralCursorSec(): number | null {
 
 function placeBeatAt(timeSec: number) {
   if (!isSongReadyForActions.value) return;
+  const curSong = loadedSongId.value;
+  if (!curSong) return;
   const clamped = Number(Math.min(durationSec.value, Math.max(0, timeSec)).toFixed(6));
   clearSnapState();
 
-  let coincidentBeat: Beat | undefined;
+  let coincidentId: string | undefined;
   let nearestDist = Number.POSITIVE_INFINITY;
   for (const b of beats.value) {
     const dist = Math.abs(b.timeSec - clamped);
     if (dist <= 0.0005 && dist < nearestDist) {
-      coincidentBeat = b;
+      coincidentId = b.id;
+      nearestDist = dist;
+    }
+  }
+  for (const entry of inFlightPlacedBeats.values()) {
+    if (entry.songId !== curSong) continue;
+    const dist = Math.abs(entry.timeSec - clamped);
+    if (dist <= 0.0005 && dist < nearestDist) {
+      coincidentId = entry.id;
       nearestDist = dist;
     }
   }
 
-  if (coincidentBeat) {
-    selection.value = { kind: "beat", id: coincidentBeat.id };
+  if (coincidentId) {
+    const targetId = coincidentId;
+    const optKey = `${curSong}::${targetId}`;
+    inFlightPlacedBeats.set(optKey, { songId: curSong, id: targetId, timeSec: clamped });
+    selection.value = { kind: "beat", id: targetId };
     void commitOps(
       {
         op: "move_beat",
-        id: coincidentBeat.id,
+        id: targetId,
         timeSec: clamped,
         source: "user",
       },
       {
         markCuesDirty: true,
-        afterSelect: { kind: "beat", id: coincidentBeat.id },
-        snapBeat: { id: coincidentBeat.id, timeSec: clamped },
+        afterSelect: { kind: "beat", id: targetId },
+        snapBeat: { id: targetId, timeSec: clamped },
       },
-    );
+    ).finally(() => {
+      const cur = inFlightPlacedBeats.get(optKey);
+      if (cur && cur.timeSec === clamped) {
+        inFlightPlacedBeats.delete(optKey);
+      }
+    });
     return;
   }
 
   const id = crypto.randomUUID();
+  const optKey = `${curSong}::${id}`;
+  inFlightPlacedBeats.set(optKey, { songId: curSong, id, timeSec: clamped });
+  selection.value = { kind: "beat", id };
   void commitOps(
     {
       op: "upsert_beat",
@@ -1737,7 +1843,12 @@ function placeBeatAt(timeSec: number) {
       afterSelect: { kind: "beat", id },
       snapBeat: { id, timeSec: clamped },
     },
-  );
+  ).finally(() => {
+    const cur = inFlightPlacedBeats.get(optKey);
+    if (cur && cur.timeSec === clamped) {
+      inFlightPlacedBeats.delete(optKey);
+    }
+  });
 }
 
 function placeUnbeatAt(timeSec: number, isLivePlaying = false) {
@@ -1892,27 +2003,33 @@ function nudgeSelectionFrames(deltaFrames: number) {
 
 function deleteSelectedEntity() {
   if (!isSongReadyForActions.value) return;
+  const curSong = loadedSongId.value;
+  if (!curSong) return;
   clearSnapState();
   if (selectedBeat.value) {
     const id = selectedBeat.value.id;
-    pendingEntityTimeSec.delete(`beat:${id}`);
-    queuedEntityNudges.delete(`beat:${id}`);
+    const key = entityNudgeKey(curSong, "beat", id);
+    pendingEntityTimeSec.delete(key);
+    queuedEntityNudges.delete(key);
+    inFlightPlacedBeats.delete(`${curSong}::${id}`);
     selection.value = { kind: "none" };
     void commitOps({ op: "remove_beat", id }, { markCuesDirty: true });
     return;
   }
   if (selectedUnbeat.value) {
     const id = selectedUnbeat.value.id;
-    pendingEntityTimeSec.delete(`unbeat:${id}`);
-    queuedEntityNudges.delete(`unbeat:${id}`);
+    const key = entityNudgeKey(curSong, "unbeat", id);
+    pendingEntityTimeSec.delete(key);
+    queuedEntityNudges.delete(key);
     selection.value = { kind: "none" };
     void commitOps({ op: "remove_unbeat", id }, { markCuesDirty: true });
     return;
   }
   if (selectedSound.value) {
     const id = selectedSound.value.id;
-    pendingEntityTimeSec.delete(`sound:${id}`);
-    queuedEntityNudges.delete(`sound:${id}`);
+    const key = entityNudgeKey(curSong, "sound", id);
+    pendingEntityTimeSec.delete(key);
+    queuedEntityNudges.delete(key);
     selection.value = { kind: "none" };
     void commitOps({ op: "remove_sound", id }, { markCuesDirty: true });
     return;
@@ -2242,17 +2359,18 @@ async function beginHoldCompare(offerId?: string) {
   holdOwnerSongId = capturedSongId;
 
   try {
-    const res = await setHoldOffers(capturedSongId, true);
-    if (
-      !disposed &&
-      holdingAlt.value &&
-      holdOwnerSongId === capturedSongId &&
-      capturedEpoch === songEpoch &&
-      selectedSongId.value === capturedSongId &&
-      loadedSongId.value === capturedSongId
-    ) {
-      applyPayload(res);
-    }
+    await enqueueHoldRequest(capturedSongId, true, (res) => {
+      if (
+        !disposed &&
+        holdingAlt.value &&
+        holdOwnerSongId === capturedSongId &&
+        capturedEpoch === songEpoch &&
+        selectedSongId.value === capturedSongId &&
+        loadedSongId.value === capturedSongId
+      ) {
+        applyPayload(res);
+      }
+    });
   } catch {}
 }
 
@@ -2265,15 +2383,16 @@ async function endHoldCompare() {
   if (!ownerSongId) return;
 
   try {
-    const res = await setHoldOffers(ownerSongId, false);
-    if (
-      !disposed &&
-      capturedEpoch === songEpoch &&
-      selectedSongId.value === ownerSongId &&
-      loadedSongId.value === ownerSongId
-    ) {
-      applyPayload(res);
-    }
+    await enqueueHoldRequest(ownerSongId, false, (res) => {
+      if (
+        !disposed &&
+        capturedEpoch === songEpoch &&
+        selectedSongId.value === ownerSongId &&
+        loadedSongId.value === ownerSongId
+      ) {
+        applyPayload(res);
+      }
+    });
   } catch {}
 }
 
@@ -2655,6 +2774,7 @@ onMounted(() => {
 onBeforeUnmount(() => {
   disposed = true;
   releaseHoldOwnerSynchronously();
+  setClientWorkspaceDir(null);
   songEpoch += 1;
   songOpenAbort?.abort();
   snapsAbort?.abort();
@@ -3093,7 +3213,7 @@ onBeforeUnmount(() => {
                   <button
                     type="button"
                     class="tool-button"
-                    :disabled="!sessionPayload"
+                    :disabled="!isSongReadyForActions"
                     aria-keyshortcuts="B"
                     title="Place user beat (B)"
                     @pointerdown="onToolbarCuePress('beat', $event)"
@@ -3104,7 +3224,7 @@ onBeforeUnmount(() => {
                   <button
                     type="button"
                     class="tool-button"
-                    :disabled="!sessionPayload"
+                    :disabled="!isSongReadyForActions"
                     aria-keyshortcuts="U"
                     title="Mark standalone unbeat cue (U)"
                     @pointerdown="onToolbarCuePress('unbeat', $event)"
@@ -3115,7 +3235,7 @@ onBeforeUnmount(() => {
                   <button
                     type="button"
                     class="tool-button"
-                    :disabled="!sessionPayload"
+                    :disabled="!isSongReadyForActions"
                     aria-keyshortcuts="N"
                     title="Mark heard sound anchor (N)"
                     @pointerdown="onToolbarCuePress('sound', $event)"
@@ -3126,7 +3246,7 @@ onBeforeUnmount(() => {
                   <button
                     type="button"
                     class="tool-button"
-                    :disabled="!sessionPayload"
+                    :disabled="!isSongReadyForActions"
                     :aria-pressed="
                       activeRange ? isRangeAllFree : selectedSegment?.regime === 'free'
                     "
@@ -3139,7 +3259,7 @@ onBeforeUnmount(() => {
                   <button
                     type="button"
                     class="tool-button"
-                    :disabled="!sessionPayload"
+                    :disabled="!isSongReadyForActions"
                     :aria-pressed="activeRange ? isRangeAllKept : Boolean(selectedSegment?.kept)"
                     aria-keyshortcuts="V"
                     title="Keep active range or whole segment (V)"
@@ -3153,7 +3273,7 @@ onBeforeUnmount(() => {
                   type="button"
                   class="tool-button"
                   :class="{ 'tool-button--primary': cuesDirty }"
-                  :disabled="!sessionPayload || recomputing"
+                  :disabled="!isSongReadyForActions || recomputing"
                   aria-keyshortcuts="Meta+K Control+K"
                   title="Recompute timing suggestions from cues (⌘K)"
                   @click="triggerRecompute"

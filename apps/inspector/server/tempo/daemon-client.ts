@@ -153,7 +153,12 @@ export class TempoDaemonClient {
   private child: ChildProcessWithoutNullStreams | null = null;
   private rl: ReadlineInterface | null = null;
   private readonly pending = new Map<string, PendingRpc>();
+  private readonly stdinFailureHandlers = new WeakMap<
+    ChildProcessWithoutNullStreams,
+    (err: Error) => void
+  >();
   private closed = false;
+  private closingPromise: Promise<void> | null = null;
   private nextId = 1;
 
   constructor(options: TempoDaemonClientOptions = {}) {
@@ -194,8 +199,45 @@ export class TempoDaemonClient {
     this.child = child;
     const stderrTail: string[] = [];
 
-    // Prevent unhandled stream error crashes (e.g. EPIPE when daemon exits mid-write).
-    child.stdin.on("error", () => {});
+    const rl = createInterface({ input: child.stdout, crlfDelay: Infinity });
+    this.rl = rl;
+
+    const rejectPendingForChild = (err: unknown) => {
+      rl.close();
+      if (this.child === child) {
+        this.child = null;
+      }
+      if (this.rl === rl) {
+        this.rl = null;
+      }
+      const owned: Array<[string, PendingRpc]> = [];
+      for (const [id, entry] of this.pending) {
+        if (entry.child === child) {
+          owned.push([id, entry]);
+        }
+      }
+      for (const [id, entry] of owned) {
+        this.pending.delete(id);
+        entry.cleanupAbort();
+        entry.reject(err);
+      }
+    };
+
+    const handleStdinError = (err: Error) => {
+      const reason = this.closed
+        ? makeAbortError("Tempo daemon closed.")
+        : new Error(`Tempo daemon stdin write failed (${err.message || "broken pipe"}).`);
+      rejectPendingForChild(reason);
+      if (child.exitCode === null && child.signalCode === null && !child.killed) {
+        try {
+          child.kill("SIGTERM");
+        } catch {}
+      }
+    };
+    this.stdinFailureHandlers.set(child, handleStdinError);
+
+    // Reject pending RPCs and terminate child immediately on broken stdin pipe.
+    child.stdin.on("error", handleStdinError);
     child.stdout.on("error", () => {});
     child.stderr.on("error", () => {});
 
@@ -209,8 +251,6 @@ export class TempoDaemonClient {
       }
     });
 
-    const rl = createInterface({ input: child.stdout, crlfDelay: Infinity });
-    this.rl = rl;
     rl.on("line", (line: string) => {
       const trimmed = line.trim();
       if (!trimmed) return;
@@ -234,27 +274,6 @@ export class TempoDaemonClient {
       }
     });
 
-    const rejectPendingForChild = (err: unknown) => {
-      rl.close();
-      if (this.child === child) {
-        this.child = null;
-      }
-      if (this.rl === rl) {
-        this.rl = null;
-      }
-      const owned: Array<[string, PendingRpc]> = [];
-      for (const [id, entry] of this.pending) {
-        if (entry.child === child) {
-          owned.push([id, entry]);
-        }
-      }
-      for (const [id, entry] of owned) {
-        this.pending.delete(id);
-        entry.cleanupAbort();
-        entry.reject(err);
-      }
-    };
-
     const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
       const detail = stderrTail.at(-1) ?? `code=${String(code)} signal=${String(signal)}`;
       const err = this.closed
@@ -276,8 +295,9 @@ export class TempoDaemonClient {
       throw new Error("Tempo daemon stdin pipe is not writable.");
     }
     child.stdin.write(`${JSON.stringify(payload)}\n`, (err) => {
-      // Handled by process exit/error listener; swallow callback error to avoid unhandled throw.
-      void err;
+      if (err) {
+        this.stdinFailureHandlers.get(child)?.(err);
+      }
     });
   }
 
@@ -409,82 +429,113 @@ export class TempoDaemonClient {
     return this.request<DaemonRenderSpanResponse>("export_clip", { ...params }, signal);
   }
 
-  async close(): Promise<void> {
-    if (this.closed) return;
+  close(): Promise<void> {
+    if (this.closingPromise) {
+      return this.closingPromise;
+    }
     this.closed = true;
     const child = this.child;
-    if (!child || child.exitCode !== null || child.signalCode !== null) {
-      this.child = null;
+    if (!child) {
       this.rl?.close();
       this.rl = null;
-      return;
+      this.closingPromise = Promise.resolve();
+      return this.closingPromise;
     }
 
-    await new Promise<void>((done) => {
-      let finished = false;
-      const finish = () => {
-        if (finished) return;
-        finished = true;
-        clearTimeout(termTimer);
-        clearTimeout(killTimer);
-        clearTimeout(giveUpTimer);
-        child.off("exit", finish);
-        child.off("close", finish);
-        done();
-      };
-
-      child.once("exit", finish);
-      child.once("close", finish);
-
-      const termTimer = setTimeout(() => {
-        if (child.exitCode === null && child.signalCode === null) {
-          try {
-            child.kill("SIGTERM");
-          } catch {
-            finish();
-          }
-        }
-      }, 400);
-      termTimer.unref?.();
-
-      const killTimer = setTimeout(() => {
-        if (child.exitCode === null && child.signalCode === null) {
-          try {
-            child.kill("SIGKILL");
-          } catch {
-            finish();
-          }
-        }
-      }, 800);
-      killTimer.unref?.();
-
-      const giveUpTimer = setTimeout(finish, 1500);
-      giveUpTimer.unref?.();
-
-      try {
-        if (!child.stdin.destroyed && child.stdin.writable) {
-          child.stdin.write(
-            `${JSON.stringify({ id: "shutdown", method: "shutdown", params: {} })}\n`,
-            () => {},
-          );
-          child.stdin.end();
-        } else {
-          child.kill("SIGTERM");
-        }
-      } catch {
-        try {
-          child.kill("SIGTERM");
-        } catch {
-          finish();
+    this.closingPromise = (async () => {
+      const closeErr = makeAbortError("Tempo daemon closed.");
+      for (const [id, entry] of Array.from(this.pending.entries())) {
+        if (entry.child === child) {
+          this.pending.delete(id);
+          entry.cleanupAbort();
+          entry.reject(closeErr);
         }
       }
-    });
 
-    if (this.child === child) {
-      this.child = null;
-    }
-    this.rl?.close();
-    this.rl = null;
+      const alreadyClosed =
+        (child.exitCode !== null || child.signalCode !== null) &&
+        child.stdout.destroyed &&
+        child.stderr.destroyed;
+
+      if (!alreadyClosed) {
+        await new Promise<void>((done) => {
+          let finished = false;
+          const finish = () => {
+            if (finished) return;
+            finished = true;
+            clearTimeout(termTimer);
+            clearTimeout(killTimer);
+            child.off("close", finish);
+            child.off("exit", onExitCheck);
+            done();
+          };
+          const onExitCheck = () => {
+            if (child.stdout.destroyed && child.stderr.destroyed) {
+              finish();
+            }
+          };
+
+          child.once("close", finish);
+          child.once("exit", onExitCheck);
+
+          if (
+            (child.exitCode !== null || child.signalCode !== null) &&
+            child.stdout.destroyed &&
+            child.stderr.destroyed
+          ) {
+            finish();
+            return;
+          }
+
+          const termTimer = setTimeout(() => {
+            if (child.exitCode === null && child.signalCode === null) {
+              try {
+                child.kill("SIGTERM");
+              } catch {}
+            }
+          }, 400);
+          termTimer.unref?.();
+
+          const killTimer = setTimeout(() => {
+            if (child.exitCode === null && child.signalCode === null) {
+              try {
+                child.kill("SIGKILL");
+              } catch {}
+            }
+            child.stdin.destroy();
+            child.stdout.destroy();
+            child.stderr.destroy();
+          }, 800);
+          killTimer.unref?.();
+
+          try {
+            if (!child.stdin.destroyed && child.stdin.writable) {
+              child.stdin.write(
+                `${JSON.stringify({ id: "shutdown", method: "shutdown", params: {} })}\n`,
+                () => {},
+              );
+              child.stdin.end();
+            } else if (child.exitCode === null && child.signalCode === null) {
+              child.kill("SIGTERM");
+            }
+          } catch {
+            if (child.exitCode === null && child.signalCode === null) {
+              try {
+                child.kill("SIGTERM");
+              } catch {}
+            }
+          }
+        });
+      }
+
+      if (this.child === child) {
+        this.child = null;
+      }
+      this.rl?.close();
+      this.rl = null;
+    })();
+
+    return this.closingPromise;
   }
 }
 

@@ -17,6 +17,18 @@ import type {
 export const TEMPO_API_PREFIX = "/api/tempo";
 export const LOCAL_HEADER_NAME = "x-beatmap-lens-local";
 export const LOCAL_HEADER_VALUE = "1";
+export const WORKSPACE_DIR_HEADER_NAME = "X-Tempo-Workspace-Dir";
+
+let activeClientWorkspaceDir: string | null = null;
+
+export function setClientWorkspaceDir(dir: string | null | undefined): void {
+  const trimmed = typeof dir === "string" ? dir.trim() : "";
+  activeClientWorkspaceDir = trimmed.length > 0 ? trimmed : null;
+}
+
+export function getClientWorkspaceDir(): string | null {
+  return activeClientWorkspaceDir;
+}
 
 export type AuditionFilter = "mix" | "percussive" | "harmonic" | "low" | "mid" | "high";
 
@@ -26,6 +38,7 @@ export interface TempoSongSummary {
   fileName: string;
   audioPath: string;
   audioSizeBytes?: number;
+  audioSha256?: string;
   audioSha256Sample?: string;
   durationSec: number | null;
   analyzed: boolean;
@@ -163,12 +176,20 @@ async function tempoJson<T>(
     body?: Record<string, unknown>;
     signal?: AbortSignal;
     localWrite?: boolean;
+    workspaceDir?: string | null;
+    includeWorkspaceHeader?: boolean;
   },
 ): Promise<T> {
   const method = options?.method ?? "GET";
   const headers: Record<string, string> = {};
   if (method !== "GET" || options?.localWrite) {
     headers[LOCAL_HEADER_NAME] = LOCAL_HEADER_VALUE;
+  }
+  if (options?.includeWorkspaceHeader) {
+    const wsDir = options.workspaceDir ?? activeClientWorkspaceDir;
+    if (typeof wsDir === "string" && wsDir.trim().length > 0) {
+      headers[WORKSPACE_DIR_HEADER_NAME] = encodeURIComponent(wsDir.trim());
+    }
   }
   if (options?.body !== undefined) {
     headers["content-type"] = "application/json";
@@ -213,7 +234,12 @@ export function openWorkspaceFolder(
 
 export function importWorkspacePaths(
   paths: string[],
-  options?: { dir?: string; copyIntoWorkspace?: boolean; signal?: AbortSignal },
+  options?: {
+    dir?: string;
+    workspaceDir?: string | null;
+    copyIntoWorkspace?: boolean;
+    signal?: AbortSignal;
+  },
 ): Promise<TempoUploadResponse> {
   return tempoJson<TempoUploadResponse>("/workspace/import", {
     method: "POST",
@@ -224,13 +250,15 @@ export function importWorkspacePaths(
         ? { copyIntoWorkspace: options.copyIntoWorkspace }
         : {}),
     },
+    includeWorkspaceHeader: !options?.dir,
+    ...(options?.workspaceDir !== undefined ? { workspaceDir: options.workspaceDir } : {}),
     ...(options?.signal ? { signal: options.signal } : {}),
   });
 }
 
 export async function uploadAudioFiles(
   files: readonly File[],
-  options?: { dir?: string; signal?: AbortSignal },
+  options?: { dir?: string; workspaceDir?: string | null; signal?: AbortSignal },
 ): Promise<TempoUploadResponse> {
   const form = new FormData();
   for (const file of files) {
@@ -239,11 +267,18 @@ export async function uploadAudioFiles(
   const params = new URLSearchParams();
   if (options?.dir) params.set("dir", options.dir);
   const query = params.size > 0 ? `?${params.toString()}` : "";
+  const headers: Record<string, string> = {
+    [LOCAL_HEADER_NAME]: LOCAL_HEADER_VALUE,
+  };
+  if (!options?.dir) {
+    const wsDir = options?.workspaceDir ?? activeClientWorkspaceDir;
+    if (typeof wsDir === "string" && wsDir.trim().length > 0) {
+      headers[WORKSPACE_DIR_HEADER_NAME] = encodeURIComponent(wsDir.trim());
+    }
+  }
   const response = await fetch(`${TEMPO_API_PREFIX}/workspace/import-upload${query}`, {
     method: "POST",
-    headers: {
-      [LOCAL_HEADER_NAME]: LOCAL_HEADER_VALUE,
-    },
+    headers,
     body: form,
     ...(options?.signal ? { signal: options.signal } : {}),
   });
@@ -253,10 +288,13 @@ export async function uploadAudioFiles(
 export function openSongSession(
   songId: string,
   signal?: AbortSignal,
+  workspaceDir?: string | null,
 ): Promise<TempoSongSessionPayload> {
   return tempoJson<TempoSongSessionPayload>(`/songs/${encodeURIComponent(songId)}/open`, {
     method: "POST",
     body: {},
+    includeWorkspaceHeader: true,
+    ...(workspaceDir !== undefined ? { workspaceDir } : {}),
     ...(signal ? { signal } : {}),
   });
 }
@@ -354,10 +392,13 @@ export function applySongOps(
   songId: string,
   ops: EditOp | EditOp[],
   signal?: AbortSignal,
+  workspaceDir?: string | null,
 ): Promise<TempoSongSessionPayload> {
   return tempoJson<TempoSongSessionPayload>(`/songs/${encodeURIComponent(songId)}/edit`, {
     method: "POST",
     body: Array.isArray(ops) ? { ops } : { op: ops },
+    includeWorkspaceHeader: true,
+    ...(workspaceDir !== undefined ? { workspaceDir } : {}),
     ...(signal ? { signal } : {}),
   });
 }
@@ -367,10 +408,13 @@ export function applySongAction(
   action: "undo" | "redo" | "ready",
   extra?: Record<string, unknown>,
   signal?: AbortSignal,
+  workspaceDir?: string | null,
 ): Promise<TempoSongSessionPayload> {
   return tempoJson<TempoSongSessionPayload>(`/songs/${encodeURIComponent(songId)}/edit`, {
     method: "POST",
     body: { action, ...extra },
+    includeWorkspaceHeader: true,
+    ...(workspaceDir !== undefined ? { workspaceDir } : {}),
     ...(signal ? { signal } : {}),
   });
 }
@@ -379,6 +423,7 @@ export function suggestSongSnaps(
   songId: string,
   params: { timeSec: number; windowSec?: number; immediate?: boolean },
   signal?: AbortSignal,
+  workspaceDir?: string | null,
 ): Promise<TempoSuggestSnapsResponse> {
   return tempoJson<TempoSuggestSnapsResponse>(`/songs/${encodeURIComponent(songId)}/snaps`, {
     method: "POST",
@@ -387,6 +432,8 @@ export function suggestSongSnaps(
       windowSec: params.windowSec ?? 0.12,
       immediate: params.immediate ?? true,
     },
+    includeWorkspaceHeader: true,
+    ...(workspaceDir !== undefined ? { workspaceDir } : {}),
     ...(signal ? { signal } : {}),
   });
 }
@@ -395,6 +442,7 @@ export function recomputeSong(
   songId: string,
   params: { scope: Range | "song"; reason?: string },
   signal?: AbortSignal,
+  workspaceDir?: string | null,
 ): Promise<TempoRecomputeResponse> {
   return tempoJson<TempoRecomputeResponse>(`/songs/${encodeURIComponent(songId)}/recompute`, {
     method: "POST",
@@ -402,6 +450,8 @@ export function recomputeSong(
       scope: params.scope,
       reason: params.reason ?? "User requested recompute",
     },
+    includeWorkspaceHeader: true,
+    ...(workspaceDir !== undefined ? { workspaceDir } : {}),
     ...(signal ? { signal } : {}),
   });
 }
@@ -410,10 +460,13 @@ export function setHoldOffers(
   songId: string,
   hold: boolean,
   signal?: AbortSignal,
+  workspaceDir?: string | null,
 ): Promise<TempoHoldOffersResponse> {
   return tempoJson<TempoHoldOffersResponse>(`/songs/${encodeURIComponent(songId)}/hold-offers`, {
     method: "POST",
     body: { hold },
+    includeWorkspaceHeader: true,
+    ...(workspaceDir !== undefined ? { workspaceDir } : {}),
     ...(signal ? { signal } : {}),
   });
 }
@@ -422,12 +475,15 @@ export function acceptOffer(
   songId: string,
   offerId: string,
   signal?: AbortSignal,
+  workspaceDir?: string | null,
 ): Promise<TempoOfferActionResponse> {
   return tempoJson<TempoOfferActionResponse>(
     `/songs/${encodeURIComponent(songId)}/offers/${encodeURIComponent(offerId)}/accept`,
     {
       method: "POST",
       body: {},
+      includeWorkspaceHeader: true,
+      ...(workspaceDir !== undefined ? { workspaceDir } : {}),
       ...(signal ? { signal } : {}),
     },
   );
@@ -438,12 +494,15 @@ export function rejectOffer(
   offerId: string,
   reason?: string,
   signal?: AbortSignal,
+  workspaceDir?: string | null,
 ): Promise<TempoOfferActionResponse> {
   return tempoJson<TempoOfferActionResponse>(
     `/songs/${encodeURIComponent(songId)}/offers/${encodeURIComponent(offerId)}/reject`,
     {
       method: "POST",
       body: reason ? { reason } : {},
+      includeWorkspaceHeader: true,
+      ...(workspaceDir !== undefined ? { workspaceDir } : {}),
       ...(signal ? { signal } : {}),
     },
   );
@@ -458,10 +517,13 @@ export function exportSong(
     filter?: AuditionFilter;
   },
   signal?: AbortSignal,
+  workspaceDir?: string | null,
 ): Promise<TempoExportResponse> {
   return tempoJson<TempoExportResponse>(`/songs/${encodeURIComponent(songId)}/export`, {
     method: "POST",
     body: { ...params },
+    includeWorkspaceHeader: true,
+    ...(workspaceDir !== undefined ? { workspaceDir } : {}),
     ...(signal ? { signal } : {}),
   });
 }

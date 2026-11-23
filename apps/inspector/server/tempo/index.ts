@@ -37,6 +37,7 @@ import {
 import {
   assertValidSongId,
   atomicWriteJson,
+  isSupportedAudioFileName,
   slugifySongStem,
   type TempoSongSummary,
   type TempoWorkspaceManifest,
@@ -65,29 +66,65 @@ const AUDIO_MIME_BY_EXT: Record<string, string> = {
 
 const ENSOMI_ERROR_MESSAGES: Record<string, string> = {
   SESSION_CLOSED: "The song session was closed; reopen the song to continue.",
-  INVALID_RANGE: "Choose a valid time span inside the recording.",
+  ABORTED: "The timing request was cancelled.",
+  SUPERSEDED: "The timing request was superseded by a newer action.",
+  AUDIO_NOT_BOUND: "Open the song audio before running analysis.",
+  INVALID_AUDIO: "Audio metadata is invalid for this recording.",
+  INVALID_DURATION: "Track duration must be a valid non-negative duration.",
+  INVALID_UNIT: "Value must stay between 0 and 1.",
+  INVALID_RANGE: "Selected time range is outside valid section bounds.",
   INVALID_BEAT: "Beat timing must stay within the recording bounds.",
   INVALID_SEGMENT: "Segment boundaries must stay ordered inside the recording.",
   INVALID_SEGMENTS: "Segment boundaries must cover the recording without overlap.",
-  INVALID_SPAN: "Marked span must lie inside a single segment.",
+  INVALID_SEGMENT_EDIT: "Invalid section edit for the current song boundaries.",
+  DUPLICATE_SEGMENT_ID: "Section identifier already exists.",
+  INVALID_SPAN: "Selected time range is outside valid section bounds.",
   INVALID_SOUND: "Sound marker must stay within the recording bounds.",
   INVALID_UNBEAT: "Unbeat cue must stay within the recording bounds.",
+  INVALID_UNBEAT_CUE: "Unbeat cue must stay within the recording bounds.",
+  INVALID_SNAP_CANDIDATE: "Acoustic snap candidate is outside valid bounds.",
   INVALID_EDIT: "That edit could not be applied to the current timing state.",
   INVALID_RETRACT: "That undo or redo step is no longer available.",
+  INVALID_RETRACTION: "That undo or redo step is no longer available.",
   INVALID_OFFER: "That timing suggestion is no longer applicable.",
+  DUPLICATE_OFFER_ID: "Duplicate timing suggestion identifier rejected.",
+  MISSING_OFFER: "That timing suggestion is no longer available.",
   OFFER_NOT_FOUND: "That timing suggestion is no longer available.",
+  OFFER_NOT_REJECTABLE: "That timing suggestion can no longer be dismissed.",
   PROTECTED_KEEP: "A locked Keep section prevents modifying beats in that span.",
+  INVALID_PAYLOAD: "Invalid session event payload.",
+  INVALID_EVENT: "Invalid session trace event.",
+  NON_MONOTONIC_SEQ: "Out-of-order session event sequence rejected.",
   DUPLICATE_EVENT_ID: "Duplicate session trace event rejected.",
+  INVALID_TRACE: "Invalid session trace sequence.",
+  INVALID_NDJSON: "Invalid session trace text.",
   CORRUPT_NDJSON: "The saved session trace could not be parsed cleanly.",
+  INVALID_POLICY: "Invalid session trigger policy configuration.",
+  INVALID_PROVIDER: "Invalid timing provider configuration.",
+  INVALID_OPTIONS: "Invalid session configuration options.",
+  INVALID_LAYER: "Unknown session trigger layer.",
+  INVALID_REQUEST: "Invalid snap query parameters.",
+  INVALID_SIGNAL: "Invalid recompute request scope.",
+  INVALID_DIVISORS: "Invalid grid subdivision settings.",
+  INVALID_TOLERANCE: "Invalid grid tolerance settings.",
+  INVALID_METER: "Invalid timing meter settings.",
 };
 
 const INTERNAL_TOKEN_RE =
   /\b(?:sk:[A-Za-z0-9_-]+|\d+:(?:edit|draft_loaded|offer_accept|offer_reject|audio_bound|retract|ready)_[A-Za-z0-9_-]+|(?:offer_b|seg|span|beat|snd|sound|unbeat|offer|batch|evt|snap|ub|kb)[_-][A-Za-z0-9_-]+|b[_-][A-Za-z0-9_-]{2,}|(?:audio_bound|draft_loaded|offer_batch|offer_accept|offer_reject|listen_effort|retract|signal|edit|ready)_\d+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b/gi;
 
 export function sanitizeTempoErrorMessage(error: unknown): string {
-  if (error instanceof EnsomiError) {
-    const mapped = ENSOMI_ERROR_MESSAGES[error.code];
-    if (mapped) return mapped;
+  const maybeErr = error as { name?: unknown; code?: unknown } | null | undefined;
+  const errCode = typeof maybeErr?.code === "string" ? maybeErr.code : "";
+  if (
+    error instanceof EnsomiError ||
+    maybeErr?.name === "EnsomiError" ||
+    (errCode.length > 0 && Object.hasOwn(ENSOMI_ERROR_MESSAGES, errCode))
+  ) {
+    return (
+      ENSOMI_ERROR_MESSAGES[errCode] ??
+      "That timing action could not be applied to the current song state."
+    );
   }
   const raw = error instanceof Error ? error.message : String(error ?? "Request failed.");
   const redacted = raw
@@ -130,8 +167,10 @@ export interface TempoServiceOptions {
   defaultImportWorkspaceDir?: string;
   /** Custom allowed bind host when CLI server runs with `--host`. */
   allowedHost?: string;
-  /** Explicit opt-in required to accept non-loopback connections (`--allow-remote`). */
+  /** Explicit opt-in required to accept non-loopback read connections (`--allow-remote`). */
   allowRemote?: boolean;
+  /** Explicit opt-in required to accept non-loopback mutation requests (`POST`/`PUT`/`DELETE`). */
+  allowRemoteMutations?: boolean;
   /** Optional `TriggerPolicy` overrides for `SessionController` instances. */
   triggerPolicy?: TriggerPolicyOverride;
   /** Environment overrides forwarded to `TempoDaemonClient`. */
@@ -167,21 +206,31 @@ interface AuditionRenderMeta {
 
 export class SongSessionHost {
   readonly songId: string;
+  readonly stateDir: string;
   readonly tracePath: string;
+  readonly boundFingerprint: string;
+  readonly traceEpoch: number;
   readonly controller: SessionController;
+  openingCount = 0;
   private persistedCount: number;
   private flushChain: Promise<void> = Promise.resolve();
   private readonly traceWriter: TempoWorkspaceStore["traceWriter"];
 
   constructor(options: {
     songId: string;
+    stateDir?: string;
     tracePath: string;
+    boundFingerprint?: string;
+    traceEpoch?: number;
     controller: SessionController;
     persistedCount: number;
     traceWriter: TempoWorkspaceStore["traceWriter"];
   }) {
     this.songId = options.songId;
+    this.stateDir = options.stateDir ?? "";
     this.tracePath = options.tracePath;
+    this.boundFingerprint = options.boundFingerprint ?? "";
+    this.traceEpoch = options.traceEpoch ?? 0;
     this.controller = options.controller;
     this.persistedCount = options.persistedCount;
     this.traceWriter = options.traceWriter;
@@ -198,7 +247,11 @@ export class SongSessionHost {
       if (allEvents.length <= this.persistedCount) return;
       const delta = allEvents.slice(this.persistedCount);
       if (delta.length === 0) return;
-      await this.traceWriter.append(this.tracePath, delta);
+      await this.traceWriter.append(
+        this.tracePath,
+        delta,
+        this.stateDir.length > 0 ? this.stateDir : undefined,
+      );
       this.persistedCount = allEvents.length;
     });
     this.flushChain = task.catch(() => {});
@@ -206,6 +259,7 @@ export class SongSessionHost {
   }
 
   isIdle(): boolean {
+    if (this.openingCount > 0) return false;
     const ls = this.layerStates();
     return !ls.song_open.inFlight && !ls.micro_assist.inFlight && !ls.heavy_recompute.inFlight;
   }
@@ -246,14 +300,26 @@ function disconnectSignal(
 export function assertTempoLocalRequest(
   request: IncomingMessage,
   url: URL,
-  options: { allowedHost?: string; allowRemote?: boolean } = {},
+  options: {
+    allowedHost?: string;
+    allowRemote?: boolean;
+    allowRemoteMutations?: boolean;
+  } = {},
   requireLocalHeader = false,
 ): void {
+  const method = (request.method ?? "GET").toUpperCase();
+  const isReadMethod = method === "GET" || method === "HEAD";
+  const isMutation = !isReadMethod || requireLocalHeader;
   const remote = request.socket.remoteAddress ?? "";
   let socketAllowed = LOOPBACK_ADDRESSES.has(remote);
-  let hostAllowed = LOOPBACK_HOSTNAMES.has(url.hostname);
+  let hostAllowed =
+    LOOPBACK_HOSTNAMES.has(url.hostname) ||
+    (Boolean(options.allowedHost) &&
+      options.allowedHost !== "0.0.0.0" &&
+      options.allowedHost !== "::" &&
+      url.hostname === options.allowedHost);
 
-  if (options.allowRemote) {
+  if (options.allowRemote && (!isMutation || options.allowRemoteMutations)) {
     if (!options.allowedHost || options.allowedHost === "0.0.0.0" || options.allowedHost === "::") {
       socketAllowed = true;
       hostAllowed = true;
@@ -264,13 +330,18 @@ export function assertTempoLocalRequest(
         remote === `::ffff:${options.allowedHost}`;
       hostAllowed = hostAllowed || url.hostname === options.allowedHost;
     }
+  } else if (options.allowRemote && isMutation && socketAllowed) {
+    // Loopback caller against a wildcard-bound local server is still allowed when Origin/headers pass.
+    hostAllowed = true;
   }
 
+  const fetchSite = request.headers["sec-fetch-site"];
   if (
     !socketAllowed ||
     !hostAllowed ||
     (request.headers.origin && request.headers.origin !== url.origin) ||
-    request.headers["sec-fetch-site"] === "cross-site"
+    fetchSite === "cross-site" ||
+    fetchSite === "same-site"
   ) {
     throw new DOMException(
       "Inspector's Tempo service accepts only same-origin local requests.",
@@ -278,7 +349,7 @@ export function assertTempoLocalRequest(
     );
   }
 
-  if (requireLocalHeader) {
+  if (isMutation) {
     const contentType = (request.headers["content-type"] ?? "").toLowerCase();
     const isSimpleFormPost =
       contentType.startsWith("application/x-www-form-urlencoded") ||
@@ -604,26 +675,45 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
     if (!stateDir) {
       throw new Error("Open a Tempo workspace folder first.");
     }
-    store.getSong(songId);
+    const song = store.getSong(songId);
+    const expectedEpoch = store.getTraceEpoch(songId, stateDir);
     const key = `${stateDir}::${songId}`;
     const existing = hosts.get(key);
-    if (existing && !existing.controller.isClosed()) {
-      hosts.delete(key);
-      hosts.set(key, existing);
-      return existing;
+    if (existing) {
+      const fingerprintChanged =
+        existing.boundFingerprint.length > 0 && existing.boundFingerprint !== song.audioSha256;
+      const epochChanged = existing.traceEpoch !== expectedEpoch;
+      if (existing.controller.isClosed() || fingerprintChanged || epochChanged) {
+        hosts.delete(key);
+        existing.controller.close();
+      } else {
+        hosts.delete(key);
+        hosts.set(key, existing);
+        return existing;
+      }
     }
 
     const inflight = hostInitLocks.get(key);
     if (inflight) {
       const resolvedHost = await inflight;
       signal?.throwIfAborted?.();
-      return resolvedHost;
+      if (
+        !resolvedHost.controller.isClosed() &&
+        resolvedHost.boundFingerprint === store.getSong(songId).audioSha256 &&
+        resolvedHost.traceEpoch === store.getTraceEpoch(songId, stateDir)
+      ) {
+        return resolvedHost;
+      }
+      hosts.delete(key);
+      resolvedHost.controller.close();
     }
 
     const loader = (async () => {
       try {
+        const liveSong = store.getSong(songId);
+        const liveEpoch = store.getTraceEpoch(songId, stateDir);
         const tracePath = await store.resolveContainedStatePath("traces", `${songId}.jsonl`);
-        const initialEvents = await store.traceWriter.read(tracePath);
+        const initialEvents = await store.traceWriter.read(tracePath, stateDir);
         const controller = new SessionController({
           provider,
           ...(options.triggerPolicy ? { triggerPolicy: options.triggerPolicy } : {}),
@@ -631,7 +721,10 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
         });
         const host = new SongSessionHost({
           songId,
+          stateDir,
           tracePath,
+          boundFingerprint: liveSong.audioSha256,
+          traceEpoch: liveEpoch,
           controller,
           persistedCount: initialEvents.length,
           traceWriter: store.traceWriter,
@@ -650,7 +743,10 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
     return created;
   }
 
-  async function buildSongSessionPayload(host: SongSessionHost): Promise<TempoSongSessionPayload> {
+  async function buildSongSessionPayload(
+    host: SongSessionHost,
+    payloadOptions?: { persist?: boolean },
+  ): Promise<TempoSongSessionPayload> {
     const liveState = host.controller.getState();
     const serialized = serializeState(liveState);
     const gridFit = computeGridFit(liveState.sounds, liveState.beats, liveState.segments);
@@ -658,7 +754,10 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
     const redLineProjection = projectRedLines(liveState.beats, liveState.segments, {
       spans: liveState.spans,
     });
-    const songSummary = await store.updateSongFromState(host.songId, liveState, inboxSpans);
+    const persist = payloadOptions?.persist !== false;
+    const songSummary = persist
+      ? await store.updateSongFromState(host.songId, liveState, inboxSpans)
+      : store.projectSongSummary(host.songId, liveState, inboxSpans);
     return {
       song: songSummary,
       songSummary,
@@ -692,41 +791,66 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
     const song = await store.setActiveSong(songId);
     signal?.throwIfAborted?.();
     const host = await getOrLoadHost(songId, signal);
-    const stateBefore = host.controller.getState();
 
-    const hasDraftLoaded = stateBefore.events.some(
-      (ev) => !stateBefore.retractedEventIds.has(ev.id) && ev.type === "draft_loaded",
-    );
-    const hasUserMutations = stateBefore.events.some(
-      (ev) => !stateBefore.retractedEventIds.has(ev.id) && ev.type === "edit",
-    );
+    const hasDraftLoaded = (st: ReturnType<SessionController["getState"]>) =>
+      st.events.some((ev) => !st.retractedEventIds.has(ev.id) && ev.type === "draft_loaded");
+    const hasUserMutations = (st: ReturnType<SessionController["getState"]>) =>
+      st.events.some(
+        (ev) =>
+          !st.retractedEventIds.has(ev.id) && (ev.type === "edit" || ev.type === "offer_accept"),
+      );
 
-    if (!stateBefore.audio) {
-      const prepared = await daemon.prepare(song.audioPath, signal);
-      signal?.throwIfAborted?.();
-      await host.controller.openSong(
-        {
+    host.openingCount += 1;
+    try {
+      const stateBefore = host.controller.getState();
+      const seqBeforePrepare = stateBefore.lastSeq;
+
+      if (!stateBefore.audio) {
+        const prepared = await daemon.prepare(song.audioPath, signal);
+        signal?.throwIfAborted?.();
+        const stateAfterPrepare = host.controller.getState();
+        const audioDescriptor = {
           songId,
           durationSec: prepared.durationSec,
           sampleRate: prepared.sampleRate,
           clock: "source-audio-sec",
           decoder: "ffmpeg-f32le",
-        },
-        signal,
-      );
-      await host.flushTrace();
-    } else if (
-      !hasDraftLoaded &&
-      !hasUserMutations &&
-      host.controller.getTriggerPolicy().song_open.mode === "auto"
-    ) {
-      await daemon.prepare(song.audioPath, signal);
-      signal?.throwIfAborted?.();
-      await host.controller.analyze(signal);
-      await host.flushTrace();
-    } else {
-      // Warm PCM cache in the background without blocking cached `.jsonl` reopen!
-      void daemon.prepare(song.audioPath).catch(() => {});
+        };
+        if (
+          stateAfterPrepare.lastSeq > seqBeforePrepare ||
+          hasUserMutations(stateAfterPrepare) ||
+          hasDraftLoaded(stateAfterPrepare)
+        ) {
+          if (!stateAfterPrepare.audio) {
+            await host.controller.bindAudio(audioDescriptor, signal);
+          }
+          await host.flushTrace();
+        } else {
+          await host.controller.openSong(audioDescriptor, signal);
+          await host.flushTrace();
+        }
+      } else if (
+        !hasDraftLoaded(stateBefore) &&
+        !hasUserMutations(stateBefore) &&
+        host.controller.getTriggerPolicy().song_open.mode === "auto"
+      ) {
+        await daemon.prepare(song.audioPath, signal);
+        signal?.throwIfAborted?.();
+        const stateAfterPrepare = host.controller.getState();
+        if (
+          stateAfterPrepare.lastSeq === seqBeforePrepare &&
+          !hasUserMutations(stateAfterPrepare) &&
+          !hasDraftLoaded(stateAfterPrepare)
+        ) {
+          await host.controller.analyze(signal, { basisSeq: seqBeforePrepare });
+          await host.flushTrace();
+        }
+      } else {
+        // Warm PCM cache in the background without blocking cached `.jsonl` reopen!
+        void daemon.prepare(song.audioPath).catch(() => {});
+      }
+    } finally {
+      host.openingCount = Math.max(0, host.openingCount - 1);
     }
 
     signal?.throwIfAborted?.();
@@ -743,12 +867,16 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
     if (t0 < 0 || t1 <= t0 || t1 - t0 > MAX_AUDITION_SPAN_SEC + 1e-6) {
       throw new Error(`Choose an audition span between 0 and ${MAX_AUDITION_SPAN_SEC} seconds.`);
     }
-    const fileInfo = await stat(song.audioPath);
+    const canonicalAudio = await realpath(song.audioPath);
+    if (!isSupportedAudioFileName(basename(canonicalAudio))) {
+      throw new DOMException("Unsupported audio file.", "NotAllowedError");
+    }
+    const fileInfo = await stat(canonicalAudio);
     const cacheKey = createHash("sha1")
       .update(
         [
-          song.audioPath,
-          song.audioSha256Sample,
+          canonicalAudio,
+          song.audioSha256 || song.audioSha256Sample,
           String(fileInfo.mtimeMs),
           String(fileInfo.size),
           String(t0),
@@ -1035,13 +1163,17 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
         throw new Error("Clip export requires 0 <= t0 < t1.");
       }
 
+      const canonicalClipSrc = await realpath(song.audioPath);
+      if (!isSupportedAudioFileName(basename(canonicalClipSrc))) {
+        throw new DOMException("Unsupported audio file.", "NotAllowedError");
+      }
       const clipsDir = await store.resolveContainedStatePath("clips");
       await mkdir(clipsDir, { recursive: true });
       const clipFileName = `${song.songId}-${t0.toFixed(3)}-${t1.toFixed(3)}-${filter}-${randomUUID().slice(0, 6)}.wav`;
       const outputPath = await store.resolveContainedStatePath("clips", clipFileName);
       const rendered = await daemon.exportClip(
         {
-          audioPath: song.audioPath,
+          audioPath: canonicalClipSrc,
           startSec: t0,
           endSec: t1,
           filter,
@@ -1067,6 +1199,43 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
     throw new Error(`Unsupported export format "${format}". Expected "osu", "jsonl", or "clip".`);
   }
 
+  async function assertExpectedWorkspaceMatches(
+    request: IncomingMessage,
+    response: ServerResponse,
+  ): Promise<boolean> {
+    const rawExpected = request.headers["x-tempo-workspace-dir"];
+    if (typeof rawExpected !== "string" || !rawExpected.trim()) {
+      return true;
+    }
+    let decoded = rawExpected.trim();
+    try {
+      decoded = decodeURIComponent(decoded).trim();
+    } catch {
+      // Keep raw string if not URI-encoded.
+    }
+    if (!decoded) return true;
+
+    await ensureInitialWorkspace();
+    let canonicalExpected = decoded;
+    try {
+      const expanded = fullPath(decoded);
+      canonicalExpected = await realpath(expanded).catch(() => expanded);
+    } catch {}
+
+    if (
+      !store.isOpen ||
+      (store.currentWorkspaceDir !== canonicalExpected && store.currentWorkspaceDir !== decoded)
+    ) {
+      response.statusCode = 409;
+      sendJson(response, {
+        name: "ConflictError",
+        error: "Active workspace changed in another tab — reopen workspace.",
+      });
+      return false;
+    }
+    return true;
+  }
+
   async function handleInternal(
     request: IncomingMessage,
     response: ServerResponse,
@@ -1086,6 +1255,9 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
       {
         ...(options.allowedHost ? { allowedHost: options.allowedHost } : {}),
         ...(options.allowRemote !== undefined ? { allowRemote: options.allowRemote } : {}),
+        ...(options.allowRemoteMutations !== undefined
+          ? { allowRemoteMutations: options.allowRemoteMutations }
+          : {}),
       },
       requireLocalHeader,
     );
@@ -1137,6 +1309,12 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
       method === "POST"
     ) {
       const body = await readJsonBody(request);
+      if (
+        typeof body.dir !== "string" &&
+        !(await assertExpectedWorkspaceMatches(request, response))
+      ) {
+        return;
+      }
       const { target } = await ensureWorkspaceForImport(
         typeof body.dir === "string" ? body.dir : undefined,
         typeof body.stateDir === "string" ? body.stateDir : undefined,
@@ -1167,6 +1345,12 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
       parts.length === 2 &&
       method === "POST"
     ) {
+      if (
+        !url.searchParams.has("dir") &&
+        !(await assertExpectedWorkspaceMatches(request, response))
+      ) {
+        return;
+      }
       sendJson(response, await handleUploadRequest(request, url));
       return;
     }
@@ -1176,9 +1360,15 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
       const songId = assertValidSongId(parts[1]);
       const action = parts[2];
 
+      if (method !== "GET" && method !== "HEAD") {
+        if (!(await assertExpectedWorkspaceMatches(request, response))) {
+          return;
+        }
+      }
+
       if (action === undefined && method === "GET") {
         const host = await getOrLoadHost(songId);
-        sendJson(response, await buildSongSessionPayload(host));
+        sendJson(response, await buildSongSessionPayload(host, { persist: false }));
         return;
       }
 
@@ -1204,6 +1394,9 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
         await ensureInitialWorkspace();
         const song = store.getSong(songId);
         const canonicalAudio = await realpath(song.audioPath);
+        if (!isSupportedAudioFileName(basename(canonicalAudio))) {
+          throw new DOMException("Unsupported audio file.", "NotAllowedError");
+        }
         const mime =
           AUDIO_MIME_BY_EXT[extname(canonicalAudio).toLowerCase()] ?? "application/octet-stream";
         await streamFileWithRange(request, response, canonicalAudio, mime);
@@ -1344,19 +1537,26 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
           if (signal.aborted || response.destroyed) return;
           if (!host.controller.getState().audio) {
             const song = store.getSong(songId);
-            const prepared = await daemon.prepare(song.audioPath, signal);
-            if (signal.aborted || response.destroyed) return;
-            await host.controller.bindAudio(
-              {
-                songId,
-                durationSec: prepared.durationSec,
-                sampleRate: prepared.sampleRate,
-                clock: "source-audio-sec",
-                decoder: "ffmpeg-f32le",
-              },
-              signal,
-            );
-            await host.flushTrace();
+            host.openingCount += 1;
+            try {
+              const prepared = await daemon.prepare(song.audioPath, signal);
+              if (signal.aborted || response.destroyed) return;
+              if (!host.controller.getState().audio) {
+                await host.controller.bindAudio(
+                  {
+                    songId,
+                    durationSec: prepared.durationSec,
+                    sampleRate: prepared.sampleRate,
+                    clock: "source-audio-sec",
+                    decoder: "ffmpeg-f32le",
+                  },
+                  signal,
+                );
+                await host.flushTrace();
+              }
+            } finally {
+              host.openingCount = Math.max(0, host.openingCount - 1);
+            }
             if (signal.aborted || response.destroyed) return;
           }
 

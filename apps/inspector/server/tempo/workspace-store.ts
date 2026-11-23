@@ -1,12 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
-import { constants, createWriteStream, existsSync } from "node:fs";
+import { constants, createReadStream, createWriteStream, existsSync, realpathSync } from "node:fs";
 import {
   appendFile,
   copyFile,
   link,
   lstat,
   mkdir,
-  open,
   readdir,
   readFile,
   realpath,
@@ -46,8 +45,6 @@ const AUDIO_EXT_SET = new Set<string>(SUPPORTED_AUDIO_EXTENSIONS);
 
 export const VALID_SONG_ID_RE = /^[a-z0-9][a-z0-9_-]{0,120}$/;
 
-const FINGERPRINT_SAMPLE_BYTES = 64 * 1024;
-
 export function isValidSongId(songId: string): boolean {
   return typeof songId === "string" && VALID_SONG_ID_RE.test(songId);
 }
@@ -66,44 +63,31 @@ export function isSupportedAudioFileName(fileName: string): boolean {
 
 export interface AudioSourceFingerprint {
   audioSizeBytes: number;
+  audioSha256: string;
   audioSha256Sample: string;
 }
 
 export async function computeAudioFingerprint(audioPath: string): Promise<AudioSourceFingerprint> {
-  const fh = await open(audioPath, "r");
-  try {
-    const info = await fh.stat();
-    if (!info.isFile()) {
-      throw new Error("Audio source path is not a regular file.");
-    }
-    const size = info.size;
-    const hasher = createHash("sha256");
-    hasher.update(`size:${size}\0`);
-
-    if (size > 0) {
-      const headLen = Math.min(size, FINGERPRINT_SAMPLE_BYTES);
-      const headBuf = Buffer.allocUnsafe(headLen);
-      const { bytesRead: headRead } = await fh.read(headBuf, 0, headLen, 0);
-      hasher.update(headBuf.subarray(0, headRead));
-
-      if (size > FINGERPRINT_SAMPLE_BYTES) {
-        const tailOffset = Math.max(headLen, size - FINGERPRINT_SAMPLE_BYTES);
-        const tailLen = size - tailOffset;
-        if (tailLen > 0) {
-          const tailBuf = Buffer.allocUnsafe(tailLen);
-          const { bytesRead: tailRead } = await fh.read(tailBuf, 0, tailLen, tailOffset);
-          hasher.update(tailBuf.subarray(0, tailRead));
-        }
-      }
-    }
-
-    return {
-      audioSizeBytes: size,
-      audioSha256Sample: hasher.digest("hex"),
-    };
-  } finally {
-    await fh.close();
+  const canonicalPath = await realpath(audioPath);
+  const info = await stat(canonicalPath);
+  if (!info.isFile()) {
+    throw new Error("Audio source path is not a regular file.");
   }
+  const hasher = createHash("sha256");
+  await new Promise<void>((resolveHash, rejectHash) => {
+    const stream = createReadStream(canonicalPath);
+    stream.on("data", (chunk: Buffer | string) => {
+      hasher.update(chunk);
+    });
+    stream.on("error", rejectHash);
+    stream.on("end", () => resolveHash());
+  });
+  const digest = hasher.digest("hex");
+  return {
+    audioSizeBytes: info.size,
+    audioSha256: digest,
+    audioSha256Sample: digest,
+  };
 }
 
 /**
@@ -167,6 +151,7 @@ export interface TempoSongSummary {
   fileName: string;
   audioPath: string;
   audioSizeBytes: number;
+  audioSha256: string;
   audioSha256Sample: string;
   durationSec: number | null;
   analyzed: boolean;
@@ -293,9 +278,9 @@ export class TraceWriter {
     this.getStateDir = getStateDir;
   }
 
-  private async verifyPath(path: string): Promise<string> {
+  private async verifyPath(path: string, expectedStateDir?: string | null): Promise<string> {
     assertNotTimingFile(path);
-    const activeStateDir = this.getStateDir?.() ?? null;
+    const activeStateDir = expectedStateDir ?? this.getStateDir?.() ?? null;
     if (activeStateDir) {
       return await assertContainedInStateDir(activeStateDir, path);
     }
@@ -315,7 +300,11 @@ export class TraceWriter {
     return resolved;
   }
 
-  append(path: string, events: readonly TraceEvent[]): Promise<TraceAppendResult> {
+  append(
+    path: string,
+    events: readonly TraceEvent[],
+    expectedStateDir?: string | null,
+  ): Promise<TraceAppendResult> {
     let incoming: TraceEvent[];
     try {
       assertNotTimingFile(path);
@@ -330,7 +319,7 @@ export class TraceWriter {
     const next = previous
       .catch(() => {})
       .then(async (): Promise<TraceAppendResult> => {
-        const safePath = await this.verifyPath(path);
+        const safePath = await this.verifyPath(path, expectedStateDir);
         let raw = "";
         try {
           raw = await readFile(safePath, "utf8");
@@ -381,7 +370,7 @@ export class TraceWriter {
         if (toAppend.length === 0) return { appended: 0, skipped };
 
         await mkdir(dirname(safePath), { recursive: true });
-        await this.verifyPath(safePath);
+        await this.verifyPath(safePath, expectedStateDir);
         const serialized = serializeTraceNdjson(toAppend);
         const payload = inspected.needsLeadingNewline ? `\n${serialized}` : serialized;
         await appendFile(safePath, payload, "utf8");
@@ -400,11 +389,11 @@ export class TraceWriter {
     return next;
   }
 
-  async read(path: string): Promise<TraceEvent[]> {
+  async read(path: string, expectedStateDir?: string | null): Promise<TraceEvent[]> {
     const key = resolve(path);
     const pending = this.tails.get(key);
     if (pending) await pending.catch(() => {});
-    const safePath = await this.verifyPath(path);
+    const safePath = await this.verifyPath(path, expectedStateDir);
     let raw = "";
     try {
       raw = await readFile(safePath, "utf8");
@@ -431,14 +420,25 @@ export function slugifySongStem(fileName: string): string {
 }
 
 export function deriveSongId(workspaceDir: string, audioPath: string): string {
-  const fileName = basename(audioPath);
+  let canonicalWs = resolve(workspaceDir);
+  try {
+    canonicalWs = realpathSync(canonicalWs);
+  } catch {}
+  let canonicalAudio = resolve(audioPath);
+  try {
+    canonicalAudio = realpathSync(canonicalAudio);
+  } catch {}
+  const fileName = basename(canonicalAudio);
   const slug = slugifySongStem(fileName);
   const isInsideWorkspace =
-    audioPath.startsWith(`${workspaceDir}${sep}`) && dirname(audioPath) === workspaceDir;
-  const hashInput = isInsideWorkspace
-    ? `rel:${relative(workspaceDir, audioPath)}`
-    : `abs:${audioPath}`;
-  const shortHash = createHash("sha256").update(hashInput).digest("hex").slice(0, 8);
+    canonicalAudio.startsWith(`${canonicalWs}${sep}`) && dirname(canonicalAudio) === canonicalWs;
+  const canonicalEntryKey = isInsideWorkspace
+    ? `rel:${relative(canonicalWs, canonicalAudio)}`
+    : `abs:${canonicalAudio}`;
+  const shortHash = createHash("sha1")
+    .update(`${canonicalWs}\0${canonicalEntryKey}`)
+    .digest("hex")
+    .slice(0, 8);
   return `${slug}-${shortHash}`;
 }
 
@@ -596,6 +596,7 @@ export class TempoWorkspaceStore {
   private manifest: TempoWorkspaceManifest | null = null;
   private opChain: Promise<unknown> = Promise.resolve();
   private writeChain: Promise<unknown> = Promise.resolve();
+  private readonly traceEpochs = new Map<string, number>();
   readonly traceWriter: TraceWriter;
 
   constructor() {
@@ -756,11 +757,25 @@ export class TempoWorkspaceStore {
     };
   }
 
+  private bumpTraceEpoch(stateDir: string, songId: string): number {
+    const key = `${stateDir}::${songId}`;
+    const next = (this.traceEpochs.get(key) ?? 0) + 1;
+    this.traceEpochs.set(key, next);
+    return next;
+  }
+
+  getTraceEpoch(songId: string, explicitStateDir?: string | null): number {
+    const dir = explicitStateDir ?? this.stateDir;
+    if (!dir) return 0;
+    return this.traceEpochs.get(`${dir}::${songId}`) ?? 0;
+  }
+
   private async rotateSupersededTrace(
     stateDir: string,
     songId: string,
   ): Promise<string | undefined> {
     assertValidSongId(songId);
+    this.bumpTraceEpoch(stateDir, songId);
     const tracePath = await assertContainedInStateDir(
       stateDir,
       join(stateDir, "traces", `${songId}.jsonl`),
@@ -818,10 +833,19 @@ export class TempoWorkspaceStore {
       for (const rawPrev of existingManifest?.songs ?? []) {
         if (!isValidPersistedSummaryCandidate(rawPrev)) continue;
         const prevCanonical = await realpath(rawPrev.audioPath).catch(() => null);
-        if (!prevCanonical) continue;
+        if (!prevCanonical || !isSupportedAudioFileName(basename(prevCanonical))) continue;
         const prevStat = await stat(prevCanonical).catch(() => null);
         if (!prevStat?.isFile()) continue;
-        const normalizedPrev = { ...rawPrev, audioPath: prevCanonical } as TempoSongSummary;
+        const prevSha =
+          typeof rawPrev.audioSha256 === "string" && rawPrev.audioSha256.length > 0
+            ? rawPrev.audioSha256
+            : (rawPrev.audioSha256Sample ?? "");
+        const normalizedPrev = {
+          ...rawPrev,
+          audioPath: prevCanonical,
+          audioSha256: prevSha,
+          audioSha256Sample: prevSha,
+        } as TempoSongSummary;
         previousByPath.set(prevCanonical, normalizedPrev);
         previousByPath.set(rawPrev.audioPath, normalizedPrev);
         previousById.set(rawPrev.songId, normalizedPrev);
@@ -838,7 +862,13 @@ export class TempoWorkspaceStore {
         if (!isSupportedAudioFileName(entry.name)) continue;
         const candidatePath = join(workspaceDir, entry.name);
         const canonicalAudioPath = await realpath(candidatePath).catch(() => null);
-        if (!canonicalAudioPath || discoveredPaths.has(canonicalAudioPath)) continue;
+        if (
+          !canonicalAudioPath ||
+          !isSupportedAudioFileName(basename(canonicalAudioPath)) ||
+          discoveredPaths.has(canonicalAudioPath)
+        ) {
+          continue;
+        }
         const entryStat = await stat(canonicalAudioPath).catch(() => null);
         if (!entryStat?.isFile()) continue;
         discoveredPaths.add(canonicalAudioPath);
@@ -861,7 +891,13 @@ export class TempoWorkspaceStore {
       for (const rawPrev of existingManifest?.songs ?? []) {
         if (!isValidPersistedSummaryCandidate(rawPrev)) continue;
         const prevCanonical = await realpath(rawPrev.audioPath).catch(() => null);
-        if (!prevCanonical || discoveredPaths.has(prevCanonical)) continue;
+        if (
+          !prevCanonical ||
+          !isSupportedAudioFileName(basename(prevCanonical)) ||
+          discoveredPaths.has(prevCanonical)
+        ) {
+          continue;
+        }
         const insideWorkspace =
           prevCanonical.startsWith(`${workspaceDir}${sep}`) &&
           dirname(prevCanonical) === workspaceDir;
@@ -923,12 +959,12 @@ export class TempoWorkspaceStore {
     const songId = assertValidSongId(candidateId);
     const title = existing?.title ?? basename(fileName, extname(fileName));
 
+    const prevDigest = existing?.audioSha256 || existing?.audioSha256Sample || "";
     const fingerprintMismatch =
       existing !== undefined &&
-      typeof existing.audioSha256Sample === "string" &&
-      existing.audioSha256Sample.length > 0 &&
+      prevDigest.length > 0 &&
       (existing.audioSizeBytes !== fingerprint.audioSizeBytes ||
-        existing.audioSha256Sample !== fingerprint.audioSha256Sample);
+        prevDigest !== fingerprint.audioSha256);
 
     if (fingerprintMismatch) {
       await this.rotateSupersededTrace(stateDir, songId);
@@ -942,6 +978,7 @@ export class TempoWorkspaceStore {
       fileName,
       audioPath,
       audioSizeBytes: fingerprint.audioSizeBytes,
+      audioSha256: fingerprint.audioSha256,
       audioSha256Sample: fingerprint.audioSha256Sample,
       durationSec: validExisting?.durationSec ?? null,
       analyzed: validExisting?.analyzed ?? false,
@@ -958,7 +995,7 @@ export class TempoWorkspaceStore {
       join(stateDir, "traces", `${songId}.jsonl`),
     );
     if (!validExisting && !fingerprintMismatch && existsSync(tracePath)) {
-      const events = await this.traceWriter.read(tracePath);
+      const events = await this.traceWriter.read(tracePath, stateDir);
       if (events.length > 0) {
         const folded = foldTrace(events);
         return summarizeSongFromState(base, folded, undefined, base.updatedAtMs);
@@ -995,25 +1032,29 @@ export class TempoWorkspaceStore {
         err.name = "NotFoundError";
         throw err;
       }
+      if (!isSupportedAudioFileName(basename(canonicalAudio))) {
+        throw new DOMException("Unsupported audio target.", "NotAllowedError");
+      }
       const liveFp = await computeAudioFingerprint(canonicalAudio);
       await assertContainedInStateDir(stateDir, join(stateDir, "traces", `${songId}.jsonl`));
 
+      const prevDigest = current.audioSha256 || current.audioSha256Sample || "";
       const changed =
-        typeof current.audioSha256Sample === "string" &&
-        current.audioSha256Sample.length > 0 &&
-        (current.audioSizeBytes !== liveFp.audioSizeBytes ||
-          current.audioSha256Sample !== liveFp.audioSha256Sample);
+        prevDigest.length > 0 &&
+        (current.audioSizeBytes !== liveFp.audioSizeBytes || prevDigest !== liveFp.audioSha256);
 
       if (!changed) {
         if (
           current.audioPath !== canonicalAudio ||
           current.audioSizeBytes !== liveFp.audioSizeBytes ||
+          current.audioSha256 !== liveFp.audioSha256 ||
           current.audioSha256Sample !== liveFp.audioSha256Sample
         ) {
           const synced: TempoSongSummary = {
             ...current,
             audioPath: canonicalAudio,
             audioSizeBytes: liveFp.audioSizeBytes,
+            audioSha256: liveFp.audioSha256,
             audioSha256Sample: liveFp.audioSha256Sample,
           };
           this.manifest.songs[idx] = synced;
@@ -1028,6 +1069,7 @@ export class TempoWorkspaceStore {
         ...current,
         audioPath: canonicalAudio,
         audioSizeBytes: liveFp.audioSizeBytes,
+        audioSha256: liveFp.audioSha256,
         audioSha256Sample: liveFp.audioSha256Sample,
         durationSec: null,
         analyzed: false,
@@ -1083,7 +1125,7 @@ export class TempoWorkspaceStore {
           for (const name of names) {
             const subPath = join(dirCanonical, name);
             const subCanonical = await realpath(subPath).catch(() => null);
-            if (!subCanonical) continue;
+            if (!subCanonical || !isSupportedAudioFileName(basename(subCanonical))) continue;
             const subStat = await stat(subCanonical).catch(() => null);
             if (subStat?.isFile()) candidateFiles.push(subCanonical);
           }
@@ -1095,6 +1137,11 @@ export class TempoWorkspaceStore {
             );
           }
           const canonicalFile = await realpath(expanded);
+          if (!isSupportedAudioFileName(basename(canonicalFile))) {
+            throw new Error(
+              `Unsupported audio file "${basename(canonicalFile)}". Supported formats: ${SUPPORTED_AUDIO_EXTENSIONS.join(", ")}.`,
+            );
+          }
           const realStat = await stat(canonicalFile);
           if (!realStat.isFile()) {
             throw new Error("Audio source path is not a regular file.");
@@ -1278,6 +1325,19 @@ export class TempoWorkspaceStore {
       }
       return song;
     });
+  }
+
+  /**
+   * Read-only projection of `TempoSongSummary` from live `SessionState` without mutating
+   * `this.manifest` or writing `workspace.json` (used for side-effect-free `GET` endpoints).
+   */
+  projectSongSummary(
+    songId: string,
+    state: SessionState,
+    inboxSpans?: readonly Span[],
+  ): TempoSongSummary {
+    const current = this.getSong(songId);
+    return summarizeSongFromState(current, state, inboxSpans, current.updatedAtMs);
   }
 
   updateSongFromState(

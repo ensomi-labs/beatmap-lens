@@ -17,6 +17,7 @@ import {
   computeSpectrogram,
   createSpectrogramWorker,
   cropSamples,
+  hop,
   level,
   nearestFrame,
   rowBins,
@@ -197,6 +198,7 @@ interface SpecCoverage {
   buffer: AudioBuffer;
   startMs: number;
   endMs: number;
+  frameHop: number;
 }
 
 let worker: Worker | undefined;
@@ -214,15 +216,32 @@ function visibleTimeRangeMs(): { visStartMs: number; visEndMs: number } {
   return { visStartMs, visEndMs };
 }
 
+function desiredHopForSpanMs(spanMs: number): number {
+  if (spanMs <= SPEC_WINDOW_MS) return hop;
+  return hop * Math.max(2, Math.ceil(spanMs / SPEC_WINDOW_MS));
+}
+
 function isViewportCoveredBy(coverage: SpecCoverage | null): boolean {
   if (!coverage || coverage.buffer !== props.buffer) return false;
+  const { visStartMs, visEndMs } = visibleTimeRangeMs();
+  const visSpan = visEndMs - visStartMs;
+
+  // Must always cover the entire visible [visStartMs, visEndMs] span without any blank tail.
+  if (coverage.startMs > visStartMs || coverage.endMs < visEndMs) {
+    return false;
+  }
+
+  // Upgrade coarse wide-view spectrogram back to full resolution when zooming back in.
+  const targetHop = desiredHopForSpanMs(visSpan);
+  if (coverage.frameHop > targetHop) {
+    return false;
+  }
+
   if (coverage.startMs <= props.bounds.startMs && coverage.endMs >= props.bounds.endMs) {
     return true;
   }
-  const { visStartMs, visEndMs } = visibleTimeRangeMs();
-  const visSpan = visEndMs - visStartMs;
   if (visSpan >= SPEC_WINDOW_MS - 2 * SPEC_EDGE_MARGIN_MS) {
-    return visStartMs >= coverage.startMs && visStartMs < coverage.endMs - SPEC_EDGE_MARGIN_MS;
+    return true;
   }
   const leftMargin = coverage.startMs > props.bounds.startMs ? SPEC_EDGE_MARGIN_MS : 0;
   const rightMargin = coverage.endMs < props.bounds.endMs ? SPEC_EDGE_MARGIN_MS : 0;
@@ -231,25 +250,30 @@ function isViewportCoveredBy(coverage: SpecCoverage | null): boolean {
   );
 }
 
-function computeTargetSpecWindow(): { startMs: number; endMs: number } {
+function computeTargetSpecWindow(): { startMs: number; endMs: number; frameHop: number } {
   const totalSpanMs = props.bounds.endMs - props.bounds.startMs;
   if (totalSpanMs <= SPEC_WINDOW_MS) {
-    return { startMs: props.bounds.startMs, endMs: props.bounds.endMs };
+    return { startMs: props.bounds.startMs, endMs: props.bounds.endMs, frameHop: hop };
   }
   const { visStartMs, visEndMs } = visibleTimeRangeMs();
-  if (visEndMs - visStartMs >= SPEC_WINDOW_MS) {
-    const startMs = Math.max(
-      props.bounds.startMs,
-      Math.min(props.bounds.endMs - SPEC_WINDOW_MS, visStartMs),
-    );
-    return { startMs, endMs: startMs + SPEC_WINDOW_MS };
+  const visSpan = visEndMs - visStartMs;
+  if (visSpan > SPEC_WINDOW_MS) {
+    return {
+      startMs: visStartMs,
+      endMs: visEndMs,
+      frameHop: desiredHopForSpanMs(visSpan),
+    };
   }
   const centerMs = 0.5 * (visStartMs + visEndMs);
   const startMs = Math.max(
     props.bounds.startMs,
     Math.min(props.bounds.endMs - SPEC_WINDOW_MS, Math.round(centerMs - SPEC_WINDOW_MS / 2)),
   );
-  return { startMs, endMs: Math.min(props.bounds.endMs, startMs + SPEC_WINDOW_MS) };
+  return {
+    startMs,
+    endMs: Math.min(props.bounds.endMs, startMs + SPEC_WINDOW_MS),
+    frameHop: hop,
+  };
 }
 
 watch(
@@ -284,11 +308,11 @@ watch(
     }
 
     const targetBuffer = props.buffer;
-    const { startMs, endMs } = computeTargetSpecWindow();
+    const { startMs, endMs, frameHop } = computeTargetSpecWindow();
     const requestId = ++activeSpecRequestId;
-    inFlightSpecRange = { buffer: targetBuffer, startMs, endMs };
+    inFlightSpecRange = { buffer: targetBuffer, startMs, endMs, frameHop };
 
-    const crop = cropSamples(startMs, endMs, sampleRate.value, targetBuffer.length);
+    const crop = cropSamples(startMs, endMs, sampleRate.value, targetBuffer.length, frameHop);
     const request: SpectrogramWorkerRequest = {
       requestId,
       channels: channels.value.map((data) => data.slice(crop.start, crop.end)),
@@ -297,11 +321,12 @@ watch(
       sampleRate: sampleRate.value,
       startMs,
       endMs,
+      ...(frameHop !== hop ? { frameHop } : {}),
     };
 
     if (typeof Worker === "undefined") {
       const computedSpec = computeSpectrogram(request);
-      coveredSpecRange = { buffer: targetBuffer, startMs, endMs };
+      coveredSpecRange = { buffer: targetBuffer, startMs, endMs, frameHop };
       inFlightSpecRange = null;
       columnCache.clear();
       spectrogram.value = computedSpec;
@@ -313,7 +338,12 @@ watch(
       if (event.data.requestId !== activeSpecRequestId || props.buffer !== targetBuffer) {
         return;
       }
-      coveredSpecRange = { buffer: targetBuffer, startMs, endMs };
+      coveredSpecRange = {
+        buffer: targetBuffer,
+        startMs,
+        endMs,
+        frameHop: event.data.frameHop ?? frameHop,
+      };
       inFlightSpecRange = null;
       columnCache.clear();
       spectrogram.value = event.data;
@@ -512,11 +542,12 @@ function drawSpectrogram(context: CanvasRenderingContext2D) {
   const rows = Math.round(lane.height * dpr);
   if (!data || rows <= 0 || width <= 0) return;
   const binsForRows = rowBins(rows, data.sampleRate);
+  const dataHop = data.frameHop ?? hop;
   const image = context.createImageData(width, rows);
   const pixels = new Uint32Array(image.data.buffer);
   for (let x = 0; x < width; x++) {
     const timeMs = xToMs(props.view, (x + 0.5) / dpr);
-    const frame = nearestFrame(timeMs, data.sampleRate);
+    const frame = nearestFrame(timeMs, data.sampleRate, dataHop);
     const index = frame - data.firstFrame;
     if (index < 0 || index >= data.frameCount) continue;
     let column = columnCache.get(frame);

@@ -287,7 +287,9 @@ export function computeAuditionWindow(options: {
   if (
     !options.forwardBias &&
     options.activeRange &&
-    options.activeRange.t1 > options.activeRange.t0
+    options.activeRange.t1 > options.activeRange.t0 &&
+    options.playheadSec >= options.activeRange.t0 &&
+    options.playheadSec < options.activeRange.t1
   ) {
     const len = options.activeRange.t1 - options.activeRange.t0;
     if (len <= maxSpan) {
@@ -297,7 +299,13 @@ export function computeAuditionWindow(options: {
       return { t0, t1: Math.min(dur, Math.min(t0 + maxSpan, t1)) };
     }
   }
-  if (!options.forwardBias && options.looping && options.loopEndSec > options.loopStartSec) {
+  if (
+    !options.forwardBias &&
+    options.looping &&
+    options.loopEndSec > options.loopStartSec &&
+    options.playheadSec >= options.loopStartSec &&
+    options.playheadSec < options.loopEndSec
+  ) {
     const len = options.loopEndSec - options.loopStartSec;
     if (len <= maxSpan) {
       const pad = Math.min(4, (maxSpan - len) / 2);

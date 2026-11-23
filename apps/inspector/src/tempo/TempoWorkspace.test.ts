@@ -14,6 +14,7 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createApp, defineComponent, h, nextTick } from "vue";
 import type { TempoRecomputeResponse, TempoSongSessionPayload, TempoSongSummary } from "./client";
+import { computeAuditionWindow } from "./state";
 import TempoWorkspace from "./TempoWorkspace.vue";
 
 const engineSpy = vi.hoisted(() => ({
@@ -1120,7 +1121,12 @@ describe("TempoWorkspace interactive UI", () => {
       await vi.importActual<{ default: ReturnType<typeof defineComponent> }>("./TempoStage.vue")
     ).default;
 
-    const postedMessages: Array<{ requestId?: number; startMs: number; endMs: number }> = [];
+    const postedMessages: Array<{
+      requestId?: number;
+      startMs: number;
+      endMs: number;
+      frameHop?: number;
+    }> = [];
     const workerSpy = { onMessage: null as ((ev: MessageEvent) => void) | null };
     class MockSpecWorker {
       set onmessage(fn: ((ev: MessageEvent) => void) | null) {
@@ -1129,11 +1135,12 @@ describe("TempoWorkspace interactive UI", () => {
       get onmessage() {
         return workerSpy.onMessage;
       }
-      postMessage(msg: { requestId?: number; startMs: number; endMs: number }) {
+      postMessage(msg: { requestId?: number; startMs: number; endMs: number; frameHop?: number }) {
         postedMessages.push({
           ...(msg.requestId !== undefined ? { requestId: msg.requestId } : {}),
           startMs: msg.startMs,
           endMs: msg.endMs,
+          ...(msg.frameHop !== undefined ? { frameHop: msg.frameHop } : {}),
         });
       }
       terminate() {}
@@ -1255,9 +1262,191 @@ describe("TempoWorkspace interactive UI", () => {
       } as MessageEvent);
       await flushUi();
       expect(postedMessages).toHaveLength(3);
+
+      // Switch back to 12-min Song A zoomed all the way out to [0, 720_000 ms) (`msPerPx = 900` on 800px width):
+      // MUST cover the entire [0, 720_000 ms] visible span with adaptive frameHop (zero blank tail!)
+      rBuf.value = bufA;
+      rBounds.value = { startMs: 0, endMs: 720_000 };
+      rView.value = { startMs: 0, msPerPx: 900 };
+      await flushUi();
+      const wideMsg = postedMessages.at(-1) as {
+        requestId?: number;
+        startMs: number;
+        endMs: number;
+        frameHop?: number;
+      };
+      expect(wideMsg.startMs).toBe(0);
+      expect(wideMsg.endMs).toBe(720_000);
+      expect(wideMsg.frameHop).toBe(512);
     } finally {
       stageApp.unmount();
       stageHost.remove();
     }
+  });
+
+  it("[Stage 7] enforces audio-settled mutation gate, optimistic double-B dedupe, song-scoped nudge keys, recomputing reset, stale lastSeq drop, sequential Alt hold chain, X-Tempo-Workspace-Dir, and paused-seek Audition window", async () => {
+    // 1. Unit check on computeAuditionWindow when playheadSec lies outside activeRange [80, 90):
+    expect(
+      computeAuditionWindow({
+        durationSec: 180,
+        playheadSec: 5,
+        activeRange: { t0: 80, t1: 90 },
+        looping: false,
+        loopStartSec: 80,
+        loopEndSec: 90,
+      }),
+    ).toEqual({ t0: 0, t1: 60 });
+
+    const seenWorkspaceHeaders: string[] = [];
+    let releaseAudioSong2: (() => void) | null = null;
+    let delaySong1Nudge: (() => void) | null = null;
+    let releaseHoldTrue: (() => void) | null = null;
+    let delayFirstPlaceBeat: (() => void) | null = null;
+
+    const baseFetch = globalThis.fetch;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const rawUrl = typeof input === "string" ? input : input.toString();
+        const url = new URL(rawUrl, "http://127.0.0.1");
+        const headersObj = (init?.headers ?? {}) as Record<string, string>;
+        const wsHdr = headersObj["X-Tempo-Workspace-Dir"] ?? headersObj["x-tempo-workspace-dir"];
+        if (wsHdr) {
+          seenWorkspaceHeaders.push(`${init?.method ?? "GET"} ${url.pathname} -> ${wsHdr}`);
+        }
+
+        if (url.pathname === "/api/tempo/songs/02-hyper-vivacity-e5f60718/audio") {
+          await new Promise<void>((r) => {
+            releaseAudioSong2 = r;
+          });
+        }
+        if (
+          url.pathname === "/api/tempo/songs/01-campanella-a1b2c3d4/recompute" &&
+          init?.method === "POST"
+        ) {
+          // Stall recompute until aborted on song switch
+          await new Promise<void>((_resolve, reject) => {
+            init.signal?.addEventListener("abort", () =>
+              reject(new DOMException("Aborted", "AbortError")),
+            );
+          });
+        }
+        if (
+          url.pathname === "/api/tempo/songs/01-campanella-a1b2c3d4/hold-offers" &&
+          typeof init?.body === "string" &&
+          init.body.includes('"hold":true')
+        ) {
+          const song1 = requireSong("01-campanella-a1b2c3d4");
+          // Capture stale snapshot BEFORE hold:true resolves so we can verify stale lastSeq drop & sequential hold:false!
+          const staleSnapshot = buildPayload(song1);
+          await new Promise<void>((r) => {
+            releaseHoldTrue = r;
+          });
+          song1.holdCalls.push(true);
+          song1.controller.setHoldOffers(true);
+          return new Response(
+            JSON.stringify({
+              ...staleSnapshot,
+              hold: true,
+              flushed: false,
+              offers: [],
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          );
+        }
+        if (
+          url.pathname === "/api/tempo/songs/01-campanella-a1b2c3d4/edit" &&
+          typeof init?.body === "string"
+        ) {
+          if (init.body.includes('"upsert_beat"') && !delayFirstPlaceBeat) {
+            await new Promise<void>((r) => {
+              delayFirstPlaceBeat = r;
+            });
+          } else if (init.body.includes('"b-s14-01"') && !delaySong1Nudge) {
+            await new Promise<void>((r) => {
+              delaySong1Nudge = r;
+            });
+          }
+        }
+        return await baseFetch(input, init);
+      }),
+    );
+
+    await mountWorkspace();
+    const song1 = requireSong("01-campanella-a1b2c3d4");
+    const song2 = requireSong("02-hyper-vivacity-e5f60718");
+
+    // Verify X-Tempo-Workspace-Dir header was sent on openSong!
+    expect(seenWorkspaceHeaders.some((h) => h.includes("%2Fmusic%2Fhard-songs"))).toBe(true);
+
+    // 2. Rapid double-B press at 6.2500s and 6.2503s while first POST .../edit is still in flight:
+    //    reuses the exact same optimistic beat ID instead of inserting two distinct beats!
+    const initialBeatCount = song1.controller.getState().beats.size;
+    stageHook.emit?.("hover-time", 6250.0);
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "b" }));
+    stageHook.emit?.("hover-time", 6250.3);
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "b" }));
+    await nextTick();
+    (delayFirstPlaceBeat as (() => void) | null)?.();
+    await flushUi();
+    expect(song1.controller.getState().beats.size).toBe(initialBeatCount + 1);
+
+    // 3. Sequential Alt hold-offers chain + stale lastSeq response drop:
+    //    Press Alt (stalled on hold:true), release Alt immediately, AND perform an edit advancing lastSeq!
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "Alt" }));
+    window.dispatchEvent(new KeyboardEvent("keyup", { key: "Alt" }));
+    stageHook.emit?.("hover-time", 7200.0);
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "b" }));
+    await flushUi();
+    // Before releaseHoldTrue, holdCalls must NOT have executed hold:false ahead of hold:true!
+    expect(song1.holdCalls).toEqual([]);
+    (releaseHoldTrue as (() => void) | null)?.();
+    await flushUi();
+    // Strict sequential order [true, false], AND stale hold:true payload did NOT clobber the newer beat at 7.2s!
+    expect(song1.holdCalls).toEqual([true, false]);
+    expect(
+      ((stageHook.props.beats ?? []) as Array<{ timeSec: number }>).some(
+        (b) => Math.abs(b.timeSec - 7.2) < 1e-4,
+      ),
+    ).toBe(true);
+
+    // 4. Start in-flight recompute AND delayed nudge on Song 1's `b-s14-01`, then switch to Song 2!
+    stageHook.emit?.("select", { kind: "beat", id: "b-s14-01" });
+    await flushUi();
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight" }));
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "k", metaKey: true }));
+    await nextTick();
+
+    const songRows = container.querySelectorAll("#tempo-songs .tempo-list-row");
+    (songRows[1] as HTMLButtonElement).click();
+    await flushUi();
+
+    // Song 2 `/open` resolved, while `/audio` is still paused:
+    //  a) `recomputing` was reset immediately (Recompute button wouldn't stay stuck once audio settles),
+    //  b) While `/audio` is unsettled, pressing `B` MUST be gated (zero premature beats on Song 2)!
+    stageHook.emit?.("hover-time", 4500);
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "b" }));
+    await flushUi();
+    expect(
+      Array.from(song2.controller.getState().beats.values()).some(
+        (b) => Math.abs(b.timeSec - 4.5) < 1e-3,
+      ),
+    ).toBe(false);
+
+    // Settle Song 2 audio AND release Song 1's delayed nudge drain while nudging Song 2's same ID `b-s14-01`!
+    (releaseAudioSong2 as (() => void) | null)?.();
+    await flushUi();
+
+    const recomputeBtn = Array.from(container.querySelectorAll(".stage-toolbar button")).find((b) =>
+      b.textContent?.includes("Recompute"),
+    ) as HTMLButtonElement | undefined;
+    expect(recomputeBtn?.disabled).toBe(false);
+
+    stageHook.emit?.("select", { kind: "beat", id: "b-s14-01" });
+    await flushUi();
+    (delaySong1Nudge as (() => void) | null)?.();
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight" }));
+    await flushUi();
+    expect(song2.controller.getState().beats.get("b-s14-01")?.timeSec).toBeCloseTo(1.001, 4);
   });
 });

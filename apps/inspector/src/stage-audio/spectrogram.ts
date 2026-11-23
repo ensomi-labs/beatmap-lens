@@ -23,6 +23,8 @@ export interface Spectrogram {
   bins: number;
   /** `frameCount * bins` power in dB, frame-major. */
   db: Float32Array;
+  /** STFT hop in samples (`256` by default; adaptive multiple on wide `> 10 min` viewports). */
+  frameHop?: number;
 }
 
 export interface SpectrogramInput {
@@ -32,6 +34,7 @@ export interface SpectrogramInput {
   sampleRate: number;
   startMs: number;
   endMs: number;
+  frameHop?: number;
 }
 
 export interface SpectrogramWorkerRequest extends SpectrogramInput {
@@ -42,12 +45,12 @@ export interface SpectrogramWorkerResponse extends Spectrogram {
   requestId?: number;
 }
 
-export function frameCentreMs(frame: number, sampleRate: number): number {
-  return (frame * hop * 1000) / sampleRate;
+export function frameCentreMs(frame: number, sampleRate: number, frameHop = hop): number {
+  return (frame * frameHop * 1000) / sampleRate;
 }
 
-export function nearestFrame(timeMs: number, sampleRate: number): number {
-  return Math.round((timeMs * sampleRate) / 1000 / hop);
+export function nearestFrame(timeMs: number, sampleRate: number, frameHop = hop): number {
+  return Math.round((timeMs * sampleRate) / 1000 / frameHop);
 }
 
 /**
@@ -59,14 +62,15 @@ export function cropSamples(
   endMs: number,
   sampleRate: number,
   totalFrames: number,
+  frameHop = hop,
 ) {
-  const firstFrame = nearestFrame(startMs, sampleRate);
-  const lastFrame = nearestFrame(endMs, sampleRate);
+  const firstFrame = nearestFrame(startMs, sampleRate, frameHop);
+  const lastFrame = nearestFrame(endMs, sampleRate, frameHop);
   return {
     firstFrame,
     frameCount: Math.max(0, lastFrame - firstFrame + 1),
-    start: Math.max(0, firstFrame * hop - fftSize / 2),
-    end: Math.min(totalFrames, lastFrame * hop + fftSize / 2),
+    start: Math.max(0, firstFrame * frameHop - fftSize / 2),
+    end: Math.min(totalFrames, lastFrame * frameHop + fftSize / 2),
   };
 }
 
@@ -81,13 +85,19 @@ export function computeSpectrogram(input: {
   sampleRate: number;
   startMs: number;
   endMs: number;
+  frameHop?: number;
 }): Spectrogram {
   const { channels, sliceStart, totalFrames, sampleRate } = input;
+  const effectiveHop =
+    typeof input.frameHop === "number" && Number.isInteger(input.frameHop) && input.frameHop > 0
+      ? input.frameHop
+      : hop;
   const { firstFrame, frameCount } = cropSamples(
     input.startMs,
     input.endMs,
     sampleRate,
     totalFrames,
+    effectiveHop,
   );
   const bins = fftSize / 2 + 1;
   const db = new Float32Array(frameCount * bins);
@@ -99,7 +109,7 @@ export function computeSpectrogram(input: {
   // A full-scale sine peaks at fftSize / 4 under a Hann window.
   const reference = 20 * Math.log10(fftSize / 4);
   for (let index = 0; index < frameCount; index++) {
-    const origin = (firstFrame + index) * hop - fftSize / 2;
+    const origin = (firstFrame + index) * effectiveHop - fftSize / 2;
     power.fill(0);
     for (const data of channels) {
       for (let n = 0; n < fftSize; n++) {
@@ -120,7 +130,14 @@ export function computeSpectrogram(input: {
       db[row + bin] = 10 * Math.log10(mean + 1e-20) - reference;
     }
   }
-  return { sampleRate, firstFrame, frameCount, bins, db };
+  return {
+    sampleRate,
+    firstFrame,
+    frameCount,
+    bins,
+    db,
+    ...(effectiveHop !== hop ? { frameHop: effectiveHop } : {}),
+  };
 }
 
 /** Periodic Hann: peak exactly at index `size / 2`, the frame's centre sample. */
