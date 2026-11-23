@@ -9,6 +9,7 @@ areas = [
     for area in (
         repo / 'harness',
         repo / 'apps' / 'inspector' / 'server',
+        repo / 'apps' / 'inspector' / 'server' / 'tempo',
         *(repo / 'annotation' / name for name in ('pipeline', 'evaluation', 'learning', 'release')),
     )
     if (area / 'tests').is_dir()
