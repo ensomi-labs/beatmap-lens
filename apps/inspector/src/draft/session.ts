@@ -190,7 +190,8 @@ export class DraftSession {
     reason?: string,
     author: TraceAuthor = { kind: "user" },
   ): TraceEvent | undefined {
-    if (!this.state.offers.has(offerId)) return undefined;
+    const offer = this.state.offers.get(offerId);
+    if (offer?.status !== "pending") return undefined;
     return this.commit("offer_reject", { offerId, ...(reason ? { reason } : {}) }, author);
   }
 

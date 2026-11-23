@@ -44,6 +44,8 @@ export interface RecomputeRequest {
   sounds: SoundAnchor[];
   statements: Statement[];
   suppressions?: RejectionSuppression[];
+  /** Current entity revision tokens (`seq:eventId`) from SessionState for stale-offer protection. */
+  entityRevisions?: Record<string, string>;
   /** Existing offer IDs in the session so newly generated offer/batch IDs never collide across reloads. */
   existingOfferIds?: string[];
 }
@@ -137,6 +139,11 @@ function buildSnapshotState(request: RecomputeRequest): SessionState {
   for (const boundary of request.boundaries) state.boundaries.set(boundary.id, boundary);
   for (const sound of request.sounds) state.sounds.set(sound.id, sound);
   for (const statement of request.statements) state.statements.set(statement.id, statement);
+  if (request.entityRevisions) {
+    for (const [id, rev] of Object.entries(request.entityRevisions)) {
+      state.entityRevisions.set(id, rev);
+    }
+  }
   state.suppressions = [...(request.suppressions ?? [])];
   return state;
 }
@@ -145,6 +152,22 @@ function expectedVersionsFor(beats: readonly Beat[]): Record<string, number> {
   const versions: Record<string, number> = {};
   for (const beat of beats) versions[beat.id] = beat.version;
   return versions;
+}
+
+function expectedRevisionsFor(
+  beats: readonly Beat[],
+  state: SessionState,
+): Record<string, string> | undefined {
+  const revisions: Record<string, string> = {};
+  let count = 0;
+  for (const beat of beats) {
+    const rev = state.entityRevisions.get(beat.id);
+    if (rev !== undefined) {
+      revisions[beat.id] = rev;
+      count += 1;
+    }
+  }
+  return count > 0 ? revisions : undefined;
 }
 
 /**
@@ -242,13 +265,19 @@ function steadyRefits(
     const moved: Beat[] = [];
     const upsertBeats: BeatInput[] = [];
     beats.forEach((beat, k) => {
-      const t = intercept + slope * k;
+      const t = Math.max(0, intercept + slope * k);
       if (Math.abs(t - beat.t) > 0.0005) {
         moved.push(beat);
         upsertBeats.push({ ...beat, t, source: "rule" });
       }
     });
     if (!upsertBeats.length) return [];
+    const touchedTimes = [...moved.map((beat) => beat.t), ...upsertBeats.map((beat) => beat.t)];
+    const writeScope: Span = {
+      t0: Math.min(span.t0, ...touchedTimes),
+      t1: Math.max(span.t1, Math.max(...touchedTimes) + 0.001),
+    };
+    const expectedRevisions = expectedRevisionsFor(moved, state);
     return [
       {
         groupKey: `steady-${statement.id}`,
@@ -256,11 +285,12 @@ function steadyRefits(
         scopeKind: "local",
         summary: `Steady refit at ${(60 / slope).toFixed(2)} BPM`,
         readScope: span,
-        writeScope: span,
+        writeScope,
         ops: {
           upsertBeats,
           expectedVersions: expectedVersionsFor(moved),
-          expectedRangeEntityIds: getRangeEntityIds(state, span),
+          ...(expectedRevisions ? { expectedRevisions } : {}),
+          expectedRangeEntityIds: getRangeEntityIds(state, writeScope),
         },
       },
     ];
@@ -322,7 +352,7 @@ function quickFix(request: RecomputeRequest, state: SessionState, _ids: IdAlloca
     const nearest = [strong[at - 1], strong[at]]
       .filter((t): t is number => t !== undefined)
       .sort((a, b) => Math.abs(a - beat.t) - Math.abs(b - beat.t))[0];
-    if (nearest === undefined) continue;
+    if (nearest === undefined || !spanContainsTime(request.span, nearest)) continue;
     const distance = Math.abs(nearest - beat.t);
     if (distance > 0.003 && distance <= 0.035) {
       moved.push(beat);
@@ -330,6 +360,7 @@ function quickFix(request: RecomputeRequest, state: SessionState, _ids: IdAlloca
     }
   }
   if (!upsertBeats.length) return [];
+  const expectedRevisions = expectedRevisionsFor(moved, state);
   return [
     {
       groupKey: "quick_fix",
@@ -341,6 +372,7 @@ function quickFix(request: RecomputeRequest, state: SessionState, _ids: IdAlloca
       ops: {
         upsertBeats,
         expectedVersions: expectedVersionsFor(moved),
+        ...(expectedRevisions ? { expectedRevisions } : {}),
         expectedRangeEntityIds: getRangeEntityIds(state, request.span),
       },
     },
@@ -385,6 +417,7 @@ function alternatives(
   const resetT0 = Math.max(request.span.t0, Math.min(...touchedTimes) - 0.0005);
   const resetT1 = Math.min(upperBound, Math.max(...touchedTimes) + 0.0005);
   const resetSpan: Span = { t0: resetT0, t1: Math.max(resetT0, resetT1) };
+  const resetRevisions = expectedRevisionsFor(shiftedBeats, state);
   const resetOps: PatchOp = {
     upsertBoundaries: [
       { id: ids.mint(`r-${ids.stem}`), t: first.t, kind: "reset", source: "rule", version: 1 },
@@ -395,6 +428,7 @@ function alternatives(
       source: "rule",
     })),
     expectedVersions: expectedVersionsFor(shiftedBeats),
+    ...(resetRevisions ? { expectedRevisions: resetRevisions } : {}),
     expectedRangeEntityIds: getRangeEntityIds(state, resetSpan),
   };
 
@@ -416,6 +450,8 @@ function alternatives(
     }
   }
   const freeMovedList = [...freeMoves.values()];
+  const freeMovedBeats = freeMovedList.map(({ beat }) => beat);
+  const freeRevisions = expectedRevisionsFor(freeMovedBeats, state);
   const freeOps: PatchOp = {
     upsertBoundaries: [
       {
@@ -427,7 +463,8 @@ function alternatives(
       },
     ],
     upsertBeats: freeMovedList.map(({ beat, t }) => ({ ...beat, t, source: "rule" })),
-    expectedVersions: expectedVersionsFor(freeMovedList.map(({ beat }) => beat)),
+    expectedVersions: expectedVersionsFor(freeMovedBeats),
+    ...(freeRevisions ? { expectedRevisions: freeRevisions } : {}),
     expectedRangeEntityIds: getRangeEntityIds(state, request.span),
   };
 

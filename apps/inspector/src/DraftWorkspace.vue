@@ -163,7 +163,7 @@ const audioReady = ref(false);
 const pcm = shallowRef<Float32Array[] | null>(null);
 const playing = ref(false);
 const looping = ref(false);
-const loopSpan = ref<Span | null>(null);
+const loopSpan = shallowRef<Span | null>(null);
 const clicksOn = ref(true);
 const flamSlot = ref<number | null>(null);
 
@@ -359,7 +359,7 @@ async function openTrace() {
 
 // ---------------------------------------------------------------- view
 
-const view = ref<TimeWindow>({ startS: 0, endS: 10 });
+const view = shallowRef<TimeWindow>({ startS: 0, endS: 10 });
 const stageWidth = ref(1000);
 const stageWrap = ref<HTMLElement | null>(null);
 const duration = computed(() => draftAudio.value?.durationS ?? 0);
@@ -420,13 +420,13 @@ onMounted(() => {
 const selectedBeatId = ref<string | null>(null);
 const selectedSoundId = ref<string | null>(null);
 const selectedStatementId = ref<string | null>(null);
-const selection = ref<Span | null>(null);
+const selection = shallowRef<Span | null>(null);
 /** The selection is a run picked on the ruler; arrows then shift its offset. */
 const runSelected = ref(false);
 const cursorS = ref(0);
 /** Transient previews: drawn at once, committed as one edit on release or after a settle. */
-const preview = ref<{ beatId: string; t: number } | null>(null);
-const runShift = ref<{ span: Span; dt: number } | null>(null);
+const preview = shallowRef<{ beatId: string; t: number } | null>(null);
+const runShift = shallowRef<{ span: Span; dt: number } | null>(null);
 let settleTimer: ReturnType<typeof setTimeout> | undefined;
 const settleMs = 400;
 
@@ -722,6 +722,7 @@ async function requestOffer() {
           sounds: sounds.value,
           statements: statements.value,
           suppressions: state.value.suppressions,
+          entityRevisions: Object.fromEntries(state.value.entityRevisions),
           existingOfferIds: [...state.value.offers.keys()],
         },
       },

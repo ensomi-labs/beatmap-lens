@@ -367,6 +367,70 @@ describe("DraftSession", () => {
     }
     expect(session.state.beats.get("b2")?.t).toBe(1);
   });
+
+  it("blocks stale offer acceptance via expectedRevisions after retract + re-edit, and ignores reject on non-pending offers", async () => {
+    const session = new DraftSession();
+    session.initDraft(demoAudio(), { beats: grid(6), sounds: [sound("a", 1.02)] }, demoProviders);
+    // Edit b2 from 1.0 -> 1.005 (version 2)
+    session.applyEdit({ op: "move_beat", id: "b2", t: 1.005, source: "user" });
+    const revBefore = session.state.entityRevisions.get("b2");
+    expect(revBefore).toBeDefined();
+
+    const offers = await ruleMockRecompute({
+      generation: 1,
+      basisSeq: session.state.lastSeq,
+      span: { t0: 0, t1: 4 },
+      durationS: 10,
+      beats: sortedEntities(session.state.beats),
+      boundaries: [],
+      sounds: sortedEntities(session.state.sounds),
+      statements: [],
+      suppressions: session.state.suppressions,
+      entityRevisions: Object.fromEntries(session.state.entityRevisions),
+    });
+    const quick = offers.find((o) => o.role === "quick_fix");
+    expect(quick).toBeDefined();
+    expect(quick?.ops.expectedRevisions?.b2).toBe(revBefore);
+    session.recordOfferBatch(offers);
+
+    // Undo (retract) the edit and re-edit b2 to a different time -> version is 2 again, but revision changed!
+    session.undo();
+    session.applyEdit({ op: "move_beat", id: "b2", t: 0.995, source: "user" });
+    expect(session.state.beats.get("b2")?.version).toBe(2);
+    expect(session.state.entityRevisions.get("b2")).not.toBe(revBefore);
+
+    const offerId = quick?.id ?? "";
+    expect(session.state.offers.get(offerId)?.status).toBe("stale");
+    const blocked = session.acceptOffer(offerId);
+    expect(blocked.ok).toBe(false);
+    if (!blocked.ok) {
+      expect(blocked.conflicts.map((c) => c.kind)).toContain("version_mismatch");
+    }
+    // Stale (non-pending) offer cannot be rejected.
+    expect(session.rejectOffer(offerId)).toBeUndefined();
+
+    // Fresh pending offer can be rejected once; a second reject returns undefined.
+    const freshOffers = await ruleMockRecompute({
+      generation: 2,
+      basisSeq: session.state.lastSeq,
+      span: { t0: 0, t1: 4 },
+      durationS: 10,
+      beats: sortedEntities(session.state.beats),
+      boundaries: [],
+      sounds: sortedEntities(session.state.sounds),
+      statements: [],
+      suppressions: session.state.suppressions,
+      entityRevisions: Object.fromEntries(session.state.entityRevisions),
+      existingOfferIds: [...session.state.offers.keys()],
+    });
+    const freshQuick = freshOffers.find((o) => o.role === "quick_fix");
+    expect(freshQuick).toBeDefined();
+    session.recordOfferBatch(freshOffers);
+    const freshId = freshQuick?.id ?? "";
+    expect(session.rejectOffer(freshId)).toBeDefined();
+    expect(session.state.offers.get(freshId)?.status).toBe("rejected");
+    expect(session.rejectOffer(freshId)).toBeUndefined();
+  });
 });
 
 describe("computeGridFit (ensomi with calibrated Draft defaults)", () => {
@@ -400,6 +464,19 @@ describe("computeGridFit (ensomi with calibrated Draft defaults)", () => {
       DRAFT_GRID_FIT_OPTIONS,
     );
     expect(fits[0]?.status).toBe("unexplained");
+  });
+
+  it("reports signed residualMs (negative early, positive late, Infinity for 0 beats)", () => {
+    const fits = computeGridFit(
+      [sound("early", 0.495), sound("late", 0.505)],
+      grid(3),
+      [],
+      DRAFT_GRID_FIT_OPTIONS,
+    );
+    expect(fits[0]?.residualMs).toBeCloseTo(-5, 4);
+    expect(fits[1]?.residualMs).toBeCloseTo(5, 4);
+    const noBeats = computeGridFit([sound("alone", 1.0)], [], [], DRAFT_GRID_FIT_OPTIONS);
+    expect(noBeats[0]?.residualMs).toBe(Number.POSITIVE_INFINITY);
   });
 });
 
@@ -662,6 +739,45 @@ describe("RuleMockRecompute", () => {
     for (const upserted of resetDistant?.ops.upsertBeats ?? []) {
       expect(upserted.t).toBeLessThan(4);
     }
+  });
+
+  it("keeps steadyRefits and quickFix entity positions inside writeScope so offers accept cleanly", async () => {
+    // Beat b2 at 1.0 sits right on statement.span.t0; shifting b5 early pulls fitted b2 below 1.0.
+    // Sound s_out at 0.99 is 10 ms from b2 but outside request.span [1.0, 4.0).
+    const session = new DraftSession();
+    const beats = grid(8).map((entry, k) => (k === 5 ? { ...entry, t: entry.t - 0.02 } : entry));
+    session.initDraft(
+      demoAudio(),
+      { beats, sounds: [sound("s_out", 0.99, 1.0), sound("s_in", 2.012, 1.0)] },
+      demoProviders,
+    );
+    session.upsertStatement({ id: "st_edge", kind: "steady", span: { t0: 1.0, t1: 4.0 } });
+
+    const offers = await ruleMockRecompute({
+      generation: 1,
+      basisSeq: session.state.lastSeq,
+      span: { t0: 1.0, t1: 4.0 },
+      durationS: 10,
+      beats: sortedEntities(session.state.beats),
+      boundaries: [],
+      sounds: sortedEntities(session.state.sounds),
+      statements: [...session.state.statements.values()],
+      suppressions: [],
+      entityRevisions: Object.fromEntries(session.state.entityRevisions),
+    });
+
+    const rewrite = offers.find((o) => o.role === "rewrite");
+    expect(rewrite).toBeDefined();
+    expect(rewrite?.conflicts).toEqual([]);
+
+    const quick = offers.find((o) => o.role === "quick_fix");
+    expect(quick).toBeDefined();
+    expect(quick?.conflicts).toEqual([]);
+    // Must snap b4 -> 2.012 (inside span), NOT b2 -> 0.99 (outside span)
+    expect(quick?.ops.upsertBeats?.map((b) => b.id)).toEqual(["b4"]);
+
+    session.recordOfferBatch(offers);
+    expect(session.acceptOffer(rewrite?.id ?? "").ok).toBe(true);
   });
 });
 
