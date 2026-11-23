@@ -3162,9 +3162,10 @@ fieldset.toolbar-group,
   color: var(--warning);
 }
 
-/* Below 1240 px a view's bar keeps its identity, flags and hint, and drops the range (also in
-   the list beside it) and the word before the number. */
+/* Below 1240 px the toolbar drops optional items, a view's bar keeps its identity, flags and hint
+   while dropping the range and the word before the number, and the status bar drops optional facts. */
 @media (max-width: 1240px) {
+  .toolbar-optional,
   .status-optional,
   .stage-toolbar .toolbar-label,
   .stage-identity .data,

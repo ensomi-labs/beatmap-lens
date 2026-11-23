@@ -1,31 +1,32 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, shallowRef, watch } from "vue";
-import type { Mark } from "./timing/contracts";
-import type { PlayheadMotion } from "./timing/display";
-import { nearestSample } from "./timing/format";
-import { marksWithin, type SelectMode } from "./timing/marks";
-import { proposalColour } from "./timing/palette";
-import { PlayheadLayer } from "./timing/playhead-layer";
+import type { PlayheadMotion } from "./stage-audio/display";
+import { PlayheadLayer } from "./stage-audio/playhead-layer";
 import {
   computeSpectrogram,
+  createSpectrogramWorker,
   cropSamples,
   level,
   nearestFrame,
   rowBins,
   type Spectrogram,
-} from "./timing/spectrogram";
+} from "./stage-audio/spectrogram";
 import {
   formatSourceTime,
   lineLeft,
   msDecimals,
   msToX,
+  nearestSample,
   type TimeRange,
   type TimeView,
   tickStepMs,
   ticks,
   xToMs,
-} from "./timing/time-view";
-import { lowerBound, peak } from "./timing/waveform";
+} from "./stage-audio/time-view";
+import { lowerBound, peak } from "./stage-audio/waveform";
+import type { Mark } from "./timing/contracts";
+import { marksWithin, type SelectMode } from "./timing/marks";
+import { proposalColour } from "./timing/palette";
 
 export interface StageProposal {
   key: string;
@@ -193,9 +194,7 @@ watch(
       spectrogram.value = computeSpectrogram(input);
       return;
     }
-    worker ??= new Worker(new URL("./timing/spectrogram.worker.ts", import.meta.url), {
-      type: "module",
-    });
+    worker ??= createSpectrogramWorker();
     worker.onmessage = (event: MessageEvent<Spectrogram>) => {
       if (request === generation) spectrogram.value = event.data;
     };

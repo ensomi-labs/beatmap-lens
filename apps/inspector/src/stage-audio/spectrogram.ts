@@ -180,3 +180,10 @@ export function rowBins(rows: number, sampleRate: number): { lo: number; hi: num
 export function level(db: number): number {
   return Math.min(1, Math.max(0, (db - (ceilingDb - rangeDb)) / rangeDb));
 }
+
+/** Spawns the module Web Worker that computes spectrograms off the main thread. */
+export function createSpectrogramWorker(): Worker {
+  return new Worker(new URL("./spectrogram.worker.ts", import.meta.url), {
+    type: "module",
+  });
+}

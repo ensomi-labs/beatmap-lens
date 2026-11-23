@@ -344,3 +344,5 @@ export class TimingAudioEngine {
     return buffer;
   }
 }
+
+export { TimingAudioEngine as StageAudioEngine };

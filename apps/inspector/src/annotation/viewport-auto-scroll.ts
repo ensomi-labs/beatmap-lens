@@ -1,4 +1,10 @@
-export const viewportAutoScrollEdgeZonePx = 40;
+import {
+  axisEdgePenetration,
+  edgeAutoScrollZonePx,
+  quadraticEdgeVelocity,
+} from "../stage-audio/edge-auto-scroll";
+
+export const viewportAutoScrollEdgeZonePx = edgeAutoScrollZonePx;
 
 export type ViewportAutoScrollEdge = "top" | "bottom";
 
@@ -56,21 +62,18 @@ export function viewportPointerY(options: ViewportPointerYOptions): ViewportPoin
 export function viewportEdgePenetration(
   options: ViewportEdgePenetrationOptions,
 ): ViewportEdgePenetration | undefined {
-  const edgeZonePx = options.edgeZonePx ?? viewportAutoScrollEdgeZonePx;
-  const topPenetrationPx = clamp(edgeZonePx - (options.clientY - options.rect.top), 0, edgeZonePx);
-  const bottomPenetrationPx = clamp(
-    edgeZonePx - (options.rect.bottom - options.clientY),
-    0,
-    edgeZonePx,
-  );
-  const penetrationPx = Math.max(topPenetrationPx, bottomPenetrationPx);
-
-  if (penetrationPx === 0) return undefined;
+  const hit = axisEdgePenetration({
+    coordinatePx: options.clientY,
+    startPx: options.rect.top,
+    endPx: options.rect.bottom,
+    ...(options.edgeZonePx !== undefined ? { edgeZonePx: options.edgeZonePx } : {}),
+  });
+  if (!hit) return undefined;
 
   return {
-    edge: topPenetrationPx >= bottomPenetrationPx ? "top" : "bottom",
-    penetrationPx,
-    penetrationRatio: penetrationPx / edgeZonePx,
+    edge: hit.side === "start" ? "top" : "bottom",
+    penetrationPx: hit.penetrationPx,
+    penetrationRatio: hit.penetrationRatio,
   };
 }
 
@@ -81,7 +84,7 @@ export function viewportAutoScrollVelocityMsPerSecond(
   if (!penetration) return 0;
 
   const direction = penetration.edge === "top" ? 1 : -1;
-  return direction * penetration.penetrationRatio ** 2 * viewportDurationMs;
+  return direction * quadraticEdgeVelocity(penetration.penetrationRatio, viewportDurationMs);
 }
 
 export function advanceViewportAutoScroll(

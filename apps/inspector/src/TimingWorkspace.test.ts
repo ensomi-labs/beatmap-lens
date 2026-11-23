@@ -1,6 +1,7 @@
 // @vitest-environment happy-dom
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { createApp, defineComponent, h, nextTick } from "vue";
+import type { PlayheadMotion } from "./stage-audio/display";
 import TimingWorkspace from "./TimingWorkspace.vue";
 import { timingJson, timingRequest } from "./timing/client";
 import {
@@ -9,10 +10,9 @@ import {
   type OpenTiming,
   staleSessionError,
 } from "./timing/contracts";
-import type { PlayheadMotion } from "./timing/display";
 
 vi.mock("./timing/client", () => ({ timingJson: vi.fn(), timingRequest: vi.fn() }));
-const { motionAt } = await vi.hoisted(() => import("./timing/display"));
+const { motionAt } = await vi.hoisted(() => import("./stage-audio/display"));
 const engine = vi.hoisted(() => ({
   plays: 0,
   /** Where each play was asked to start, pre-roll included. */
@@ -29,7 +29,7 @@ const engine = vi.hoisted(() => ({
   clickVolumes: [] as number[],
   instance: undefined as { onEnded: ((positionMs: number) => void) | undefined } | undefined,
 }));
-vi.mock("./timing/audio-engine", () => ({
+vi.mock("./stage-audio/audio-engine", () => ({
   TimingAudioEngine: class {
     readonly sampleRate: number;
     playing = false;

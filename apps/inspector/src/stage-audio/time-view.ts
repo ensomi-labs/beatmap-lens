@@ -129,3 +129,8 @@ export function formatSourceTime(timeMs: number, msDigits = 0): string {
     ms,
   ).padStart(3, "0")}${fraction ?? ""}`;
 }
+
+/** Nearest sample index of a source time; `timeMs` stays canonical. */
+export function nearestSample(timeMs: number, sampleRate: number): number {
+  return Math.floor((timeMs * sampleRate) / 1000 + 0.5);
+}

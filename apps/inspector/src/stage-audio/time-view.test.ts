@@ -6,6 +6,7 @@ import {
   lineLeft,
   msDecimals,
   msToX,
+  nearestSample,
   placeAt,
   tickStepMs,
   ticks,
@@ -110,5 +111,12 @@ describe("ruler", () => {
     expect(formatSourceTime(76_482.3, 1)).toBe("01:16.4823");
     expect(formatSourceTime(59_999.9996)).toBe("01:00.000");
     expect(formatSourceTime(0)).toBe("00:00.000");
+  });
+
+  it("derives the nearest sample index without rounding canonical source time", () => {
+    expect(nearestSample(0, 44_100)).toBe(0);
+    expect(nearestSample(1_000, 48_000)).toBe(48_000);
+    expect(nearestSample(10.5 / 48, 48_000)).toBe(11);
+    expect(nearestSample(10.49 / 48, 48_000)).toBe(10);
   });
 });

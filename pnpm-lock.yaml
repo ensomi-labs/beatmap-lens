@@ -39,8 +39,8 @@ importers:
         specifier: workspace:*
         version: link:../../packages/beatmap-lens
       ensomi:
-        specifier: github:ensomi-labs/ensomi#b3a735e25fac1a5130ec6075f56c0d9657770494
-        version: https://codeload.github.com/ensomi-labs/ensomi/tar.gz/b3a735e25fac1a5130ec6075f56c0d9657770494
+        specifier: file:/Users/l/ensomi/ensomi
+        version: file:../../../../ensomi/ensomi
       vue:
         specifier: 3.5.40
         version: 3.5.40(typescript@6.0.3)
@@ -872,9 +872,8 @@ packages:
     resolution: {integrity: sha512-rRqJg/6gd538VHvR3PSrdRBb/1Vy2YfzHqzvbhGIQpDRKIa4FgV/54b5Q1xYSxOOwKvjXweS26E0Q+nAMwp2pQ==}
     engines: {node: '>=8.6'}
 
-  ensomi@https://codeload.github.com/ensomi-labs/ensomi/tar.gz/b3a735e25fac1a5130ec6075f56c0d9657770494:
-    resolution: {gitHosted: true, integrity: sha512-KJmEHuDviAGrTFlYKPuiXeeGf4/RtDeQeItduUvsraiPVvLTgbNV6YZ6WPAW1Q2IipU28KLmgKi7cbi5lNRZ2w==, tarball: https://codeload.github.com/ensomi-labs/ensomi/tar.gz/b3a735e25fac1a5130ec6075f56c0d9657770494}
-    version: 0.0.1
+  ensomi@file:../../../../ensomi/ensomi:
+    resolution: {directory: ../../../../ensomi/ensomi, type: directory}
     engines: {node: '>=22'}
 
   entities@7.0.1:
@@ -2232,7 +2231,7 @@ snapshots:
       ansi-colors: 4.1.3
       strip-ansi: 6.0.1
 
-  ensomi@https://codeload.github.com/ensomi-labs/ensomi/tar.gz/b3a735e25fac1a5130ec6075f56c0d9657770494: {}
+  ensomi@file:../../../../ensomi/ensomi: {}
 
   entities@7.0.1: {}
 

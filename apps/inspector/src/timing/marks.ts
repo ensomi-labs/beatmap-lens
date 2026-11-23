@@ -1,5 +1,5 @@
+import type { TimeRange } from "../stage-audio/time-view";
 import type { Mark } from "./contracts";
-import type { TimeRange } from "./time-view";
 
 /**
  * One passage's marks with its undo history. Selection alone is not an undoable change. Several

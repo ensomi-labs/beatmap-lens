@@ -1,9 +1,9 @@
 // @vitest-environment happy-dom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createApp, h, nextTick, reactive } from "vue";
+import type { PlayheadMotion } from "./stage-audio/display";
 import TimingStage from "./TimingStage.vue";
 import type { Mark } from "./timing/contracts";
-import type { PlayheadMotion } from "./timing/display";
 
 let app: ReturnType<typeof createApp>;
 let frames: FrameRequestCallback[];

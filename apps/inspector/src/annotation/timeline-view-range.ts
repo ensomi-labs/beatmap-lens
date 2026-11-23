@@ -1,7 +1,12 @@
+import {
+  axisEdgePenetration,
+  edgeAutoScrollZonePx,
+  quadraticEdgeVelocity,
+} from "../stage-audio/edge-auto-scroll";
 import type { TimeRangeV1 } from "./contracts";
 
 export const minimumTimelineViewDurationMs = 1_000;
-export const timelineEdgePanSizePx = 40;
+export const timelineEdgePanSizePx = edgeAutoScrollZonePx;
 
 export type TimelineEdgePanDirection = "earlier" | "later";
 
@@ -134,21 +139,22 @@ export function timelineZoomAnchorMs(viewRange: TimeRangeV1, playheadMs: number)
 export function calculateTimelineEdgePan(
   options: TimelineEdgePanOptions,
 ): TimelineEdgePanCalculation | undefined {
-  const edgeSizePx = options.edgeSizePx ?? timelineEdgePanSizePx;
-  const topPenetration = clamp((edgeSizePx - options.pointerY) / edgeSizePx, 0, 1);
-  const bottomPenetration = clamp(
-    (options.pointerY - (options.height - edgeSizePx)) / edgeSizePx,
-    0,
-    1,
-  );
-  const penetration = Math.max(topPenetration, bottomPenetration);
-  if (penetration <= 0) return undefined;
+  const hit = axisEdgePenetration({
+    coordinatePx: options.pointerY,
+    startPx: 0,
+    endPx: options.height,
+    edgeZonePx: options.edgeSizePx ?? timelineEdgePanSizePx,
+  });
+  if (!hit) return undefined;
 
-  const direction = topPenetration >= bottomPenetration ? "later" : "earlier";
-  const velocityMsPerSecond = penetration ** 2 * timelineViewDurationMs(options.viewRange);
+  const direction = hit.side === "start" ? "later" : "earlier";
+  const velocityMsPerSecond = quadraticEdgeVelocity(
+    hit.penetrationRatio,
+    timelineViewDurationMs(options.viewRange),
+  );
   const deltaMs =
     velocityMsPerSecond * (options.elapsedMs / 1_000) * (direction === "later" ? 1 : -1);
-  return { direction, penetration, velocityMsPerSecond, deltaMs };
+  return { direction, penetration: hit.penetrationRatio, velocityMsPerSecond, deltaMs };
 }
 
 export function applyTimelineEdgePan(options: TimelineEdgePanOptions): TimeRangeV1 {

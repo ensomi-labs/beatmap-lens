@@ -6,6 +6,7 @@
  * This module is pure (no Node imports) because the standalone service runs it with plain `node`
  * and the tests run it directly; the caller resolves paths.
  */
+import { nearestSample } from "../stage-audio/time-view.ts";
 import type {
   LastSetup,
   Mark,
@@ -17,6 +18,8 @@ import type {
   SessionNote,
   SetupSource,
 } from "./contracts.ts";
+
+export { nearestSample };
 
 export interface SessionFileV1 {
   version: 1;
@@ -79,11 +82,6 @@ export interface TimingPassage {
 
 /** Context shown and played around a passage when the session does not state it. */
 export const defaultContextMs = 2000;
-
-/** Nearest sample index of a source time, derived only for writing; `time_ms` stays canonical. */
-export function nearestSample(timeMs: number, sampleRate: number): number {
-  return Math.floor((timeMs * sampleRate) / 1000 + 0.5);
-}
 
 /** Reads a session file; `resolvePath` resolves a path relative to the session file. */
 export function parseSession(text: string, resolvePath: (path: string) => string): TimingSession {

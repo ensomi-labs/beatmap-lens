@@ -6,8 +6,33 @@ import DraftNumberInput from "./DraftNumberInput.vue";
 import PanelSection from "./layout/PanelSection.vue";
 import type { PaneSpec } from "./layout/pane-layout";
 import WorkspaceFrame from "./layout/WorkspaceFrame.vue";
+import { TimingAudioEngine } from "./stage-audio/audio-engine";
+import {
+  followView,
+  loopReanchorDue,
+  motionAt,
+  needsResync,
+  nextFollowCheckMs,
+  type PlayheadMotion,
+  readoutIntervalMs,
+  transportDelayMs,
+} from "./stage-audio/display";
+import { deinterleave } from "./stage-audio/pcm";
+import {
+  clampView,
+  fitView,
+  formatSourceTime,
+  msToX,
+  nearestSample,
+  placeAt,
+  type TimeRange,
+  type TimeView,
+  zoomAt,
+  zoomLimits,
+} from "./stage-audio/time-view";
+import { prerollStart } from "./stage-audio/transport";
+import { nearSilence } from "./stage-audio/waveform";
 import TimingStage, { type LocatePhase, type StageProposal } from "./TimingStage.vue";
-import { TimingAudioEngine } from "./timing/audio-engine";
 import { timingJson, timingRequest } from "./timing/client";
 import {
   type BlindPassage,
@@ -28,17 +53,6 @@ import {
   staleSessionError,
 } from "./timing/contracts";
 import {
-  followView,
-  loopReanchorDue,
-  motionAt,
-  needsResync,
-  nextFollowCheckMs,
-  type PlayheadMotion,
-  readoutIntervalMs,
-  transportDelayMs,
-} from "./timing/display";
-import { nearestSample } from "./timing/format";
-import {
   addMark,
   adjacentMark,
   differsFrom,
@@ -56,7 +70,6 @@ import {
   undo,
 } from "./timing/marks";
 import { proposalColour } from "./timing/palette";
-import { deinterleave } from "./timing/pcm";
 import {
   type Detection,
   deviceRate,
@@ -66,19 +79,6 @@ import {
   recordedSetup,
   type SetupLine,
 } from "./timing/setup";
-import {
-  clampView,
-  fitView,
-  formatSourceTime,
-  msToX,
-  placeAt,
-  type TimeRange,
-  type TimeView,
-  zoomAt,
-  zoomLimits,
-} from "./timing/time-view";
-import { prerollStart } from "./timing/transport";
-import { nearSilence } from "./timing/waveform";
 import WorkspaceModeSwitch from "./WorkspaceModeSwitch.vue";
 import type { WorkspaceMode } from "./workspace-mode";
 
@@ -2685,12 +2685,6 @@ function handleKeydown(event: KeyboardEvent) {
 
 .timing-desktop-note {
   display: none;
-}
-
-@media (max-width: 1240px) {
-  .toolbar-optional {
-    display: none;
-  }
 }
 
 @media (max-width: 920px) {

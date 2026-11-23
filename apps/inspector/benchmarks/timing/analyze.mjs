@@ -12,7 +12,7 @@
 import { readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
-import { OutputClock } from "../../src/timing/clock.ts";
+import { OutputClock } from "../../src/stage-audio/clock.ts";
 
 const { positionals, values } = parseArgs({
   allowPositionals: true,
