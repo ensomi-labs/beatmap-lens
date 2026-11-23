@@ -3,18 +3,25 @@ import { computed, onBeforeUnmount, onMounted, ref, shallowRef, watch } from "vu
 import { deinterleave, draftJson, draftRequest } from "./draft/client";
 import {
   type Beat,
+  type Boundary,
   beatsAfter,
   computeGridFit,
+  DRAFT_GRID_FIT_OPTIONS,
   type DraftAudio,
-  type DraftState,
-  type GridFit,
+  type DraftProviders,
+  extractDraftMeta,
+  formatConsequences,
+  type GridFitItem,
+  isNonBinaryDivisor,
   type PatchOffer,
   projectRedLines,
   rankTroubleSpans,
+  type SessionState,
   type SoundAnchor,
   type Span,
   type Statement,
-  type TraceBody,
+  signedGridResidualMs,
+  sortedEntities,
   type TraceEvent,
 } from "./draft/ensomi-contract";
 import type { RecomputeOutcome } from "./draft/recompute";
@@ -104,17 +111,22 @@ function appendToTrace(events: TraceEvent[]) {
 }
 
 const session = new DraftSession((event) => appendToTrace([event]));
-const state = shallowRef<DraftState>(session.state);
+const state = shallowRef<SessionState>(session.state);
 const undoState = ref({ undo: false, redo: false });
+
+const draftMeta = computed(() => extractDraftMeta(state.value));
+const draftAudio = computed(() => draftMeta.value.audio);
+const providers = computed(() => draftMeta.value.providers);
+const beats = computed<Beat[]>(() => sortedEntities(state.value.beats));
+const boundaries = computed<Boundary[]>(() => sortedEntities(state.value.boundaries));
+const sounds = computed<SoundAnchor[]>(() => sortedEntities(state.value.sounds));
+const statements = computed<Statement[]>(() =>
+  [...state.value.statements.values()].filter((statement) => statement.active),
+);
 
 function sync() {
   state.value = session.state;
   undoState.value = { undo: session.canUndo, redo: session.canRedo };
-}
-
-function commit(body: TraceBody) {
-  session.commit(body);
-  sync();
 }
 
 let idCounter = 0;
@@ -156,12 +168,18 @@ async function loadPcm(channels: Float32Array[], sampleRate: number) {
 
 // ---------------------------------------------------------------- loading
 
-function startDraft(init: Extract<TraceBody, { type: "init" }>, path: string | null) {
+function startDraft(
+  audio: DraftAudio,
+  draft: { beats: Beat[]; sounds: SoundAnchor[]; boundaries: Boundary[] },
+  draftProviders: DraftProviders,
+  path: string | null,
+) {
   stop();
   tracePath.value = null;
   traceStatus.value = "none";
   session.load([]);
-  commit(init);
+  session.initDraft(audio, draft, draftProviders);
+  sync();
   audioPath.value = path;
   resetSelection();
   activeOfferIndex.value = 0;
@@ -177,14 +195,9 @@ function attachTrace(path: string) {
 async function loadDemo() {
   error.value = "";
   startDraft(
-    {
-      type: "init",
-      audio: demoAudio(),
-      beats: demoBeats(),
-      sounds: demoSounds(),
-      boundaries: [],
-      providers: demoProviders,
-    },
+    demoAudio(),
+    { beats: demoBeats(), sounds: demoSounds(), boundaries: [] },
+    demoProviders,
     null,
   );
   await loadPcm([demoPcm()], demoSampleRate);
@@ -202,8 +215,8 @@ interface AnalyzeResponse {
   audio: DraftAudio & { path: string };
   beats: Beat[];
   sounds: SoundAnchor[];
-  boundaries: [];
-  providers: Extract<TraceBody, { type: "init" }>["providers"];
+  boundaries: Boundary[];
+  providers: DraftProviders;
   tracePath: string;
   runtime: string;
 }
@@ -221,14 +234,9 @@ async function analyzeTrack() {
   try {
     const result = await draftJson<AnalyzeResponse>("analyze", { audioPath: path });
     startDraft(
-      {
-        type: "init",
-        audio: result.audio,
-        beats: result.beats,
-        sounds: result.sounds,
-        boundaries: result.boundaries,
-        providers: result.providers,
-      },
+      result.audio,
+      { beats: result.beats, sounds: result.sounds, boundaries: result.boundaries },
+      result.providers,
       result.audio.path,
     );
     attachTrace(result.tracePath);
@@ -257,7 +265,7 @@ async function openTrace() {
     sync();
     tracePath.value = path;
     traceStatus.value = "saved";
-    const audio = state.value.audio;
+    const audio = draftAudio.value;
     audioPath.value = audio?.path ?? null;
     resetSelection();
     fitView();
@@ -276,7 +284,7 @@ async function openTrace() {
 const view = ref<TimeWindow>({ startS: 0, endS: 10 });
 const stageWidth = ref(1000);
 const stageWrap = ref<HTMLElement | null>(null);
-const duration = computed(() => state.value.audio?.durationS ?? 0);
+const duration = computed(() => draftAudio.value?.durationS ?? 0);
 const zoomPresets = [
   { key: "fit", label: "Fit" },
   { key: 16, label: "16 s" },
@@ -349,11 +357,11 @@ function resetSelection() {
 const displayBeats = computed<Beat[]>(() => {
   const moved = preview.value;
   const shift = runShift.value;
-  if (!moved && !shift) return state.value.beats;
-  return state.value.beats
+  if (!moved && !shift) return beats.value;
+  return beats.value
     .map((beat) => {
       if (moved && beat.id === moved.beatId) return { ...beat, t: moved.t };
-      if (shift && beat.t >= shift.span.t0 && beat.t <= shift.span.t1)
+      if (shift && beat.t >= shift.span.t0 && beat.t < shift.span.t1)
         return { ...beat, t: beat.t + shift.dt };
       return beat;
     })
@@ -368,12 +376,20 @@ function commitTransient() {
   preview.value = null;
   runShift.value = null;
   if (moved) {
-    const beat = state.value.beats.find((entry) => entry.id === moved.beatId);
-    if (beat && Math.abs(beat.t - moved.t) > 1e-5)
-      commit({ type: "edit", edit: { op: "move_beat", id: moved.beatId, t: moved.t } });
+    const beat = state.value.beats.get(moved.beatId);
+    if (beat && Math.abs(beat.t - moved.t) > 1e-5) {
+      session.applyEdit({ op: "move_beat", id: moved.beatId, t: moved.t, source: "user" });
+      sync();
+    }
   }
   if (shift && Math.abs(shift.dt) > 1e-5) {
-    commit({ type: "edit", edit: { op: "shift_run_offset", span: shift.span, dt: shift.dt } });
+    session.applyEdit({
+      op: "shift_run_offset",
+      span: shift.span,
+      deltaSec: shift.dt,
+      source: "user",
+    });
+    sync();
     selection.value = { t0: shift.span.t0 + shift.dt, t1: shift.span.t1 + shift.dt };
   }
 }
@@ -390,7 +406,7 @@ function nudge(deltaS: number) {
     settleLater();
     return true;
   }
-  const beat = state.value.beats.find((entry) => entry.id === selectedBeatId.value);
+  const beat = selectedBeatId.value ? state.value.beats.get(selectedBeatId.value) : undefined;
   if (!beat) return false;
   preview.value = { beatId: beat.id, t: (preview.value?.t ?? beat.t) + deltaS };
   settleLater();
@@ -399,28 +415,37 @@ function nudge(deltaS: number) {
 
 // ---------------------------------------------------------------- derived views
 
-const fits = computed<GridFit[]>(() =>
-  computeGridFit(state.value.sounds, state.value.beats, state.value.boundaries),
+const fits = computed<GridFitItem[]>(() =>
+  computeGridFit(
+    state.value.sounds,
+    state.value.beats,
+    state.value.boundaries,
+    DRAFT_GRID_FIT_OPTIONS,
+  ),
 );
 const fitById = computed(() => new Map(fits.value.map((fit) => [fit.soundId, fit])));
-const trouble = computed(() => rankTroubleSpans(state.value, { fits: fits.value }));
-const bands = computed(() => runBands(displayBeats.value, state.value.boundaries));
+const beatTimes = computed(() => beats.value.map((beat) => beat.t));
+const signedResidual = (t: number) => signedGridResidualMs(t, beatTimes.value);
+const trouble = computed(() =>
+  rankTroubleSpans(state.value, { gridFitOptions: DRAFT_GRID_FIT_OPTIONS }),
+);
+const bands = computed(() => runBands(displayBeats.value, boundaries.value));
 const heat = computed(() =>
-  duration.value ? overviewHeat(fits.value, state.value.beats, duration.value, 160) : [],
+  duration.value ? overviewHeat(fits.value, beats.value, duration.value, 160) : [],
 );
 const visible = (t: number, marginS = 0) =>
   t >= view.value.startS - marginS && t <= view.value.endS + marginS;
 const visibleBeats = computed(() => displayBeats.value.filter((beat) => visible(beat.t)));
 const collapsed = computed(() => beatsCollapse(displayBeats.value, view.value, stageWidth.value));
 const visibleSounds = computed(() =>
-  state.value.sounds.filter((sound) => visible(sound.t)).slice(0, 4000),
+  sounds.value.filter((sound) => visible(sound.t)).slice(0, 4000),
 );
-const userBeats = computed(() => state.value.beats.filter((beat) => beat.source === "user").length);
+const userBeats = computed(() => beats.value.filter((beat) => beat.source === "user").length);
 
 // ---------------------------------------------------------------- honesty
 
 const draftBadge = computed(() => {
-  const provider = state.value.providers?.beats;
+  const provider = providers.value?.beats;
   if (!provider) return null;
   if (provider.kind === "model")
     return { kind: "model", text: "Draft · BeatThis (raw, un-folded)", title: provider.name };
@@ -433,7 +458,7 @@ const draftBadge = computed(() => {
   return { kind: "mock", text: "Draft · synthetic demo (mock)", title: provider.name };
 });
 const soundsBadge = computed(() => {
-  const provider = state.value.providers?.sounds;
+  const provider = providers.value?.sounds;
   if (!provider) return null;
   return provider.kind === "mock"
     ? { kind: "mock", text: "Sounds · synthetic onsets (mock / experimental)" }
@@ -446,7 +471,8 @@ const statementBadge = "Statement · recorded (not honored by raw BeatThis)";
 
 function addStatement(kind: Statement["kind"]) {
   if (kind === "sound_at" || kind === "beat_at") {
-    commit({ type: "statement", statement: { id: newId("st"), version: 1, kind, t: cursorS.value } });
+    session.upsertStatement({ id: newId("st"), kind, t: cursorS.value });
+    sync();
     message.value = `Statement ${statementLabel[kind]} recorded at ${formatSourceTime(cursorS.value * 1000, 1)}`;
     return;
   }
@@ -455,36 +481,42 @@ function addStatement(kind: Statement["kind"]) {
     message.value = "Select a span first: Shift+drag on the stage.";
     return;
   }
-  commit({ type: "statement", statement: { id: newId("st"), version: 1, kind, span } });
+  session.upsertStatement({ id: newId("st"), kind, span });
+  sync();
   message.value = `Statement ${statementLabel[kind]} recorded; nothing recomputes until you ask (⌘K).`;
 }
 
+function removeStatement(id: string) {
+  session.deactivateStatement(id);
+  sync();
+  if (selectedStatementId.value === id) selectedStatementId.value = null;
+}
+
 function addBeat(t: number) {
-  const beat: Beat = { id: newId("u"), t, source: "user", version: 1 };
-  commit({ type: "edit", edit: { op: "upsert_beat", beat } });
-  selectedBeatId.value = beat.id;
+  const id = newId("u");
+  session.applyEdit({ op: "upsert_beat", beat: { id, t, source: "user" } });
+  sync();
+  selectedBeatId.value = id;
 }
 
 function removeSelected() {
   if (selectedBeatId.value) {
-    commit({ type: "edit", edit: { op: "remove_beat", id: selectedBeatId.value } });
+    session.applyEdit({ op: "remove_beat", id: selectedBeatId.value });
+    sync();
     selectedBeatId.value = null;
   } else if (selectedStatementId.value) {
-    commit({ type: "remove_statement", id: selectedStatementId.value });
-    selectedStatementId.value = null;
+    removeStatement(selectedStatementId.value);
   }
 }
 
 function addReset() {
-  const beat = state.value.beats.find((entry) => entry.id === selectedBeatId.value);
+  const beat = selectedBeatId.value ? state.value.beats.get(selectedBeatId.value) : undefined;
   const t = beat?.t ?? cursorS.value;
-  commit({
-    type: "edit",
-    edit: {
-      op: "upsert_boundary",
-      boundary: { id: newId("bd"), t, kind: "reset", source: "user", version: 1 },
-    },
+  session.applyEdit({
+    op: "upsert_boundary",
+    boundary: { id: newId("bd"), t, kind: "reset", source: "user" },
   });
+  sync();
   message.value = `Reset boundary at ${formatSourceTime(t * 1000, 1)}`;
 }
 
@@ -503,7 +535,9 @@ const generation = ref(0);
 const recomputing = ref<{ span: Span; provider: string } | null>(null);
 let recomputeAbort: AbortController | null = null;
 const activeOfferIndex = ref(0);
-const offers = computed(() => state.value.offers);
+const offers = computed<PatchOffer[]>(() =>
+  [...state.value.offers.values()].filter((offer) => offer.status === "pending"),
+);
 const activeOffer = computed<PatchOffer | null>(() =>
   offers.value.length ? (offers.value[activeOfferIndex.value % offers.value.length] ?? null) : null,
 );
@@ -512,14 +546,14 @@ const offerBeats = computed(() =>
 );
 const ghostBeats = computed(() => {
   if (mode.value !== "audition" || !offerBeats.value) return [];
-  const current = new Map(state.value.beats.map((beat) => [beat.id, beat.t]));
+  const current = new Map(beats.value.map((beat) => [beat.id, beat.t]));
   return offerBeats.value.filter(
     (beat) => visible(beat.t) && Math.abs((current.get(beat.id) ?? -1) - beat.t) > 1e-6,
   );
 });
 
 async function requestOffer() {
-  if (!state.value.audio) return;
+  if (!draftAudio.value) return;
   commitTransient();
   const span = selection.value ?? { t0: view.value.startS, t1: view.value.endS };
   const current = ++generation.value;
@@ -527,6 +561,8 @@ async function requestOffer() {
   const controller = new AbortController();
   recomputeAbort = controller;
   recomputing.value = { span, provider: "rule mock" };
+  session.recordSignal(span, "user_recompute", current);
+  sync();
   try {
     const outcome = await draftJson<RecomputeOutcome>(
       "recompute",
@@ -534,23 +570,29 @@ async function requestOffer() {
         client: clientId,
         request: {
           generation: current,
+          basisSeq: state.value.lastSeq,
           span,
           durationS: duration.value,
-          beats: state.value.beats,
-          boundaries: state.value.boundaries,
-          sounds: state.value.sounds,
-          statements: state.value.statements,
-          suppressed: state.value.suppressed,
+          beats: beats.value,
+          boundaries: boundaries.value,
+          sounds: sounds.value,
+          statements: statements.value,
+          suppressions: state.value.suppressions,
         },
       },
       controller.signal,
     );
     if (current !== generation.value) return;
     if (outcome.status === "ok") {
-      commit({ type: "offers", offers: outcome.offers });
+      session.recordOfferBatch(outcome.offers, {
+        kind: outcome.providerKind,
+        id: outcome.provider,
+      });
+      sync();
       activeOfferIndex.value = 0;
-      message.value = outcome.offers.length
-        ? `${outcome.offers.length} offer${outcome.offers.length === 1 ? "" : "s"} from the rule mock; compare them in Audition (2).`
+      const surfaced = offers.value.length;
+      message.value = surfaced
+        ? `${surfaced} offer${surfaced === 1 ? "" : "s"} from the rule mock; compare them in Audition (2).`
         : "The rule mock has no offer for this span.";
     } else message.value = `Recompute ${outcome.status}.`;
   } catch (failure) {
@@ -588,16 +630,24 @@ function cycleOffer() {
 
 function acceptOffer(offer = activeOffer.value) {
   if (guardAb() || !offer) return;
-  commit({ type: "accept_offer", offerId: offer.id });
+  const consequenceSummary = formatConsequences(offer, state.value);
+  const outcome = session.acceptOffer(offer.id);
+  sync();
+  if (!outcome.ok) {
+    error.value = `Blocked by conflict: ${outcome.conflicts.map((conflict) => conflict.message).join(" · ")}`;
+    return;
+  }
+  error.value = "";
   activeOfferIndex.value = 0;
-  message.value = `Accepted: ${offer.label} (${offer.consequences.summary}); siblings superseded.`;
+  message.value = `Accepted: ${offer.summary} (${consequenceSummary}); siblings superseded.`;
 }
 
 function rejectOffer(offer = activeOffer.value) {
   if (guardAb() || !offer) return;
-  commit({ type: "reject_offer", offerId: offer.id });
+  session.rejectOffer(offer.id);
+  sync();
   activeOfferIndex.value = 0;
-  message.value = `Rejected and suppressed: ${offer.label}`;
+  message.value = `Rejected and suppressed: ${offer.summary}`;
 }
 
 // ---------------------------------------------------------------- audition
@@ -637,7 +687,7 @@ function syncClicks() {
   engine.setClicks(clicksOn.value ? beats.map((beat) => beat.t * 1000) : null);
 }
 
-watch([clicksOn, flamSlot, () => state.value.beats], syncClicks);
+watch([clicksOn, flamSlot, beats], syncClicks);
 
 function auditionSpan(): Span {
   const span = selection.value ?? loopSpan.value ?? { t0: view.value.startS, t1: view.value.endS };
@@ -696,12 +746,13 @@ function flamCheck() {
     message.value = "No off-grid sound in view to check.";
     return;
   }
-  const slot = target.t - target.residualMs / 1000;
+  const signedMs = signedResidual(target.t);
+  const slot = target.t - signedMs / 1000;
   flamSlot.value = slot;
   selectedSoundId.value = target.soundId;
   loopSpan.value = { t0: Math.max(0, slot - 0.4), t1: slot + 0.4 };
   looping.value = true;
-  message.value = `Flam check: the click marks the nearest grid slot; the sound is ${Math.abs(target.residualMs).toFixed(1)} ms ${target.residualMs > 0 ? "late" : "early"}.`;
+  message.value = `Flam check: the click marks the nearest grid slot; the sound is ${Math.abs(signedMs).toFixed(1)} ms ${signedMs > 0 ? "late" : "early"}.`;
   void play();
 }
 
@@ -824,20 +875,23 @@ function download(name: string, text: string) {
 }
 
 const titleStem = computed(() =>
-  (state.value.audio?.title ?? "draft").replace(/\.[^.]+$/, "").replace(/[^\w.-]+/g, "_"),
+  (draftAudio.value?.title ?? "draft").replace(/\.[^.]+$/, "").replace(/[^\w.-]+/g, "_"),
 );
 
 function exportRedLines() {
   const projection = projectRedLines(state.value.beats, state.value.boundaries);
-  download(`${titleStem.value}.redlines.osu.txt`, projection.text);
-  message.value = `${projection.points.length} red lines exported (barlines not inferred).`;
+  const text = [
+    `// ${projection.barPolicy}: ${projection.losses[0] ?? "meter is a placeholder"}`,
+    "[TimingPoints]",
+    projection.osuTimingPoints,
+    "",
+  ].join("\n");
+  download(`${titleStem.value}.redlines.osu.txt`, text);
+  message.value = `${projection.redLines.length} red lines exported (${projection.barPolicy}).`;
 }
 
 function exportTrace() {
-  download(
-    `${titleStem.value}.draft.jsonl`,
-    session.events.map((event) => `${JSON.stringify(event)}\n`).join(""),
-  );
+  download(`${titleStem.value}.draft.jsonl`, session.exportNdjson());
 }
 
 async function exportClip() {
@@ -848,14 +902,14 @@ async function exportClip() {
   const span = auditionSpan();
   busy.value = "Rendering clip";
   try {
-    const beats = (abHeld.value && offerBeats.value ? offerBeats.value : state.value.beats).map(
+    const exportedBeats = (abHeld.value && offerBeats.value ? offerBeats.value : beats.value).map(
       (beat) => beat.t,
     );
     const result = await draftJson<{ outputPath: string }>("export-clip", {
       audioPath: audioPath.value,
       startSec: span.t0,
       endSec: span.t1,
-      beats,
+      beats: exportedBeats,
       format: "wav",
     });
     clipPath.value = result.outputPath;
@@ -1113,8 +1167,8 @@ function drawWaveform() {
   canvas.height = Math.round(height * ratio);
   context.setTransform(ratio, 0, 0, ratio, 0, 0);
   context.clearRect(0, 0, width, height);
-  if (!channels?.length || !state.value.audio) return;
-  const rate = state.value.audio.sampleRate;
+  if (!channels?.length || !draftAudio.value) return;
+  const rate = draftAudio.value.sampleRate;
   const data = channels[0] as Float32Array;
   context.fillStyle = "oklch(58% 0.03 240 / 0.75)";
   for (let px = 0; px < width; px++) {
@@ -1135,7 +1189,7 @@ const selectedBeat = computed(() =>
   displayBeats.value.find((beat) => beat.id === selectedBeatId.value) ?? null,
 );
 const selectedSound = computed(() =>
-  state.value.sounds.find((sound) => sound.id === selectedSoundId.value) ?? null,
+  selectedSoundId.value ? (state.value.sounds.get(selectedSoundId.value) ?? null) : null,
 );
 const span = (value: Span) =>
   `${formatSourceTime(value.t0 * 1000, 1)}–${formatSourceTime(value.t1 * 1000, 1)}`;
@@ -1143,12 +1197,12 @@ const statusText = computed(() => {
   if (mode.value === "audition" && activeOffer.value) {
     const offer = activeOffer.value;
     const conflicts = offer.conflicts.length ? ` · ${offer.conflicts.length} conflict(s)` : "";
-    return `${abHeld.value ? "Hearing" : "Offer"} ${activeOfferIndex.value + 1}/${offers.value.length}: ${offer.consequences.summary}${conflicts}${abHeld.value ? " · Release Alt to change the offer" : ""}`;
+    return `${abHeld.value ? "Hearing" : "Offer"} ${activeOfferIndex.value + 1}/${offers.value.length}: ${formatConsequences(offer, state.value)}${conflicts}${abHeld.value ? " · Release Alt to change the offer" : ""}`;
   }
   return message.value;
 });
 const healthTone = computed(() =>
-  error.value ? "error" : traceStatus.value === "error" ? "warn" : state.value.audio ? "ready" : "idle",
+  error.value ? "error" : traceStatus.value === "error" ? "warn" : draftAudio.value ? "ready" : "idle",
 );
 </script>
 
@@ -1219,7 +1273,7 @@ const healthTone = computed(() =>
       <button
         class="tool-button tool-button--primary draft-request"
         type="button"
-        :disabled="!state.audio"
+        :disabled="!draftAudio"
         aria-keyshortcuts="Meta+K Control+K"
         title="Request an offer for the selection or the view; nothing recomputes otherwise (⌘K)"
         @click="requestOffer"
@@ -1229,14 +1283,14 @@ const healthTone = computed(() =>
       <div class="time-counter" title="Playhead">
         <span class="sr-only">Playhead</span>
         <span ref="counterMain" class="time-counter-main">{{ formatSourceTime(cursorS * 1000, 1) }}</span>
-        <span class="time-counter-sub">{{ state.audio ? `${state.audio.sampleRate} Hz` : "no track" }}</span>
+        <span class="time-counter-sub">{{ draftAudio ? `${draftAudio.sampleRate} Hz` : "no track" }}</span>
       </div>
     </template>
 
     <template #toolbar-end>
       <span class="health-status" :class="`health-status--${healthTone}`" aria-live="polite">
         <span class="health-dot" aria-hidden="true"></span>
-        {{ busy ?? (state.audio ? (traceStatus === "saved" ? "Trace saved" : traceStatus === "saving" ? "Saving" : "Draft") : "No track") }}
+        {{ busy ?? (draftAudio ? (traceStatus === "saved" ? "Trace saved" : traceStatus === "saving" ? "Saving" : "Draft") : "No track") }}
       </span>
     </template>
 
@@ -1265,11 +1319,11 @@ const healthTone = computed(() =>
       </nav>
       <header class="pane-header">
         <h2 id="draft-statements-heading">Statements</h2>
-        <span class="pane-count">{{ state.statements.length }}</span>
+        <span class="pane-count">{{ statements.length }}</span>
       </header>
       <ul class="draft-statements" aria-labelledby="draft-statements-heading">
         <li
-          v-for="statement in state.statements"
+          v-for="statement in statements"
           :key="statement.id"
           class="draft-statement"
           :class="{ 'is-active': statement.id === selectedStatementId }"
@@ -1282,12 +1336,12 @@ const healthTone = computed(() =>
             type="button"
             class="tool-button tool-button--icon"
             :title="`Remove the ${statementLabel[statement.kind]} statement`"
-            @click="commit({ type: 'remove_statement', id: statement.id })"
+            @click="removeStatement(statement.id)"
           >
             ×
           </button>
         </li>
-        <li v-if="state.statements.length" class="draft-badge-row">
+        <li v-if="statements.length" class="draft-badge-row">
           <span class="honesty-badge honesty-badge--statement">{{ statementBadge }}</span>
         </li>
       </ul>
@@ -1307,8 +1361,8 @@ const healthTone = computed(() =>
       <section class="draft-main" aria-label="Draft stage">
         <header class="stage-toolbar draft-bar">
           <div class="stage-identity">
-            <strong>{{ state.audio?.title ?? "No track" }}</strong>
-            <span v-if="state.audio" class="data">{{ formatSourceTime(duration * 1000) }}</span>
+            <strong>{{ draftAudio?.title ?? "No track" }}</strong>
+            <span v-if="draftAudio" class="data">{{ formatSourceTime(duration * 1000) }}</span>
           </div>
           <div class="draft-badges">
             <span
@@ -1350,7 +1404,7 @@ const healthTone = computed(() =>
           <button class="tool-button" type="button" @click="error = ''">Dismiss</button>
         </p>
 
-        <div v-if="!state.audio" class="draft-empty-stage">
+        <div v-if="!draftAudio" class="draft-empty-stage">
           <p>Load a local track to draft its beats with raw BeatThis, or try the synthetic demo.</p>
           <button class="tool-button tool-button--primary" type="button" @click="loadDemo">Load demo</button>
         </div>
@@ -1417,7 +1471,7 @@ const healthTone = computed(() =>
               </defs>
               <rect class="stage-ground" x="0" y="0" :width="stageWidth" :height="stageHeight" />
               <rect
-                v-for="statement in state.statements.filter((entry) => entry.kind === 'keep')"
+                v-for="statement in statements.filter((entry) => entry.kind === 'keep')"
                 :key="`keep-${statement.id}`"
                 class="keep-tint"
                 :x="x(statementSpan(statement).t0)"
@@ -1458,7 +1512,7 @@ const healthTone = computed(() =>
                   >{{ band.bpm.toFixed(2) }}</text>
                 </template>
                 <path
-                  v-for="boundary in state.boundaries.filter((entry) => visible(entry.t))"
+                  v-for="boundary in boundaries.filter((entry) => visible(entry.t))"
                   :key="boundary.id"
                   class="boundary-notch"
                   :class="`boundary-notch--${boundary.kind}`"
@@ -1467,16 +1521,16 @@ const healthTone = computed(() =>
                   <title>{{ boundary.kind }} {{ formatSourceTime(boundary.t * 1000, 1) }}</title>
                 </path>
                 <g
-                  v-for="statement in state.statements"
+                  v-for="statement in statements"
                   :key="`chip-${statement.id}`"
                   class="statement-chip"
                   :class="{ 'is-selected': statement.id === selectedStatementId }"
                 >
                   <path
                     :data-statement-id="statement.id"
-                    :d="'span' in statement
+                    :d="statement.span
                       ? `M${x(statement.span.t0)},12 V4 H${x(statement.span.t1)} V12`
-                      : `M${x(statement.t) - 4},4 L${x(statement.t) + 4},4 L${x(statement.t)},12 Z`"
+                      : `M${x(statement.t ?? 0) - 4},4 L${x(statement.t ?? 0) + 4},4 L${x(statement.t ?? 0)},12 Z`"
                   />
                   <text :x="x(statementSpan(statement).t0) + 3" y="11">{{ statementLabel[statement.kind] }}</text>
                 </g>
@@ -1531,7 +1585,7 @@ const healthTone = computed(() =>
                     <line
                       class="whisker"
                       :x1="x(sound.t)"
-                      :x2="x(sound.t) - whiskerPx(fitById.get(sound.id)?.residualMs ?? 0)"
+                      :x2="x(sound.t) - whiskerPx(signedResidual(sound.t))"
                       :y1="(lane.bottom + lane.soundsBottom) / 2"
                       :y2="(lane.bottom + lane.soundsBottom) / 2"
                     />
@@ -1543,17 +1597,17 @@ const healthTone = computed(() =>
                       :cy="(lane.bottom + lane.soundsBottom) / 2"
                       :r="2 + 4 * sound.emphasis"
                     >
-                      <title>unexplained {{ (fitById.get(sound.id)?.residualMs ?? 0).toFixed(1) }} ms</title>
+                      <title>unexplained {{ signedResidual(sound.t).toFixed(1) }} ms</title>
                     </circle>
                   </template>
                   <text
-                    v-else-if="fitById.get(sound.id)?.status === 'subdivision'"
+                    v-else-if="fitById.get(sound.id)?.status === 'subdivision' && isNonBinaryDivisor(fitById.get(sound.id)?.nearestDivisor)"
                     class="sound-numeral"
                     :data-sound-id="sound.id"
                     :x="x(sound.t)"
                     :y="(lane.bottom + lane.soundsBottom) / 2 + 3.5"
                     :font-size="8 + 4 * sound.emphasis"
-                  >{{ fitById.get(sound.id)?.divisor }}</text>
+                  >{{ fitById.get(sound.id)?.nearestDivisor }}</text>
                   <circle
                     v-else
                     class="sound sound--on-grid"
@@ -1630,7 +1684,7 @@ const healthTone = computed(() =>
             </label>
             <div class="draft-actions">
               <button class="tool-button" type="submit" :disabled="Boolean(busy) || !traceInput.trim()">Open trace</button>
-              <button class="tool-button" type="button" :disabled="!state.audio" @click="exportTrace">Download trace</button>
+              <button class="tool-button" type="button" :disabled="!draftAudio" @click="exportTrace">Download trace</button>
             </div>
           </form>
         </PanelSection>
@@ -1648,14 +1702,14 @@ const healthTone = computed(() =>
         </PanelSection>
 
         <PanelSection id="draft-facts" title="Draft">
-          <div class="prop-row"><span>Beats</span><b class="data draft-beat-count">{{ state.beats.length }}</b></div>
+          <div class="prop-row"><span>Beats</span><b class="data draft-beat-count">{{ beats.length }}</b></div>
           <div class="prop-row"><span>Your beats</span><b class="data">{{ userBeats }}</b></div>
-          <div class="prop-row"><span>Sounds</span><b class="data">{{ state.sounds.length }}</b></div>
+          <div class="prop-row"><span>Sounds</span><b class="data">{{ sounds.length }}</b></div>
           <div class="prop-row">
             <span>Unexplained</span>
             <b class="data">{{ fits.filter((fit) => fit.status === "unexplained").length }}</b>
           </div>
-          <div class="prop-row"><span>Boundaries</span><b class="data">{{ state.boundaries.length }}</b></div>
+          <div class="prop-row"><span>Boundaries</span><b class="data">{{ boundaries.length }}</b></div>
           <div class="draft-actions">
             <button class="tool-button" type="button" :disabled="!undoState.undo" aria-keyshortcuts="Meta+Z" title="Undo (⌘Z)" @click="undo">Undo</button>
             <button class="tool-button" type="button" :disabled="!undoState.redo" aria-keyshortcuts="Meta+Shift+Z" title="Redo (⇧⌘Z)" @click="redo">Redo</button>
@@ -1675,8 +1729,8 @@ const healthTone = computed(() =>
               <span>Grid fit</span>
               <b class="data">
                 {{ fitById.get(selectedSound.id)?.status }}
-                {{ fitById.get(selectedSound.id)?.divisor ? `1/${fitById.get(selectedSound.id)?.divisor}` : "" }}
-                {{ (fitById.get(selectedSound.id)?.residualMs ?? 0).toFixed(1) }} ms
+                {{ fitById.get(selectedSound.id)?.nearestDivisor ? `1/${fitById.get(selectedSound.id)?.nearestDivisor}` : "" }}
+                {{ Number.isFinite(fitById.get(selectedSound.id)?.residualMs) ? (fitById.get(selectedSound.id)?.residualMs ?? 0).toFixed(1) : "—" }} ms
               </b>
             </div>
           </template>
@@ -1698,11 +1752,11 @@ const healthTone = computed(() =>
             >
               <button type="button" class="draft-offer-select" @click="!guardAb() && (activeOfferIndex = index)">
                 <span class="draft-chip">{{ offer.role }} · {{ offer.scopeKind }}</span>
-                <strong>{{ offer.label }}</strong>
-                <span class="draft-note">{{ offer.consequences.summary }}</span>
+                <strong>{{ offer.summary }}</strong>
+                <span class="draft-note">{{ formatConsequences(offer, state) }}</span>
                 <span v-for="(conflict, at) in offer.conflicts" :key="at" class="draft-conflict">{{ conflict.message }}</span>
                 <span class="honesty-badge honesty-badge--offer">
-                  {{ offer.providerKind === "rule" ? offerBadge : `Offer · ${offer.provider}` }}
+                  {{ offer.providerKind === "rule" ? offerBadge : `Offer · ${offer.providerId}` }}
                 </span>
               </button>
               <div class="draft-actions">
@@ -1719,7 +1773,7 @@ const healthTone = computed(() =>
 
         <PanelSection id="draft-export" title="Export">
           <div class="draft-actions">
-            <button class="tool-button" type="button" :disabled="!state.beats.length" @click="exportRedLines">.osu red lines</button>
+            <button class="tool-button" type="button" :disabled="!beats.length" @click="exportRedLines">.osu red lines</button>
             <button class="tool-button" type="button" :disabled="!audioPath || Boolean(busy)" @click="exportClip">Export clip for Gemini</button>
           </div>
           <p class="draft-note">Red lines: barlines not inferred (meter is a placeholder).</p>

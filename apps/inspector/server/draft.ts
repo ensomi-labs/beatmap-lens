@@ -21,7 +21,14 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { Beat, ProviderInfo, SoundAnchor, TraceEvent } from "../src/draft/ensomi-contract.ts";
+import {
+  type Beat,
+  type ProviderInfo,
+  parseTraceNdjson,
+  type SoundAnchor,
+  serializeTraceNdjson,
+  type TraceEvent,
+} from "../src/draft/ensomi-contract.ts";
 import {
   type RecomputeOutcome,
   type RecomputeRequest,
@@ -117,8 +124,9 @@ export function runProcess(
 export class TraceWriter {
   private readonly tails = new Map<string, Promise<void>>();
 
-  append(path: string, events: readonly unknown[]): Promise<void> {
-    const text = events.map((event) => `${JSON.stringify(event)}\n`).join("");
+  append(path: string, events: readonly TraceEvent[]): Promise<void> {
+    const text = serializeTraceNdjson([...events]);
+    if (!text) return Promise.resolve();
     const previous = this.tails.get(path) ?? Promise.resolve();
     const next = previous
       .catch(() => {})
@@ -137,10 +145,7 @@ export class TraceWriter {
 
 export async function readTrace(path: string): Promise<TraceEvent[]> {
   const text = await readFile(path, "utf8");
-  return text
-    .split("\n")
-    .filter((line) => line.trim())
-    .map((line) => JSON.parse(line) as TraceEvent);
+  return parseTraceNdjson(text, { discardTruncatedTail: true });
 }
 
 /**

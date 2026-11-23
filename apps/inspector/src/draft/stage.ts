@@ -1,5 +1,5 @@
 /** Geometry and derived drawing data for the Draft stage; pure, so the stage stays thin. */
-import type { Beat, Boundary, GridFit, Span, Statement } from "./ensomi-contract";
+import type { Beat, Boundary, GridFitItem, Span, Statement } from "./ensomi-contract";
 
 export interface TimeWindow {
   startS: number;
@@ -89,12 +89,14 @@ export const statementLabel: Record<Statement["kind"], string> = {
 };
 
 export function statementSpan(statement: Statement): Span {
-  return "span" in statement ? statement.span : { t0: statement.t, t1: statement.t };
+  if (statement.span) return statement.span;
+  const t = statement.t ?? 0;
+  return { t0: t, t1: t };
 }
 
 /** Per-bin heat for the overview bar: unexplained sounds and beat uncertainty, each 0 to 1. */
 export function overviewHeat(
-  fits: readonly GridFit[],
+  fits: readonly GridFitItem[],
   beats: readonly Beat[],
   durationS: number,
   bins: number,

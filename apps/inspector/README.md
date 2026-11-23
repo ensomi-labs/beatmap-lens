@@ -229,12 +229,13 @@ generated track whose mock draft misses a phase reset at 14 s.
 - <kbd>J</kbd>/<kbd>Shift</kbd>+<kbd>J</kbd> tour the trouble spans (low confidence,
   interval jumps, unexplained sounds, conflicts), looping each with clicks.
 
-The trace appends to `.local/draft-traces/*.jsonl`; **Open trace** re-folds one.
+The trace appends to `.local/draft-traces/*.jsonl` as `ensomi` v0 NDJSON (`schemaVersion: "0.1"`);
+**Open trace** re-folds one via `ensomi`.
 **.osu red lines** exports `[TimingPoints]` with barlines not inferred, and
 **Export clip for Gemini** renders a click-overlay WAV with
 `harness/audio-harness.py` into `.local/draft-clips/` and shows its path.
-`src/draft/ensomi-contract.ts` holds the shared ensomi v0 contract until the
-`ensomi` package can be imported.
+Draft imports the `ensomi` v0 contract package directly (`src/draft/ensomi-contract.ts` is a thin UI
+adapter; set `ENSOMI_PACKAGE_DIR` for paired local development against a local `ensomi` checkout).
 
 ## Code map
 

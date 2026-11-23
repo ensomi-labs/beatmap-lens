@@ -15,6 +15,7 @@
   "dependencies": {
     "@fontsource-variable/azeret-mono": "5.3.0",
     "beatmap-lens": "workspace:*",
+    "ensomi": "github:ensomi-labs/ensomi#e5c1ac88673587e04b790b0b882088d7fb325357",
     "vue": "3.5.40"
   },
   "devDependencies": {

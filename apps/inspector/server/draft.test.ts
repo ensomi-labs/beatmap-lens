@@ -2,10 +2,20 @@ import { mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promis
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { foldTrace, parseTraceNdjson } from "ensomi";
 import { afterEach, describe, expect, it } from "vitest";
-import type { TraceEvent } from "../src/draft/ensomi-contract";
+import { sortedEntities, type TraceEvent } from "../src/draft/ensomi-contract";
 import type { RecomputeRequest } from "../src/draft/recompute";
-import { demoPcm, demoSampleRate, encodeWav } from "../src/draft/synthetic";
+import { DraftSession } from "../src/draft/session";
+import {
+  demoAudio,
+  demoBeats,
+  demoPcm,
+  demoProviders,
+  demoSampleRate,
+  demoSounds,
+  encodeWav,
+} from "../src/draft/synthetic";
 import { createDraftMiddleware, RecomputeQueue, readTrace, TraceWriter } from "./draft";
 import { startDraftServer } from "./draft-server";
 
@@ -42,10 +52,13 @@ async function service(localDir: string) {
 }
 
 const event = (seq: number): TraceEvent => ({
+  schemaVersion: "0.1",
   seq,
-  at: "t",
+  id: `edit_${seq}`,
   type: "edit",
-  edit: { op: "remove_beat", id: `b${seq}` },
+  tsMs: 1_700_000_000_000 + seq,
+  author: { kind: "user" },
+  payload: { op: "remove_beat", id: `b${seq}` },
 });
 
 describe("TraceWriter", () => {
@@ -54,10 +67,35 @@ describe("TraceWriter", () => {
     const path = join(root, "nested", "trace.jsonl");
     const writer = new TraceWriter();
     await Promise.all(
-      Array.from({ length: 40 }, (_, index) => writer.append(path, [event(index + 1)])),
+      Array.from({ length: 40 }, (_, index) => writer.append(path, [event(index)])),
     );
     const events = await readTrace(path);
-    expect(events.map((entry) => entry.seq)).toEqual(Array.from({ length: 40 }, (_, i) => i + 1));
+    expect(events.map((entry) => entry.seq)).toEqual(Array.from({ length: 40 }, (_, i) => i));
+  });
+
+  it("writes DraftSession NDJSON traces that round-trip cleanly through ensomi parseTraceNdjson + foldTrace", async () => {
+    const root = await folder();
+    const path = join(root, "session.jsonl");
+    const writer = new TraceWriter();
+    const pending: Promise<void>[] = [];
+    const session = new DraftSession((ev) => {
+      pending.push(writer.append(path, [ev]));
+    });
+    session.initDraft(demoAudio(), { beats: demoBeats(), sounds: demoSounds() }, demoProviders);
+    session.applyEdit({ op: "move_beat", id: "d0", t: 0.52, source: "user" });
+    session.upsertStatement({ id: "st1", kind: "steady", span: { t0: 0, t1: 14 } });
+    session.undo();
+    session.redo();
+    await Promise.all(pending);
+
+    const raw = await readFile(path, "utf8");
+    const parsed = parseTraceNdjson(raw);
+    const folded = foldTrace(parsed);
+    expect(parsed.every((ev) => ev.schemaVersion === "0.1")).toBe(true);
+    expect(folded.beats.get("d0")).toMatchObject({ t: 0.52, source: "user", version: 2 });
+    expect([...folded.statements.values()].filter((s) => s.active)).toHaveLength(1);
+    expect(sortedEntities(folded.beats)).toEqual(sortedEntities(session.state.beats));
+    expect((await readTrace(path)).map((ev) => ev.id)).toEqual(parsed.map((ev) => ev.id));
   });
 });
 
@@ -101,7 +139,7 @@ describe("RecomputeQueue", () => {
       boundaries: [],
       sounds: [],
       statements: [],
-      suppressed: [],
+      suppressions: [],
     });
     expect(outcome).toMatchObject({ status: "ok", provider: "rule mock (reserved for N1)" });
   });

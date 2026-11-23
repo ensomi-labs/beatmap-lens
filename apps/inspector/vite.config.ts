@@ -1,3 +1,4 @@
+import { resolve } from "node:path";
 import { fileURLToPath, URL } from "node:url";
 import vue from "@vitejs/plugin-vue";
 import { defineConfig } from "vite";
@@ -6,6 +7,8 @@ import { draftPlugin } from "./server/draft.ts";
 import { localFilesPlugin } from "./server/local-files.ts";
 import { timingPlugin } from "./server/timing.ts";
 
+const ensomiPackageDir = process.env.ENSOMI_PACKAGE_DIR;
+
 export default defineConfig({
   plugins: [vue(), localFilesPlugin(), comparisonsPlugin(), timingPlugin(), draftPlugin()],
   resolve: {
@@ -13,6 +16,7 @@ export default defineConfig({
       "beatmap-lens": fileURLToPath(
         new URL("../../packages/beatmap-lens/src/index.ts", import.meta.url),
       ),
+      ...(ensomiPackageDir ? { ensomi: resolve(ensomiPackageDir) } : {}),
     },
   },
 });

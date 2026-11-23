@@ -3,7 +3,7 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { createApp, nextTick } from "vue";
 import DraftWorkspace from "./DraftWorkspace.vue";
 import { draftJson, draftRequest } from "./draft/client";
-import type { PatchOffer } from "./draft/ensomi-contract";
+import { computeSemanticKey, type PatchOffer } from "./draft/ensomi-contract";
 
 vi.mock("./draft/client", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./draft/client")>()),
@@ -89,19 +89,28 @@ function shiftDrag(fromX: number, toX: number) {
 }
 
 function offer(id: string, t: number): PatchOffer {
+  const writeScope = { t0: 1, t1: 2 };
+  const ops = {
+    upsertBeats: [{ id: "d2", t, source: "rule" as const }],
+    expectedVersions: { d2: 1 },
+  };
   return {
     id,
     batchId: "b1",
     role: "alternative",
     scopeKind: "local",
+    providerId: "rule mock (reserved for N1)",
     providerKind: "rule",
-    provider: "rule mock (reserved for N1)",
-    semanticKey: `alternative:${id}`,
-    label: `Offer ${id}`,
-    span: { t0: 1, t1: 2 },
-    edits: [{ op: "move_beat", id: "d2", t, source: "rule" }],
+    generation: 1,
+    basisSeq: 2,
+    readScope: writeScope,
+    writeScope,
+    ops,
+    summary: `Offer ${id}`,
+    consequences: { beatsAdded: 0, beatsMoved: 1, beatsRemoved: 0 },
     conflicts: [],
-    consequences: { added: 0, moved: 1, removed: 0, maxShiftMs: 50, summary: `moves d2 to ${t}` },
+    semanticKey: computeSemanticKey(writeScope, ops),
+    status: "pending",
   };
 }
 
@@ -168,7 +177,10 @@ it("labels a real analysis as raw BeatThis with experimental onset-flux sounds a
   await vi.waitFor(() =>
     expect(json).toHaveBeenCalledWith("trace/append", {
       tracePath: "/repo/.local/draft-traces/a.jsonl",
-      events: [expect.objectContaining({ seq: 1, type: "init" })],
+      events: [
+        expect.objectContaining({ schemaVersion: "0.1", seq: 0, type: "audio_bound" }),
+        expect.objectContaining({ schemaVersion: "0.1", seq: 1, type: "draft_loaded" }),
+      ],
     }),
   );
 });
@@ -232,7 +244,7 @@ it("plays an offer only while Alt is held and never swaps it mid-audition", asyn
   press("\\", { code: "Backslash" });
   await nextTick();
   expect(active()).toContain("Offer B");
-  expect(text()).toContain("moves d2 to 1.45");
+  expect(text()).toContain("moves 1 beat (max 50.0 ms)");
   press("Tab");
   await nextTick();
   expect(document.querySelectorAll(".draft-offer")).toHaveLength(0);
@@ -256,4 +268,32 @@ it("tours the trouble spans with J and Shift+J, looping each with clicks on", as
   await nextTick();
   expect(rows()[0]?.classList.contains("is-active")).toBe(true);
   expect(engine.plays.at(-1)?.loop).toEqual(first?.loop);
+});
+
+it("blocks Tab acceptance when an offer conflicts with an active keep constraint", async () => {
+  await loadDemo();
+  // Select a span covering d2 (at 1.5 s) and record a keep statement (V).
+  shiftDrag(40, 120);
+  press("v");
+  await nextTick();
+  json.mockImplementation(async (operation: string) => {
+    if (operation === "recompute")
+      return {
+        status: "ok",
+        generation: 1,
+        providerKind: "rule",
+        provider: "rule mock",
+        offers: [offer("A", 1.55)],
+      };
+    return {};
+  });
+  press("k", { metaKey: true });
+  await vi.waitFor(() => expect(document.querySelectorAll(".draft-offer")).toHaveLength(1));
+  expect(text()).toContain('violates active "keep"');
+  press("2");
+  await nextTick();
+  press("Tab");
+  await nextTick();
+  expect(text()).toContain("Blocked by conflict");
+  expect(document.querySelectorAll(".draft-offer")).toHaveLength(1);
 });
