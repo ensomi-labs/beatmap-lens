@@ -117,6 +117,26 @@ export function computeUnbeatCaptureRadiusSec(msPerPx: number, isLivePlaying: bo
   return Math.min(0.035, Math.max(0.015, (6 * msPerPx) / 1000));
 }
 
+const INTERNAL_UI_TOKEN_RE =
+  /\b(?:sk:[A-Za-z0-9_-]+|\d+:(?:edit|draft_loaded|offer_accept|offer_reject|audio_bound|retract|ready)_[A-Za-z0-9_-]+|(?:offer_b|seg|span|beat|snd|sound|unbeat|offer|batch|evt|snap|ub|kb)[_-][A-Za-z0-9_-]+|b[_-][A-Za-z0-9_-]{2,}|(?:audio_bound|draft_loaded|offer_batch|offer_accept|offer_reject|listen_effort|retract|signal|edit|ready)_\d+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b/gi;
+
+/** Strips internal entity/trace identifiers so human-facing banners and conflict notes stay clean. */
+export function sanitizeUserFacingText(text: string): string {
+  return text
+    .replace(/"[^"]*"/g, (quoted) => {
+      const inner = quoted.slice(1, -1);
+      if (INTERNAL_UI_TOKEN_RE.test(inner)) {
+        INTERNAL_UI_TOKEN_RE.lastIndex = 0;
+        return "this item";
+      }
+      INTERNAL_UI_TOKEN_RE.lastIndex = 0;
+      return quoted;
+    })
+    .replace(INTERNAL_UI_TOKEN_RE, "item")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
 export interface DisplayOfferItem {
   offer: PatchOffer;
   optionLabel: string | null;
@@ -125,8 +145,8 @@ export interface DisplayOfferItem {
 }
 
 /**
- * Filters offers to human-actionable `valid` and `stale` entries and computes clean
- * 1-based `Option X of Y` labels regardless of 0-based or 1-based `optionIndex` conventions.
+ * Filters offers to human-actionable `valid` and `stale` entries, sorts `valid` offers
+ * ahead of `stale` offers, and computes clean 1-based `Option X of Y` labels.
  */
 export function buildDisplayOffers(offers: readonly PatchOffer[]): DisplayOfferItem[] {
   const actionable = offers.filter((o) => o.status === "valid" || o.status === "stale");
@@ -140,7 +160,16 @@ export function buildDisplayOffers(offers: readonly PatchOffer[]): DisplayOfferI
     list.sort((a, b) => (a.optionIndex ?? 0) - (b.optionIndex ?? 0));
   }
 
-  return actionable.map((offer) => {
+  const ordered = actionable
+    .map((offer, originalIdx) => ({ offer, originalIdx }))
+    .sort((a, b) => {
+      const aRank = a.offer.status === "valid" ? 0 : 1;
+      const bRank = b.offer.status === "valid" ? 0 : 1;
+      return aRank - bRank || a.originalIdx - b.originalIdx;
+    })
+    .map((entry) => entry.offer);
+
+  return ordered.map((offer) => {
     const siblings = byBatch.get(offer.batchId) ?? [offer];
     const totalOptions = Math.max(offer.optionCount ?? 1, siblings.length);
     let optionLabel: string | null = null;
@@ -248,13 +277,18 @@ export function computeAuditionWindow(options: {
   loopStartSec: number;
   loopEndSec: number;
   maxSpanSec?: number;
+  forwardBias?: boolean;
 }): Range {
   const maxSpan = options.maxSpanSec ?? 60;
   const dur = Math.max(0.1, options.durationSec);
   if (dur <= maxSpan) {
     return { t0: 0, t1: dur };
   }
-  if (options.activeRange && options.activeRange.t1 > options.activeRange.t0) {
+  if (
+    !options.forwardBias &&
+    options.activeRange &&
+    options.activeRange.t1 > options.activeRange.t0
+  ) {
     const len = options.activeRange.t1 - options.activeRange.t0;
     if (len <= maxSpan) {
       const pad = Math.min(4, (maxSpan - len) / 2);
@@ -263,7 +297,7 @@ export function computeAuditionWindow(options: {
       return { t0, t1: Math.min(dur, Math.min(t0 + maxSpan, t1)) };
     }
   }
-  if (options.looping && options.loopEndSec > options.loopStartSec) {
+  if (!options.forwardBias && options.looping && options.loopEndSec > options.loopStartSec) {
     const len = options.loopEndSec - options.loopStartSec;
     if (len <= maxSpan) {
       const pad = Math.min(4, (maxSpan - len) / 2);
@@ -272,8 +306,9 @@ export function computeAuditionWindow(options: {
       return { t0, t1 };
     }
   }
+  const leadBackSec = options.forwardBias ? 4 : 10;
   const half = maxSpan / 2;
-  let t0 = Math.max(0, options.playheadSec - 10);
+  let t0 = Math.max(0, options.playheadSec - leadBackSec);
   let t1 = t0 + maxSpan;
   if (t1 > dur) {
     t1 = dur;

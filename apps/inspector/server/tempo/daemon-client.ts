@@ -110,12 +110,15 @@ export interface DaemonRenderSpanResponse {
   filter: AuditionFilter;
   startSec: number;
   endSec: number;
+  startSample: number;
+  endSample: number;
   sampleRate: number;
   channels: number;
   elapsedSec: number;
 }
 
 interface PendingRpc {
+  child: ChildProcessWithoutNullStreams;
   resolve: (value: unknown) => void;
   reject: (reason: unknown) => void;
   cleanupAbort: () => void;
@@ -150,7 +153,6 @@ export class TempoDaemonClient {
   private child: ChildProcessWithoutNullStreams | null = null;
   private rl: ReadlineInterface | null = null;
   private readonly pending = new Map<string, PendingRpc>();
-  private stderrTail: string[] = [];
   private closed = false;
   private nextId = 1;
 
@@ -168,7 +170,12 @@ export class TempoDaemonClient {
     if (this.closed) {
       throw new Error("Tempo daemon client is closed.");
     }
-    if (this.child && this.child.exitCode === null && !this.child.killed) {
+    if (
+      this.child &&
+      this.child.exitCode === null &&
+      this.child.signalCode === null &&
+      !this.child.killed
+    ) {
       return this.child;
     }
 
@@ -185,15 +192,20 @@ export class TempoDaemonClient {
       env: this.env,
     });
     this.child = child;
-    this.stderrTail = [];
+    const stderrTail: string[] = [];
+
+    // Prevent unhandled stream error crashes (e.g. EPIPE when daemon exits mid-write).
+    child.stdin.on("error", () => {});
+    child.stdout.on("error", () => {});
+    child.stderr.on("error", () => {});
 
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (chunk: string) => {
       for (const line of chunk.split(/\r?\n/)) {
         const trimmed = line.trim();
         if (!trimmed) continue;
-        this.stderrTail.push(trimmed);
-        if (this.stderrTail.length > 20) this.stderrTail.shift();
+        stderrTail.push(trimmed);
+        if (stderrTail.length > 20) stderrTail.shift();
       }
     });
 
@@ -210,7 +222,7 @@ export class TempoDaemonClient {
       }
       if (!msg.id) return;
       const entry = this.pending.get(msg.id);
-      if (!entry) return;
+      if (!entry || entry.child !== child) return;
       this.pending.delete(msg.id);
       entry.cleanupAbort();
       if (msg.ok) {
@@ -222,47 +234,51 @@ export class TempoDaemonClient {
       }
     });
 
-    const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+    const rejectPendingForChild = (err: unknown) => {
+      rl.close();
       if (this.child === child) {
         this.child = null;
-        this.rl?.close();
+      }
+      if (this.rl === rl) {
         this.rl = null;
       }
-      if (this.pending.size > 0) {
-        const detail = this.stderrTail.at(-1) ?? `code=${String(code)} signal=${String(signal)}`;
-        const err = this.closed
-          ? makeAbortError("Tempo daemon closed.")
-          : new Error(`Tempo daemon exited unexpectedly (${detail}).`);
-        const entries = Array.from(this.pending.values());
-        this.pending.clear();
-        for (const entry of entries) {
-          entry.cleanupAbort();
-          entry.reject(err);
+      const owned: Array<[string, PendingRpc]> = [];
+      for (const [id, entry] of this.pending) {
+        if (entry.child === child) {
+          owned.push([id, entry]);
         }
       }
+      for (const [id, entry] of owned) {
+        this.pending.delete(id);
+        entry.cleanupAbort();
+        entry.reject(err);
+      }
+    };
+
+    const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+      const detail = stderrTail.at(-1) ?? `code=${String(code)} signal=${String(signal)}`;
+      const err = this.closed
+        ? makeAbortError("Tempo daemon closed.")
+        : new Error(`Tempo daemon exited unexpectedly (${detail}).`);
+      rejectPendingForChild(err);
     };
 
     child.once("exit", onExit);
     child.once("error", (err) => {
-      if (this.child === child) {
-        this.child = null;
-        this.rl?.close();
-        this.rl = null;
-      }
-      const entries = Array.from(this.pending.values());
-      this.pending.clear();
-      for (const entry of entries) {
-        entry.cleanupAbort();
-        entry.reject(err);
-      }
+      rejectPendingForChild(err);
     });
 
     return child;
   }
 
-  private sendRaw(payload: Record<string, unknown>): void {
-    const child = this.ensureProcess();
-    child.stdin.write(`${JSON.stringify(payload)}\n`);
+  private sendRaw(child: ChildProcessWithoutNullStreams, payload: Record<string, unknown>): void {
+    if (child.stdin.destroyed || !child.stdin.writable) {
+      throw new Error("Tempo daemon stdin pipe is not writable.");
+    }
+    child.stdin.write(`${JSON.stringify(payload)}\n`, (err) => {
+      // Handled by process exit/error listener; swallow callback error to avoid unhandled throw.
+      void err;
+    });
   }
 
   request<T>(method: string, params: Record<string, unknown>, signal?: AbortSignal): Promise<T> {
@@ -273,6 +289,13 @@ export class TempoDaemonClient {
       return Promise.reject(new Error("Tempo daemon client is closed."));
     }
 
+    let child: ChildProcessWithoutNullStreams;
+    try {
+      child = this.ensureProcess();
+    } catch (err) {
+      return Promise.reject(err);
+    }
+
     const reqId = `req_${this.nextId++}_${randomUUID().slice(0, 6)}`;
     return new Promise<T>((resolve, reject) => {
       const onAbort = () => {
@@ -280,10 +303,17 @@ export class TempoDaemonClient {
         if (!entry) return;
         this.pending.delete(reqId);
         entry.cleanupAbort();
-        if (this.child && this.child.exitCode === null && !this.child.killed) {
+        if (
+          entry.child.exitCode === null &&
+          entry.child.signalCode === null &&
+          !entry.child.killed &&
+          !entry.child.stdin.destroyed &&
+          entry.child.stdin.writable
+        ) {
           try {
-            this.child.stdin.write(
+            entry.child.stdin.write(
               `${JSON.stringify({ method: "cancel", params: { targetId: reqId } })}\n`,
+              () => {},
             );
           } catch {
             // Ignore broken pipe during shutdown.
@@ -298,13 +328,14 @@ export class TempoDaemonClient {
 
       signal?.addEventListener("abort", onAbort, { once: true });
       this.pending.set(reqId, {
+        child,
         resolve: (val) => resolve(val as T),
         reject,
         cleanupAbort,
       });
 
       try {
-        this.sendRaw({ id: reqId, method, params });
+        this.sendRaw(child, { id: reqId, method, params });
       } catch (err) {
         this.pending.delete(reqId);
         cleanupAbort();
@@ -382,7 +413,7 @@ export class TempoDaemonClient {
     if (this.closed) return;
     this.closed = true;
     const child = this.child;
-    if (!child || child.exitCode !== null || child.killed) {
+    if (!child || child.exitCode !== null || child.signalCode !== null) {
       this.child = null;
       this.rl?.close();
       this.rl = null;
@@ -394,36 +425,64 @@ export class TempoDaemonClient {
       const finish = () => {
         if (finished) return;
         finished = true;
+        clearTimeout(termTimer);
         clearTimeout(killTimer);
+        clearTimeout(giveUpTimer);
+        child.off("exit", finish);
+        child.off("close", finish);
         done();
       };
-      const killTimer = setTimeout(() => {
-        try {
-          child.kill("SIGTERM");
-        } catch {
-          // Ignore already exited child.
-        }
-        finish();
-      }, 400);
-      killTimer.unref?.();
 
       child.once("exit", finish);
+      child.once("close", finish);
+
+      const termTimer = setTimeout(() => {
+        if (child.exitCode === null && child.signalCode === null) {
+          try {
+            child.kill("SIGTERM");
+          } catch {
+            finish();
+          }
+        }
+      }, 400);
+      termTimer.unref?.();
+
+      const killTimer = setTimeout(() => {
+        if (child.exitCode === null && child.signalCode === null) {
+          try {
+            child.kill("SIGKILL");
+          } catch {
+            finish();
+          }
+        }
+      }, 800);
+      killTimer.unref?.();
+
+      const giveUpTimer = setTimeout(finish, 1500);
+      giveUpTimer.unref?.();
+
       try {
-        child.stdin.write(
-          `${JSON.stringify({ id: "shutdown", method: "shutdown", params: {} })}\n`,
-        );
-        child.stdin.end();
+        if (!child.stdin.destroyed && child.stdin.writable) {
+          child.stdin.write(
+            `${JSON.stringify({ id: "shutdown", method: "shutdown", params: {} })}\n`,
+            () => {},
+          );
+          child.stdin.end();
+        } else {
+          child.kill("SIGTERM");
+        }
       } catch {
         try {
           child.kill("SIGTERM");
         } catch {
-          // Ignore already exited child.
+          finish();
         }
-        finish();
       }
     });
 
-    this.child = null;
+    if (this.child === child) {
+      this.child = null;
+    }
     this.rl?.close();
     this.rl = null;
   }

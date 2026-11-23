@@ -1,10 +1,12 @@
-import { type ClockLine, OutputClock, type PlaybackAnchor } from "./clock";
+import { type ClockLine, OutputClock, type PlaybackAnchor, sourceAtContext } from "./clock";
 import { motionAt, type PlayheadMotion, planMotion } from "./display";
 import { heardSourceMs } from "./input";
-import { clickTimes, clickWindow, planPlay } from "./transport";
+import { clickTimes, clickWindow, frameOf, frameTime, planPlay } from "./transport";
 
 /** How far ahead a start is scheduled, so its context time is known exactly. */
 const scheduleLeadS = 0.03;
+/** How far ahead a seamless buffer swap cross-schedules stop/start on an integer frame. */
+const swapLeadS = 0.02;
 /**
  * Mark clicks are scheduled this far ahead, topped up at this interval: the main thread may stall
  * for most of a second without losing one.
@@ -49,6 +51,8 @@ export class TimingAudioEngine {
   private readonly clock = new OutputClock();
   private buffer: AudioBuffer | undefined;
   private source: AudioBufferSourceNode | undefined;
+  private sourceStartCtxS = 0;
+  private retiringSources: { node: AudioBufferSourceNode; untilS: number }[] = [];
   private anchor: PlaybackAnchor | undefined;
   private frozenMs = 0;
   /** Bumped by every play and stop, so only the latest call can start a source. */
@@ -99,9 +103,8 @@ export class TimingAudioEngine {
     return this.buffer;
   }
 
-  /** Copies each channel into a buffer of the context's rate; the samples are not converted. */
-  load(channels: Float32Array[], frames: number): AudioBuffer {
-    this.stop();
+  /** Copies each channel into a new buffer at the context's rate without altering playback. */
+  createBuffer(channels: Float32Array[], frames: number): AudioBuffer {
     const buffer = new AudioBuffer({
       numberOfChannels: channels.length,
       length: frames,
@@ -110,8 +113,97 @@ export class TimingAudioEngine {
     channels.forEach((data, channel) => {
       buffer.copyToChannel(data as Float32Array<ArrayBuffer>, channel);
     });
+    return buffer;
+  }
+
+  /** Copies each channel into a buffer of the context's rate; the samples are not converted. */
+  load(channels: Float32Array[], frames: number): AudioBuffer {
+    this.stop();
+    const buffer = this.createBuffer(channels, frames);
     this.buffer = buffer;
     return buffer;
+  }
+
+  /** Stops playback immediately and drops any loaded buffer. */
+  unload(): void {
+    this.stop();
+    this.buffer = undefined;
+  }
+
+  /**
+   * Seamlessly replaces `this.buffer` with `nextBuffer`. While playing, schedules the old
+   * `AudioBufferSourceNode` to stop and the new `AudioBufferSourceNode` to start at the exact same
+   * sample-aligned `swapContextTime = ctx.currentTime + 0.020` without interrupting transport,
+   * resetting `playing`, or creating an undefined `heardAt()` window.
+   */
+  swapBuffer(nextBuffer: AudioBuffer): void {
+    this.buffer = nextBuffer;
+    const oldSource = this.source;
+    const anchor = this.anchor;
+    if (!oldSource || !anchor) return;
+
+    const sr = this.context.sampleRate;
+    const nowS = this.context.currentTime;
+    this.retiringSources = this.retiringSources.filter((item) => {
+      if (item.untilS <= nowS) {
+        item.node.disconnect();
+        return false;
+      }
+      return true;
+    });
+
+    const swapFrame = Math.ceil((nowS + swapLeadS) * sr - 1e-6);
+    const rawSwapS = frameTime(swapFrame, sr);
+    const whenS = rawSwapS <= anchor.startCtxS ? anchor.startCtxS : rawSwapS;
+    const sourceOffsetMs = sourceAtContext(anchor, whenS);
+    if (!anchor.loop && sourceOffsetMs >= anchor.endMs) {
+      return;
+    }
+
+    const offsetFrame = frameOf(sourceOffsetMs, sr);
+    const offsetS = frameTime(offsetFrame, sr);
+
+    let loopStartS: number | null = null;
+    let loopEndS: number | null = null;
+    if (anchor.loop) {
+      const loopStart = frameOf(anchor.loop.startMs, sr);
+      const loopEnd = Math.max(loopStart + 1, frameOf(anchor.loop.endMs, sr));
+      loopStartS = frameTime(loopStart, sr);
+      loopEndS = frameTime(loopEnd, sr);
+    }
+    const endFrame = frameOf(anchor.endMs, sr);
+    const stopS = anchor.loop
+      ? null
+      : whenS + Math.max(0, endFrame - offsetFrame) / sr / anchor.rate;
+
+    oldSource.onended = null;
+    if (whenS <= this.sourceStartCtxS) {
+      oldSource.stop();
+      oldSource.disconnect();
+    } else {
+      oldSource.stop(whenS);
+      this.retiringSources.push({ node: oldSource, untilS: whenS });
+    }
+
+    const nextSource = new AudioBufferSourceNode(this.context, {
+      buffer: nextBuffer,
+      playbackRate: anchor.rate,
+      loop: loopStartS !== null,
+      ...(loopStartS !== null && loopEndS !== null
+        ? { loopStart: loopStartS, loopEnd: loopEndS }
+        : {}),
+    });
+    nextSource.connect(this.loudness);
+    nextSource.start(whenS, offsetS);
+    if (stopS !== null) nextSource.stop(stopS);
+    nextSource.onended = () => {
+      if (this.source !== nextSource) return;
+      this.frozenMs = anchor.endMs;
+      this.release();
+      this.onEnded?.(anchor.endMs);
+    };
+    this.source = nextSource;
+    this.sourceStartCtxS = whenS;
   }
 
   /**
@@ -125,8 +217,7 @@ export class TimingAudioEngine {
     rate: number;
     loop: { startMs: number; endMs: number } | null;
   }): Promise<boolean> {
-    const buffer = this.buffer;
-    if (!buffer) throw new Error("The audio is not loaded yet.");
+    if (!this.buffer) throw new Error("The audio is not loaded yet.");
     this.stop();
     const token = ++this.playToken;
     if (this.context.state !== "running") {
@@ -138,6 +229,8 @@ export class TimingAudioEngine {
       }
       if (token !== this.playToken) return false;
     }
+    const buffer = this.buffer;
+    if (!buffer) return false;
     const plan = planPlay(options, {
       currentTimeS: this.context.currentTime,
       sampleRate: this.context.sampleRate,
@@ -162,6 +255,7 @@ export class TimingAudioEngine {
       this.onEnded?.(anchor.endMs);
     };
     this.source = source;
+    this.sourceStartCtxS = plan.whenS;
     this.anchor = anchor;
     this.frozenMs = anchor.startSourceMs;
     this.clickedUntilS = 0;
@@ -253,6 +347,11 @@ export class TimingAudioEngine {
       this.source.onended = null;
       this.source.stop();
     }
+    for (const item of this.retiringSources) {
+      try {
+        item.node.stop();
+      } catch {}
+    }
     this.release();
     return shown;
   }
@@ -288,6 +387,11 @@ export class TimingAudioEngine {
   private release() {
     this.source?.disconnect();
     this.source = undefined;
+    this.sourceStartCtxS = 0;
+    for (const item of this.retiringSources) {
+      item.node.disconnect();
+    }
+    this.retiringSources = [];
     this.anchor = undefined;
     for (const click of this.clicks) {
       click.node.stop();

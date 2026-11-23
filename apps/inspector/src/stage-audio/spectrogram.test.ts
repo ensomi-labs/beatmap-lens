@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   computeSpectrogram,
   createFft,
@@ -9,6 +9,7 @@ import {
   nearestFrame,
   rowBins,
   type Spectrogram,
+  type SpectrogramWorkerResponse,
 } from "./spectrogram";
 
 /** A band-limited click centred at a fractional sample position. */
@@ -148,5 +149,60 @@ describe("levels and channels", () => {
     expect(rows.at(-1)?.lo).toBe(Math.round((30 * fftSize) / 44_100));
     // At 22.05 kHz the top is Nyquist.
     expect(rowBins(10, 22_050)[0]?.hi).toBe(fftSize / 2 - 1);
+  });
+});
+
+describe("spectrogram.worker requestId tagging", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.resetModules();
+  });
+
+  it("echoes requestId when provided and stays backward-compatible when omitted", async () => {
+    const posted: Array<{ payload: SpectrogramWorkerResponse; transfer: Transferable[] }> = [];
+    const mockSelf: {
+      onmessage: ((ev: MessageEvent) => void) | null;
+      postMessage: (payload: SpectrogramWorkerResponse, transfer: Transferable[]) => void;
+    } = {
+      onmessage: null,
+      postMessage: (payload, transfer) => {
+        posted.push({ payload, transfer });
+      },
+    };
+    vi.stubGlobal("self", mockSelf);
+    await import("./spectrogram.worker");
+    expect(mockSelf.onmessage).toBeTypeOf("function");
+
+    const samples = new Float32Array(4096);
+    mockSelf.onmessage?.({
+      data: {
+        requestId: 42,
+        channels: [samples],
+        sliceStart: 0,
+        totalFrames: samples.length,
+        sampleRate: 44_100,
+        startMs: 0,
+        endMs: 50,
+      },
+    } as MessageEvent);
+
+    expect(posted).toHaveLength(1);
+    expect(posted[0]?.payload.requestId).toBe(42);
+    expect(posted[0]?.payload.bins).toBe(fftSize / 2 + 1);
+
+    // Without requestId (TimingStage backward-compatibility):
+    mockSelf.onmessage?.({
+      data: {
+        channels: [new Float32Array(4096)],
+        sliceStart: 0,
+        totalFrames: 4096,
+        sampleRate: 44_100,
+        startMs: 0,
+        endMs: 50,
+      },
+    } as MessageEvent);
+
+    expect(posted).toHaveLength(2);
+    expect("requestId" in (posted[1]?.payload ?? {})).toBe(false);
   });
 });

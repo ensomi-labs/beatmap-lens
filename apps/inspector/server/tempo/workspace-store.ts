@@ -1,9 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
-import { createWriteStream, existsSync } from "node:fs";
+import { constants, createWriteStream, existsSync } from "node:fs";
 import {
   appendFile,
   copyFile,
+  link,
+  lstat,
   mkdir,
+  open,
   readdir,
   readFile,
   realpath,
@@ -11,9 +14,10 @@ import {
   rm,
   stat,
   truncate,
+  unlink,
   writeFile,
 } from "node:fs/promises";
-import { basename, dirname, extname, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import {
@@ -40,9 +44,121 @@ export const SUPPORTED_AUDIO_EXTENSIONS = [
 
 const AUDIO_EXT_SET = new Set<string>(SUPPORTED_AUDIO_EXTENSIONS);
 
+export const VALID_SONG_ID_RE = /^[a-z0-9][a-z0-9_-]{0,120}$/;
+
+const FINGERPRINT_SAMPLE_BYTES = 64 * 1024;
+
+export function isValidSongId(songId: string): boolean {
+  return typeof songId === "string" && VALID_SONG_ID_RE.test(songId);
+}
+
+export function assertValidSongId(songId: string): string {
+  if (!isValidSongId(songId)) {
+    throw new Error("Invalid song identifier.");
+  }
+  return songId;
+}
+
 export function isSupportedAudioFileName(fileName: string): boolean {
   if (!fileName || fileName.startsWith(".")) return false;
   return AUDIO_EXT_SET.has(extname(fileName).toLowerCase());
+}
+
+export interface AudioSourceFingerprint {
+  audioSizeBytes: number;
+  audioSha256Sample: string;
+}
+
+export async function computeAudioFingerprint(audioPath: string): Promise<AudioSourceFingerprint> {
+  const fh = await open(audioPath, "r");
+  try {
+    const info = await fh.stat();
+    if (!info.isFile()) {
+      throw new Error("Audio source path is not a regular file.");
+    }
+    const size = info.size;
+    const hasher = createHash("sha256");
+    hasher.update(`size:${size}\0`);
+
+    if (size > 0) {
+      const headLen = Math.min(size, FINGERPRINT_SAMPLE_BYTES);
+      const headBuf = Buffer.allocUnsafe(headLen);
+      const { bytesRead: headRead } = await fh.read(headBuf, 0, headLen, 0);
+      hasher.update(headBuf.subarray(0, headRead));
+
+      if (size > FINGERPRINT_SAMPLE_BYTES) {
+        const tailOffset = Math.max(headLen, size - FINGERPRINT_SAMPLE_BYTES);
+        const tailLen = size - tailOffset;
+        if (tailLen > 0) {
+          const tailBuf = Buffer.allocUnsafe(tailLen);
+          const { bytesRead: tailRead } = await fh.read(tailBuf, 0, tailLen, tailOffset);
+          hasher.update(tailBuf.subarray(0, tailRead));
+        }
+      }
+    }
+
+    return {
+      audioSizeBytes: size,
+      audioSha256Sample: hasher.digest("hex"),
+    };
+  } finally {
+    await fh.close();
+  }
+}
+
+/**
+ * Verifies that `targetPath` (existing or about-to-be-created) stays strictly inside
+ * `stateDir`, refusing traversal and refusing symlinks escaping `stateDir` via `lstat` + `realpath`.
+ */
+export async function assertContainedInStateDir(
+  stateDir: string,
+  targetPath: string,
+): Promise<string> {
+  const canonicalStateDir = await realpath(stateDir);
+  const resolved = resolve(targetPath);
+  const rel = relative(canonicalStateDir, resolved);
+  if (!rel || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+    throw new DOMException("Path escapes Tempo state directory.", "NotAllowedError");
+  }
+
+  const parts = rel.split(sep).filter(Boolean);
+  let cursor = canonicalStateDir;
+  for (const part of parts) {
+    cursor = join(cursor, part);
+    let lst: Awaited<ReturnType<typeof lstat>>;
+    try {
+      lst = await lstat(cursor);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        break;
+      }
+      throw error;
+    }
+    if (lst.isSymbolicLink()) {
+      const targetReal = await realpath(cursor).catch(() => null);
+      if (
+        !targetReal ||
+        (targetReal !== canonicalStateDir && !targetReal.startsWith(`${canonicalStateDir}${sep}`))
+      ) {
+        throw new DOMException(
+          "Refusing symlink escaping Tempo state directory.",
+          "NotAllowedError",
+        );
+      }
+    }
+  }
+
+  if (existsSync(resolved)) {
+    const finalReal = await realpath(resolved).catch(() => null);
+    if (
+      !finalReal ||
+      (finalReal !== canonicalStateDir && !finalReal.startsWith(`${canonicalStateDir}${sep}`))
+    ) {
+      throw new DOMException("Path escapes Tempo state directory.", "NotAllowedError");
+    }
+  }
+
+  return resolved;
 }
 
 export interface TempoSongSummary {
@@ -50,6 +166,8 @@ export interface TempoSongSummary {
   title: string;
   fileName: string;
   audioPath: string;
+  audioSizeBytes: number;
+  audioSha256Sample: string;
   durationSec: number | null;
   analyzed: boolean;
   segmentCount: number;
@@ -65,6 +183,11 @@ export interface TempoWorkspaceManifest {
   workspaceDir: string;
   activeSongId: string | null;
   songs: TempoSongSummary[];
+}
+
+export interface WorkspaceTarget {
+  workspaceDir: string;
+  stateDir: string;
 }
 
 export interface TraceAppendResult {
@@ -126,9 +249,7 @@ function inspectTraceContent(raw: string, allowTruncatedTail: boolean): Inspecte
       );
     }
     if (seenIds.has(event.id)) {
-      throw new Error(
-        `Invalid Tempo trace file at line ${lineNum}: duplicate event id "${event.id}".`,
-      );
+      throw new Error("Invalid Tempo trace file: duplicate event identifier.");
     }
     seenIds.add(event.id);
     prevSeq = event.seq;
@@ -150,7 +271,7 @@ function validateIncomingBatch(events: readonly TraceEvent[]): TraceEvent[] {
       );
     }
     if (seenIds.has(event.id)) {
-      throw new Error(`Incoming trace events contain duplicate id "${event.id}".`);
+      throw new Error("Incoming trace events contain duplicate event identifier.");
     }
     seenIds.add(event.id);
     prevSeq = event.seq;
@@ -161,11 +282,38 @@ function validateIncomingBatch(events: readonly TraceEvent[]): TraceEvent[] {
 
 /**
  * Mutex-serialized, crash-safe per-song `.jsonl` trace writer.
- * Validates `ensomi` `0.2` envelopes, heals torn crash tails, guarantees newline termination,
- * and prevents concurrent saves/edits from interleaving or truncating prefixes.
+ * Validates `ensomi` `0.2` envelopes, enforces `stateDir` containment, heals torn crash tails,
+ * guarantees newline termination, and prevents concurrent saves/edits from interleaving.
  */
 export class TraceWriter {
   private readonly tails = new Map<string, Promise<unknown>>();
+  private readonly getStateDir: (() => string | null) | undefined;
+
+  constructor(getStateDir?: () => string | null) {
+    this.getStateDir = getStateDir;
+  }
+
+  private async verifyPath(path: string): Promise<string> {
+    assertNotTimingFile(path);
+    const activeStateDir = this.getStateDir?.() ?? null;
+    if (activeStateDir) {
+      return await assertContainedInStateDir(activeStateDir, path);
+    }
+    const resolved = resolve(path);
+    try {
+      const lst = await lstat(resolved);
+      if (lst.isSymbolicLink()) {
+        const parentReal = await realpath(dirname(resolved));
+        const targetReal = await realpath(resolved).catch(() => null);
+        if (!targetReal?.startsWith(`${parentReal}${sep}`)) {
+          throw new DOMException("Refusing symlink trace target.", "NotAllowedError");
+        }
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    return resolved;
+  }
 
   append(path: string, events: readonly TraceEvent[]): Promise<TraceAppendResult> {
     let incoming: TraceEvent[];
@@ -177,13 +325,15 @@ export class TraceWriter {
     }
     if (incoming.length === 0) return Promise.resolve({ appended: 0, skipped: 0 });
 
-    const previous = this.tails.get(path) ?? Promise.resolve();
+    const key = resolve(path);
+    const previous = this.tails.get(key) ?? Promise.resolve();
     const next = previous
       .catch(() => {})
       .then(async (): Promise<TraceAppendResult> => {
+        const safePath = await this.verifyPath(path);
         let raw = "";
         try {
-          raw = await readFile(path, "utf8");
+          raw = await readFile(safePath, "utf8");
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
         }
@@ -204,16 +354,14 @@ export class TraceWriter {
           const existingById = byId.get(ev.id);
           if (existingBySeq && existingBySeq.id === ev.id) {
             if (canonicalJson(existingBySeq) !== canonicalJson(ev)) {
-              throw new Error(
-                `Conflicting trace event for seq ${ev.seq} / id "${ev.id}" with different content.`,
-              );
+              throw new Error(`Conflicting trace event for seq ${ev.seq} with different content.`);
             }
             skipped += 1;
             continue;
           }
           if (existingBySeq || existingById) {
             throw new Error(
-              `Conflicting trace writer: seq ${ev.seq} / id "${ev.id}" conflicts with existing trace.`,
+              `Conflicting trace writer: seq ${ev.seq} conflicts with existing trace.`,
             );
           }
           if (ev.seq <= lastSeq) {
@@ -227,44 +375,46 @@ export class TraceWriter {
           toAppend.push(ev);
         }
 
-        if (inspected.truncateBytes !== undefined && existsSync(path)) {
-          await truncate(path, inspected.truncateBytes);
+        if (inspected.truncateBytes !== undefined && existsSync(safePath)) {
+          await truncate(safePath, inspected.truncateBytes);
         }
         if (toAppend.length === 0) return { appended: 0, skipped };
 
-        await mkdir(dirname(path), { recursive: true });
+        await mkdir(dirname(safePath), { recursive: true });
+        await this.verifyPath(safePath);
         const serialized = serializeTraceNdjson(toAppend);
         const payload = inspected.needsLeadingNewline ? `\n${serialized}` : serialized;
-        await appendFile(path, payload, "utf8");
+        await appendFile(safePath, payload, "utf8");
         return { appended: toAppend.length, skipped };
       });
 
-    this.tails.set(path, next);
+    this.tails.set(key, next);
     next.then(
       () => {
-        if (this.tails.get(path) === next) this.tails.delete(path);
+        if (this.tails.get(key) === next) this.tails.delete(key);
       },
       () => {
-        if (this.tails.get(path) === next) this.tails.delete(path);
+        if (this.tails.get(key) === next) this.tails.delete(key);
       },
     );
     return next;
   }
 
   async read(path: string): Promise<TraceEvent[]> {
-    assertNotTimingFile(path);
-    const pending = this.tails.get(path);
+    const key = resolve(path);
+    const pending = this.tails.get(key);
     if (pending) await pending.catch(() => {});
+    const safePath = await this.verifyPath(path);
     let raw = "";
     try {
-      raw = await readFile(path, "utf8");
+      raw = await readFile(safePath, "utf8");
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
       throw error;
     }
     const inspected = inspectTraceContent(raw, true);
     if (inspected.truncateBytes !== undefined) {
-      await truncate(path, inspected.truncateBytes).catch(() => {});
+      await truncate(safePath, inspected.truncateBytes).catch(() => {});
     }
     return inspected.events;
   }
@@ -351,7 +501,7 @@ function sortSongsDeterministically(songs: TempoSongSummary[]): TempoSongSummary
     );
 }
 
-async function atomicWriteJson(filePath: string, value: unknown): Promise<void> {
+export async function atomicWriteJson(filePath: string, value: unknown): Promise<void> {
   const dir = dirname(filePath);
   await mkdir(dir, { recursive: true });
   const tempPath = join(
@@ -367,16 +517,74 @@ async function atomicWriteJson(filePath: string, value: unknown): Promise<void> 
   }
 }
 
-async function uniqueDestinationPath(dir: string, sanitizedName: string): Promise<string> {
+async function copyFileExclusiveWithRetry(
+  srcPath: string,
+  dir: string,
+  sanitizedName: string,
+): Promise<string> {
   const ext = extname(sanitizedName);
   const stem = basename(sanitizedName, ext);
-  let candidate = join(dir, sanitizedName);
-  let counter = 2;
-  while (existsSync(candidate)) {
-    candidate = join(dir, `${stem}-${counter}${ext}`);
-    counter += 1;
+  let counter = 1;
+  while (true) {
+    const fileName = counter === 1 ? sanitizedName : `${stem}-${counter}${ext}`;
+    const candidate = join(dir, fileName);
+    try {
+      await copyFile(srcPath, candidate, constants.COPYFILE_EXCL);
+      return candidate;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+        counter += 1;
+        continue;
+      }
+      throw error;
+    }
   }
-  return candidate;
+}
+
+async function publishTempFileExclusiveWithRetry(
+  tempPath: string,
+  dir: string,
+  sanitizedName: string,
+): Promise<string> {
+  const ext = extname(sanitizedName);
+  const stem = basename(sanitizedName, ext);
+  let counter = 1;
+  try {
+    while (true) {
+      const fileName = counter === 1 ? sanitizedName : `${stem}-${counter}${ext}`;
+      const candidate = join(dir, fileName);
+      try {
+        await link(tempPath, candidate);
+        await unlink(tempPath);
+        return candidate;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+          counter += 1;
+          continue;
+        }
+        throw error;
+      }
+    }
+  } finally {
+    await rm(tempPath, { force: true }).catch(() => {});
+  }
+}
+
+function isValidPersistedSummaryCandidate(
+  entry: unknown,
+): entry is Partial<TempoSongSummary> & { songId: string; audioPath: string } {
+  if (!entry || typeof entry !== "object") return false;
+  const candidate = entry as Partial<TempoSongSummary>;
+  if (typeof candidate.songId !== "string" || !isValidSongId(candidate.songId)) return false;
+  if (typeof candidate.audioPath !== "string" || !candidate.audioPath.trim()) return false;
+  if (!isSupportedAudioFileName(basename(candidate.audioPath))) return false;
+  if (
+    candidate.fileName !== undefined &&
+    (typeof candidate.fileName !== "string" || !isSupportedAudioFileName(candidate.fileName))
+  ) {
+    return false;
+  }
+  return true;
 }
 
 /**
@@ -386,8 +594,19 @@ export class TempoWorkspaceStore {
   private workspaceDir: string | null = null;
   private stateDir: string | null = null;
   private manifest: TempoWorkspaceManifest | null = null;
+  private opChain: Promise<unknown> = Promise.resolve();
   private writeChain: Promise<unknown> = Promise.resolve();
-  readonly traceWriter = new TraceWriter();
+  readonly traceWriter: TraceWriter;
+
+  constructor() {
+    this.traceWriter = new TraceWriter(() => this.stateDir);
+  }
+
+  private withStoreLock<T>(fn: () => Promise<T>): Promise<T> {
+    const next = this.opChain.catch(() => {}).then(fn);
+    this.opChain = next;
+    return next;
+  }
 
   get isOpen(): boolean {
     return this.workspaceDir !== null && this.stateDir !== null && this.manifest !== null;
@@ -401,6 +620,16 @@ export class TempoWorkspaceStore {
     return this.stateDir;
   }
 
+  captureTarget(): WorkspaceTarget {
+    if (!this.workspaceDir || !this.stateDir) {
+      throw new Error("Open a Tempo workspace folder first.");
+    }
+    return {
+      workspaceDir: this.workspaceDir,
+      stateDir: this.stateDir,
+    };
+  }
+
   getSnapshot(): TempoWorkspaceManifest | null {
     if (!this.manifest) return null;
     return {
@@ -412,12 +641,13 @@ export class TempoWorkspaceStore {
   }
 
   getSong(songId: string): TempoSongSummary {
+    assertValidSongId(songId);
     if (!this.manifest) {
       throw new Error("Open a Tempo workspace folder first.");
     }
     const found = this.manifest.songs.find((s) => s.songId === songId);
     if (!found) {
-      const err = new Error(`Unknown song "${songId}" in workspace.`);
+      const err = new Error("Requested song was not found in the open workspace.");
       err.name = "NotFoundError";
       throw err;
     }
@@ -425,6 +655,7 @@ export class TempoWorkspaceStore {
   }
 
   tracePathFor(songId: string): string {
+    assertValidSongId(songId);
     if (!this.stateDir) throw new Error("Open a Tempo workspace folder first.");
     this.getSong(songId);
     return join(this.stateDir, "traces", `${songId}.jsonl`);
@@ -440,6 +671,14 @@ export class TempoWorkspaceStore {
     return join(this.stateDir, ".cache", "audition");
   }
 
+  async resolveContainedStatePath(...subSegments: string[]): Promise<string> {
+    if (!this.stateDir) {
+      throw new Error("Open a Tempo workspace folder first.");
+    }
+    const target = join(this.stateDir, ...subSegments);
+    return await assertContainedInStateDir(this.stateDir, target);
+  }
+
   private manifestPath(stateDir: string): string {
     return join(stateDir, "workspace.json");
   }
@@ -453,119 +692,219 @@ export class TempoWorkspaceStore {
     };
     const next = this.writeChain
       .catch(() => {})
-      .then(() => atomicWriteJson(this.manifestPath(stateDir), snapshot));
+      .then(async () => {
+        const safeManifestPath = await assertContainedInStateDir(
+          stateDir,
+          this.manifestPath(stateDir),
+        );
+        await atomicWriteJson(safeManifestPath, snapshot);
+      });
     this.writeChain = next;
     return next;
   }
 
-  async openWorkspace(
+  private async loadOrCloneTargetManifest(
+    target: WorkspaceTarget,
+  ): Promise<TempoWorkspaceManifest> {
+    if (this.stateDir === target.stateDir && this.manifest) {
+      return {
+        schemaVersion: 1,
+        workspaceDir: this.manifest.workspaceDir,
+        activeSongId: this.manifest.activeSongId,
+        songs: this.manifest.songs.map((s) => ({ ...s })),
+      };
+    }
+    const safeManifestPath = await assertContainedInStateDir(
+      target.stateDir,
+      this.manifestPath(target.stateDir),
+    );
+    try {
+      const raw = await readFile(safeManifestPath, "utf8");
+      const parsed = JSON.parse(raw) as TempoWorkspaceManifest;
+      return {
+        schemaVersion: 1,
+        workspaceDir: parsed.workspaceDir || target.workspaceDir,
+        activeSongId: parsed.activeSongId ?? null,
+        songs: Array.isArray(parsed.songs) ? parsed.songs.map((s) => ({ ...s })) : [],
+      };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        return {
+          schemaVersion: 1,
+          workspaceDir: target.workspaceDir,
+          activeSongId: null,
+          songs: [],
+        };
+      }
+      throw error;
+    }
+  }
+
+  private async commitTargetManifest(
+    target: WorkspaceTarget,
+    nextManifest: TempoWorkspaceManifest,
+  ): Promise<TempoWorkspaceManifest> {
+    if (this.stateDir === target.stateDir) {
+      this.manifest = nextManifest;
+    }
+    await this.enqueueSave(nextManifest, target.stateDir);
+    return {
+      schemaVersion: 1,
+      workspaceDir: nextManifest.workspaceDir,
+      activeSongId: nextManifest.activeSongId,
+      songs: nextManifest.songs.map((s) => ({ ...s })),
+    };
+  }
+
+  private async rotateSupersededTrace(
+    stateDir: string,
+    songId: string,
+  ): Promise<string | undefined> {
+    assertValidSongId(songId);
+    const tracePath = await assertContainedInStateDir(
+      stateDir,
+      join(stateDir, "traces", `${songId}.jsonl`),
+    );
+    if (!existsSync(tracePath)) return undefined;
+    const backupPath = await assertContainedInStateDir(
+      stateDir,
+      `${tracePath}.superseded-${Date.now()}-${randomUUID().slice(0, 6)}.bak`,
+    );
+    await rename(tracePath, backupPath);
+    return backupPath;
+  }
+
+  openWorkspace(
     dirInput: string,
     options?: { stateDir?: string; createIfMissing?: boolean },
   ): Promise<TempoWorkspaceManifest> {
-    const resolvedInput = fullPath(dirInput);
-    if (options?.createIfMissing) {
-      await mkdir(resolvedInput, { recursive: true });
-    }
-    const info = await stat(resolvedInput);
-    if (!info.isDirectory()) {
-      throw new Error(`Expected an audio workspace folder: ${resolvedInput}`);
-    }
-    const workspaceDir = await realpath(resolvedInput);
-    const rawStateDir = options?.stateDir
-      ? resolve(fullPath(options.stateDir))
-      : join(workspaceDir, ".ensomi-tempo");
-
-    await mkdir(join(rawStateDir, "traces"), { recursive: true });
-    await mkdir(join(rawStateDir, "clips"), { recursive: true });
-    const stateDir = await realpath(rawStateDir);
-
-    let existingManifest: Partial<TempoWorkspaceManifest> | null = null;
-    try {
-      const rawJson = await readFile(this.manifestPath(stateDir), "utf8");
-      existingManifest = JSON.parse(rawJson) as Partial<TempoWorkspaceManifest>;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-        // Ignore malformed missing manifest only if unreadable? No, surface genuine JSON syntax errors unless empty.
-        throw error;
+    return this.withStoreLock(async () => {
+      const resolvedInput = fullPath(dirInput);
+      if (options?.createIfMissing) {
+        await mkdir(resolvedInput, { recursive: true });
       }
-    }
-
-    const previousByPath = new Map<string, TempoSongSummary>();
-    const previousById = new Map<string, TempoSongSummary>();
-    for (const prev of existingManifest?.songs ?? []) {
-      if (prev && typeof prev.audioPath === "string" && typeof prev.songId === "string") {
-        previousByPath.set(prev.audioPath, prev);
-        previousById.set(prev.songId, prev);
+      const info = await stat(resolvedInput);
+      if (!info.isDirectory()) {
+        throw new Error("Expected an audio workspace folder.");
       }
-    }
+      const workspaceDir = await realpath(resolvedInput);
+      const rawStateDir = options?.stateDir
+        ? resolve(fullPath(options.stateDir))
+        : join(workspaceDir, ".ensomi-tempo");
 
-    const entries = await readdir(workspaceDir, { withFileTypes: true });
-    const discoveredPaths = new Set<string>();
-    const reconciled: TempoSongSummary[] = [];
+      await mkdir(rawStateDir, { recursive: true });
+      const stateDir = await realpath(rawStateDir);
+      await assertContainedInStateDir(stateDir, join(stateDir, "traces"));
+      await assertContainedInStateDir(stateDir, join(stateDir, "clips"));
+      await mkdir(join(stateDir, "traces"), { recursive: true });
+      await mkdir(join(stateDir, "clips"), { recursive: true });
 
-    for (const entry of entries) {
-      if (entry.name.startsWith(".") || entry.name === ".ensomi-tempo") continue;
-      if (!entry.isFile() && !entry.isSymbolicLink()) continue;
-      if (!isSupportedAudioFileName(entry.name)) continue;
-      const candidatePath = join(workspaceDir, entry.name);
-      const entryStat = await stat(candidatePath).catch(() => null);
-      if (!entryStat?.isFile()) continue;
-      const canonicalAudioPath = await realpath(candidatePath);
-      discoveredPaths.add(canonicalAudioPath);
-
-      const summary = await this.buildOrReconcileSongSummary(
-        workspaceDir,
+      let existingManifest: Partial<TempoWorkspaceManifest> | null = null;
+      const safeManifestPath = await assertContainedInStateDir(
         stateDir,
-        canonicalAudioPath,
-        entry.name,
-        previousByPath.get(canonicalAudioPath) ?? previousByPath.get(candidatePath),
-        entryStat.mtimeMs,
+        this.manifestPath(stateDir),
       );
-      reconciled.push(summary);
-    }
+      try {
+        const rawJson = await readFile(safeManifestPath, "utf8");
+        existingManifest = JSON.parse(rawJson) as Partial<TempoWorkspaceManifest>;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+          throw error;
+        }
+      }
 
-    // Preserve externally linked songs from workspace.json whose audio files still exist on disk.
-    for (const prev of existingManifest?.songs ?? []) {
-      if (!prev || typeof prev.audioPath !== "string") continue;
-      const prevCanonical = await realpath(prev.audioPath).catch(() => null);
-      if (!prevCanonical || discoveredPaths.has(prevCanonical)) continue;
-      const insideWorkspace =
-        prevCanonical.startsWith(`${workspaceDir}${sep}`) &&
-        dirname(prevCanonical) === workspaceDir;
-      if (insideWorkspace) continue;
-      const extStat = await stat(prevCanonical).catch(() => null);
-      if (!extStat?.isFile()) continue;
-      discoveredPaths.add(prevCanonical);
-      const summary = await this.buildOrReconcileSongSummary(
+      const previousByPath = new Map<string, TempoSongSummary>();
+      const previousById = new Map<string, TempoSongSummary>();
+      for (const rawPrev of existingManifest?.songs ?? []) {
+        if (!isValidPersistedSummaryCandidate(rawPrev)) continue;
+        const prevCanonical = await realpath(rawPrev.audioPath).catch(() => null);
+        if (!prevCanonical) continue;
+        const prevStat = await stat(prevCanonical).catch(() => null);
+        if (!prevStat?.isFile()) continue;
+        const normalizedPrev = { ...rawPrev, audioPath: prevCanonical } as TempoSongSummary;
+        previousByPath.set(prevCanonical, normalizedPrev);
+        previousByPath.set(rawPrev.audioPath, normalizedPrev);
+        previousById.set(rawPrev.songId, normalizedPrev);
+      }
+
+      const entries = await readdir(workspaceDir, { withFileTypes: true });
+      const discoveredPaths = new Set<string>();
+      const usedSongIds = new Set<string>();
+      const reconciled: TempoSongSummary[] = [];
+
+      for (const entry of entries) {
+        if (entry.name.startsWith(".") || entry.name === ".ensomi-tempo") continue;
+        if (!entry.isFile() && !entry.isSymbolicLink()) continue;
+        if (!isSupportedAudioFileName(entry.name)) continue;
+        const candidatePath = join(workspaceDir, entry.name);
+        const canonicalAudioPath = await realpath(candidatePath).catch(() => null);
+        if (!canonicalAudioPath || discoveredPaths.has(canonicalAudioPath)) continue;
+        const entryStat = await stat(canonicalAudioPath).catch(() => null);
+        if (!entryStat?.isFile()) continue;
+        discoveredPaths.add(canonicalAudioPath);
+
+        const prev = previousByPath.get(canonicalAudioPath) ?? previousByPath.get(candidatePath);
+        const usablePrev = prev && !usedSongIds.has(prev.songId) ? prev : undefined;
+        const summary = await this.buildOrReconcileSongSummary(
+          workspaceDir,
+          stateDir,
+          canonicalAudioPath,
+          entry.name,
+          usablePrev,
+          entryStat.mtimeMs,
+        );
+        usedSongIds.add(summary.songId);
+        reconciled.push(summary);
+      }
+
+      // Preserve externally linked songs from workspace.json whose audio files still exist as regular files.
+      for (const rawPrev of existingManifest?.songs ?? []) {
+        if (!isValidPersistedSummaryCandidate(rawPrev)) continue;
+        const prevCanonical = await realpath(rawPrev.audioPath).catch(() => null);
+        if (!prevCanonical || discoveredPaths.has(prevCanonical)) continue;
+        const insideWorkspace =
+          prevCanonical.startsWith(`${workspaceDir}${sep}`) &&
+          dirname(prevCanonical) === workspaceDir;
+        if (insideWorkspace) continue;
+        const extStat = await stat(prevCanonical).catch(() => null);
+        if (!extStat?.isFile()) continue;
+        const fileName = rawPrev.fileName || basename(prevCanonical);
+        if (!isSupportedAudioFileName(fileName)) continue;
+        if (usedSongIds.has(rawPrev.songId)) continue;
+        discoveredPaths.add(prevCanonical);
+
+        const summary = await this.buildOrReconcileSongSummary(
+          workspaceDir,
+          stateDir,
+          prevCanonical,
+          fileName,
+          previousById.get(rawPrev.songId),
+          extStat.mtimeMs,
+        );
+        usedSongIds.add(summary.songId);
+        reconciled.push(summary);
+      }
+
+      const sortedSongs = sortSongsDeterministically(reconciled);
+      const prevActive = existingManifest?.activeSongId ?? this.manifest?.activeSongId ?? null;
+      const activeSongId =
+        prevActive && isValidSongId(prevActive) && sortedSongs.some((s) => s.songId === prevActive)
+          ? prevActive
+          : (sortedSongs[0]?.songId ?? null);
+
+      const nextManifest: TempoWorkspaceManifest = {
+        schemaVersion: 1,
         workspaceDir,
-        stateDir,
-        prevCanonical,
-        prev.fileName || basename(prevCanonical),
-        previousById.get(prev.songId) ?? prev,
-        extStat.mtimeMs,
-      );
-      reconciled.push(summary);
-    }
+        activeSongId,
+        songs: sortedSongs,
+      };
 
-    const sortedSongs = sortSongsDeterministically(reconciled);
-    const prevActive = existingManifest?.activeSongId ?? this.manifest?.activeSongId ?? null;
-    const activeSongId =
-      prevActive && sortedSongs.some((s) => s.songId === prevActive)
-        ? prevActive
-        : (sortedSongs[0]?.songId ?? null);
-
-    const nextManifest: TempoWorkspaceManifest = {
-      schemaVersion: 1,
-      workspaceDir,
-      activeSongId,
-      songs: sortedSongs,
-    };
-
-    this.workspaceDir = workspaceDir;
-    this.stateDir = stateDir;
-    this.manifest = nextManifest;
-    await this.enqueueSave(nextManifest, stateDir);
-    return this.getSnapshot() as TempoWorkspaceManifest;
+      this.workspaceDir = workspaceDir;
+      this.stateDir = stateDir;
+      this.manifest = nextManifest;
+      await this.enqueueSave(nextManifest, stateDir);
+      return this.getSnapshot() as TempoWorkspaceManifest;
+    });
   }
 
   private async buildOrReconcileSongSummary(
@@ -576,26 +915,50 @@ export class TempoWorkspaceStore {
     existing: TempoSongSummary | undefined,
     fallbackUpdatedMs: number,
   ): Promise<TempoSongSummary> {
-    const songId = existing?.songId ?? deriveSongId(workspaceDir, audioPath);
+    const fingerprint = await computeAudioFingerprint(audioPath);
+    const candidateId =
+      existing && isValidSongId(existing.songId)
+        ? existing.songId
+        : deriveSongId(workspaceDir, audioPath);
+    const songId = assertValidSongId(candidateId);
     const title = existing?.title ?? basename(fileName, extname(fileName));
+
+    const fingerprintMismatch =
+      existing !== undefined &&
+      typeof existing.audioSha256Sample === "string" &&
+      existing.audioSha256Sample.length > 0 &&
+      (existing.audioSizeBytes !== fingerprint.audioSizeBytes ||
+        existing.audioSha256Sample !== fingerprint.audioSha256Sample);
+
+    if (fingerprintMismatch) {
+      await this.rotateSupersededTrace(stateDir, songId);
+    }
+
+    const validExisting = fingerprintMismatch ? undefined : existing;
+
     const base: TempoSongSummary = {
       songId,
       title,
       fileName,
       audioPath,
-      durationSec: existing?.durationSec ?? null,
-      analyzed: existing?.analyzed ?? false,
-      segmentCount: existing?.segmentCount ?? 0,
-      keptSegmentCount: existing?.keptSegmentCount ?? 0,
-      inboxCount: existing?.inboxCount ?? 0,
-      highestPriority: existing?.highestPriority ?? null,
-      ready: existing?.ready ?? false,
-      updatedAtMs: existing?.updatedAtMs ?? Math.round(fallbackUpdatedMs),
+      audioSizeBytes: fingerprint.audioSizeBytes,
+      audioSha256Sample: fingerprint.audioSha256Sample,
+      durationSec: validExisting?.durationSec ?? null,
+      analyzed: validExisting?.analyzed ?? false,
+      segmentCount: validExisting?.segmentCount ?? 0,
+      keptSegmentCount: validExisting?.keptSegmentCount ?? 0,
+      inboxCount: validExisting?.inboxCount ?? 0,
+      highestPriority: validExisting?.highestPriority ?? null,
+      ready: validExisting?.ready ?? false,
+      updatedAtMs: validExisting?.updatedAtMs ?? Math.round(fallbackUpdatedMs),
     };
 
-    const tracePath = join(stateDir, "traces", `${songId}.jsonl`);
-    if (!existing && existsSync(tracePath)) {
-      const events = await this.traceWriter.read(tracePath).catch(() => []);
+    const tracePath = await assertContainedInStateDir(
+      stateDir,
+      join(stateDir, "traces", `${songId}.jsonl`),
+    );
+    if (!validExisting && !fingerprintMismatch && existsSync(tracePath)) {
+      const events = await this.traceWriter.read(tracePath);
       if (events.length > 0) {
         const folded = foldTrace(events);
         return summarizeSongFromState(base, folded, undefined, base.updatedAtMs);
@@ -604,126 +967,213 @@ export class TempoWorkspaceStore {
     return base;
   }
 
-  async importPaths(options: {
+  /**
+   * Verifies that `song.audioPath` is still an existing regular file with matching source
+   * fingerprint; if the audio file on disk changed since the trace was recorded, rotates the
+   * stale `.jsonl` trace to `<trace>.superseded-<ts>.bak` and resets summary metadata.
+   */
+  verifySongAudioFreshness(
+    songId: string,
+  ): Promise<{ song: TempoSongSummary; rotated: boolean; backupPath?: string }> {
+    assertValidSongId(songId);
+    return this.withStoreLock(async () => {
+      if (!this.manifest || !this.stateDir) {
+        throw new Error("Open a Tempo workspace folder first.");
+      }
+      const stateDir = this.stateDir;
+      const idx = this.manifest.songs.findIndex((s) => s.songId === songId);
+      const current = idx >= 0 ? this.manifest.songs[idx] : undefined;
+      if (!current) {
+        const err = new Error("Requested song was not found in the open workspace.");
+        err.name = "NotFoundError";
+        throw err;
+      }
+
+      const canonicalAudio = await realpath(current.audioPath).catch(() => null);
+      if (!canonicalAudio) {
+        const err = new Error("Audio file not found.");
+        err.name = "NotFoundError";
+        throw err;
+      }
+      const liveFp = await computeAudioFingerprint(canonicalAudio);
+      await assertContainedInStateDir(stateDir, join(stateDir, "traces", `${songId}.jsonl`));
+
+      const changed =
+        typeof current.audioSha256Sample === "string" &&
+        current.audioSha256Sample.length > 0 &&
+        (current.audioSizeBytes !== liveFp.audioSizeBytes ||
+          current.audioSha256Sample !== liveFp.audioSha256Sample);
+
+      if (!changed) {
+        if (
+          current.audioPath !== canonicalAudio ||
+          current.audioSizeBytes !== liveFp.audioSizeBytes ||
+          current.audioSha256Sample !== liveFp.audioSha256Sample
+        ) {
+          const synced: TempoSongSummary = {
+            ...current,
+            audioPath: canonicalAudio,
+            audioSizeBytes: liveFp.audioSizeBytes,
+            audioSha256Sample: liveFp.audioSha256Sample,
+          };
+          this.manifest.songs[idx] = synced;
+          await this.enqueueSave(this.manifest, stateDir);
+          return { song: { ...synced }, rotated: false };
+        }
+        return { song: { ...current }, rotated: false };
+      }
+
+      const backupPath = await this.rotateSupersededTrace(stateDir, songId);
+      const resetSong: TempoSongSummary = {
+        ...current,
+        audioPath: canonicalAudio,
+        audioSizeBytes: liveFp.audioSizeBytes,
+        audioSha256Sample: liveFp.audioSha256Sample,
+        durationSec: null,
+        analyzed: false,
+        segmentCount: 0,
+        keptSegmentCount: 0,
+        inboxCount: 0,
+        highestPriority: null,
+        ready: false,
+        updatedAtMs: Date.now(),
+      };
+      this.manifest.songs[idx] = resetSong;
+      await this.enqueueSave(this.manifest, stateDir);
+      return {
+        song: { ...resetSong },
+        rotated: true,
+        ...(backupPath ? { backupPath } : {}),
+      };
+    });
+  }
+
+  importPaths(options: {
     paths: readonly string[];
     copyIntoWorkspace?: boolean;
+    target?: WorkspaceTarget;
   }): Promise<{ workspace: TempoWorkspaceManifest; importedSongIds: string[] }> {
-    if (!this.workspaceDir || !this.stateDir || !this.manifest) {
-      throw new Error("Open a Tempo workspace folder before importing audio.");
-    }
-    if (!Array.isArray(options.paths) || options.paths.length === 0) {
-      throw new Error("Provide at least one audio file or directory path to import.");
-    }
+    return this.withStoreLock(async () => {
+      const target = options.target ?? this.captureTarget();
+      const { workspaceDir, stateDir } = target;
+      if (!Array.isArray(options.paths) || options.paths.length === 0) {
+        throw new Error("Provide at least one audio file or directory path to import.");
+      }
 
-    const workspaceDir = this.workspaceDir;
-    const stateDir = this.stateDir;
-    const copyIntoWorkspace = Boolean(options.copyIntoWorkspace);
-    const candidateFiles: string[] = [];
+      const copyIntoWorkspace = Boolean(options.copyIntoWorkspace);
+      const candidateFiles: string[] = [];
 
-    for (const rawInput of options.paths) {
-      if (typeof rawInput !== "string" || !rawInput.trim()) continue;
-      const expanded = fullPath(rawInput);
-      const st = await stat(expanded);
-      if (st.isDirectory()) {
-        const dirCanonical = await realpath(expanded);
-        const dirEntries = await readdir(dirCanonical, { withFileTypes: true });
-        const names = dirEntries
-          .filter(
-            (e) =>
-              !e.name.startsWith(".") &&
-              e.name !== ".ensomi-tempo" &&
-              (e.isFile() || e.isSymbolicLink()) &&
-              isSupportedAudioFileName(e.name),
-          )
-          .map((e) => e.name)
-          .sort((a, b) => a.localeCompare(b, "en", { numeric: true, sensitivity: "base" }));
-        for (const name of names) {
-          const subPath = join(dirCanonical, name);
-          const subStat = await stat(subPath).catch(() => null);
-          if (subStat?.isFile()) candidateFiles.push(await realpath(subPath));
+      for (const rawInput of options.paths) {
+        if (typeof rawInput !== "string" || !rawInput.trim()) continue;
+        const expanded = fullPath(rawInput);
+        const st = await stat(expanded);
+        if (st.isDirectory()) {
+          const dirCanonical = await realpath(expanded);
+          const dirEntries = await readdir(dirCanonical, { withFileTypes: true });
+          const names = dirEntries
+            .filter(
+              (e) =>
+                !e.name.startsWith(".") &&
+                e.name !== ".ensomi-tempo" &&
+                (e.isFile() || e.isSymbolicLink()) &&
+                isSupportedAudioFileName(e.name),
+            )
+            .map((e) => e.name)
+            .sort((a, b) => a.localeCompare(b, "en", { numeric: true, sensitivity: "base" }));
+          for (const name of names) {
+            const subPath = join(dirCanonical, name);
+            const subCanonical = await realpath(subPath).catch(() => null);
+            if (!subCanonical) continue;
+            const subStat = await stat(subCanonical).catch(() => null);
+            if (subStat?.isFile()) candidateFiles.push(subCanonical);
+          }
+        } else if (st.isFile()) {
+          const ext = extname(expanded).toLowerCase();
+          if (!AUDIO_EXT_SET.has(ext)) {
+            throw new Error(
+              `Unsupported audio file "${basename(expanded)}". Supported formats: ${SUPPORTED_AUDIO_EXTENSIONS.join(", ")}.`,
+            );
+          }
+          const canonicalFile = await realpath(expanded);
+          const realStat = await stat(canonicalFile);
+          if (!realStat.isFile()) {
+            throw new Error("Audio source path is not a regular file.");
+          }
+          candidateFiles.push(canonicalFile);
+        } else {
+          throw new Error("Import path must be an audio file or directory.");
         }
-      } else if (st.isFile()) {
-        const ext = extname(expanded).toLowerCase();
-        if (!AUDIO_EXT_SET.has(ext)) {
-          throw new Error(
-            `Unsupported audio file "${basename(expanded)}". Supported formats: ${SUPPORTED_AUDIO_EXTENSIONS.join(", ")}.`,
-          );
+      }
+
+      if (candidateFiles.length === 0) {
+        throw new Error("No supported audio files found in the specified path(s).");
+      }
+
+      const targetManifest = await this.loadOrCloneTargetManifest(target);
+      const importedSongIds: string[] = [];
+      const byAudioPath = new Map(targetManifest.songs.map((s) => [s.audioPath, s]));
+
+      for (const srcPath of candidateFiles) {
+        const isAlreadyInside =
+          srcPath.startsWith(`${workspaceDir}${sep}`) && dirname(srcPath) === workspaceDir;
+        if (!copyIntoWorkspace || isAlreadyInside) {
+          const alreadyRegistered = byAudioPath.get(srcPath);
+          if (alreadyRegistered) {
+            importedSongIds.push(alreadyRegistered.songId);
+            continue;
+          }
         }
-        candidateFiles.push(await realpath(expanded));
-      } else {
-        throw new Error(`Not a file or directory: ${expanded}`);
-      }
-    }
 
-    if (candidateFiles.length === 0) {
-      throw new Error("No supported audio files found in the specified path(s).");
-    }
+        let finalAudioPath = srcPath;
+        if (copyIntoWorkspace && !isAlreadyInside) {
+          const sanitized = sanitizeAudioUploadName(basename(srcPath));
+          const dest = await copyFileExclusiveWithRetry(srcPath, workspaceDir, sanitized);
+          finalAudioPath = await realpath(dest);
+        }
 
-    const importedSongIds: string[] = [];
-    const byAudioPath = new Map(this.manifest.songs.map((s) => [s.audioPath, s]));
+        const existingAfterCopy = byAudioPath.get(finalAudioPath);
+        if (existingAfterCopy) {
+          importedSongIds.push(existingAfterCopy.songId);
+          continue;
+        }
 
-    for (const srcPath of candidateFiles) {
-      const alreadyRegistered = byAudioPath.get(srcPath);
-      if (alreadyRegistered) {
-        importedSongIds.push(alreadyRegistered.songId);
-        continue;
-      }
-
-      let finalAudioPath = srcPath;
-      const isAlreadyInside =
-        srcPath.startsWith(`${workspaceDir}${sep}`) && dirname(srcPath) === workspaceDir;
-      if (copyIntoWorkspace && !isAlreadyInside) {
-        const sanitized = sanitizeAudioUploadName(basename(srcPath));
-        const dest = await uniqueDestinationPath(workspaceDir, sanitized);
-        await copyFile(srcPath, dest);
-        finalAudioPath = await realpath(dest);
+        const fileStat = await stat(finalAudioPath);
+        const fileName = basename(finalAudioPath);
+        const summary = await this.buildOrReconcileSongSummary(
+          workspaceDir,
+          stateDir,
+          finalAudioPath,
+          fileName,
+          undefined,
+          fileStat.mtimeMs,
+        );
+        byAudioPath.set(finalAudioPath, summary);
+        importedSongIds.push(summary.songId);
       }
 
-      const existingAfterCopy = byAudioPath.get(finalAudioPath);
-      if (existingAfterCopy) {
-        importedSongIds.push(existingAfterCopy.songId);
-        continue;
+      targetManifest.songs = sortSongsDeterministically(Array.from(byAudioPath.values()));
+      if (importedSongIds[0]) {
+        targetManifest.activeSongId = importedSongIds[0];
+      } else if (!targetManifest.activeSongId && targetManifest.songs[0]) {
+        targetManifest.activeSongId = targetManifest.songs[0].songId;
       }
 
-      const fileStat = await stat(finalAudioPath);
-      const fileName = basename(finalAudioPath);
-      const summary = await this.buildOrReconcileSongSummary(
-        workspaceDir,
-        stateDir,
-        finalAudioPath,
-        fileName,
-        undefined,
-        fileStat.mtimeMs,
-      );
-      byAudioPath.set(finalAudioPath, summary);
-      importedSongIds.push(summary.songId);
-    }
-
-    this.manifest.songs = sortSongsDeterministically(Array.from(byAudioPath.values()));
-    if (importedSongIds[0]) {
-      this.manifest.activeSongId = importedSongIds[0];
-    } else if (!this.manifest.activeSongId && this.manifest.songs[0]) {
-      this.manifest.activeSongId = this.manifest.songs[0].songId;
-    }
-
-    await this.enqueueSave(this.manifest, stateDir);
-    return {
-      workspace: this.getSnapshot() as TempoWorkspaceManifest,
-      importedSongIds,
-    };
+      const saved = await this.commitTargetManifest(target, targetManifest);
+      return {
+        workspace: saved,
+        importedSongIds,
+      };
+    });
   }
 
   async importUploadedStream(
     rawFileName: string,
     stream: Readable,
+    explicitTarget?: WorkspaceTarget,
   ): Promise<{ workspace: TempoWorkspaceManifest; song: TempoSongSummary }> {
-    if (!this.workspaceDir || !this.stateDir || !this.manifest) {
-      throw new Error("Open a Tempo workspace folder before uploading audio.");
-    }
-    const workspaceDir = this.workspaceDir;
-    const stateDir = this.stateDir;
+    const target = explicitTarget ?? this.captureTarget();
+    const { workspaceDir, stateDir } = target;
     const sanitized = sanitizeAudioUploadName(rawFileName);
-    const destPath = await uniqueDestinationPath(workspaceDir, sanitized);
     const tempPath = join(workspaceDir, `.upload.${process.pid}.${randomUUID().slice(0, 8)}.tmp`);
 
     let byteCount = 0;
@@ -736,115 +1186,121 @@ export class TempoWorkspaceStore {
       if (byteCount === 0) {
         throw new Error("Uploaded audio file is empty.");
       }
-      await rename(tempPath, destPath);
     } catch (error) {
       await rm(tempPath, { force: true }).catch(() => {});
       throw error;
     }
 
-    const canonicalDest = await realpath(destPath);
-    const fileName = basename(canonicalDest);
-    const song = await this.buildOrReconcileSongSummary(
-      workspaceDir,
-      stateDir,
-      canonicalDest,
-      fileName,
-      undefined,
-      Date.now(),
-    );
+    return await this.withStoreLock(async () => {
+      const destPath = await publishTempFileExclusiveWithRetry(tempPath, workspaceDir, sanitized);
+      const canonicalDest = await realpath(destPath);
+      const fileName = basename(canonicalDest);
+      const song = await this.buildOrReconcileSongSummary(
+        workspaceDir,
+        stateDir,
+        canonicalDest,
+        fileName,
+        undefined,
+        Date.now(),
+      );
 
-    const filtered = this.manifest.songs.filter((s) => s.songId !== song.songId);
-    filtered.push(song);
-    this.manifest.songs = sortSongsDeterministically(filtered);
-    this.manifest.activeSongId = song.songId;
-    await this.enqueueSave(this.manifest, stateDir);
+      const targetManifest = await this.loadOrCloneTargetManifest(target);
+      const filtered = targetManifest.songs.filter((s) => s.songId !== song.songId);
+      filtered.push(song);
+      targetManifest.songs = sortSongsDeterministically(filtered);
+      targetManifest.activeSongId = song.songId;
+      const saved = await this.commitTargetManifest(target, targetManifest);
 
-    return {
-      workspace: this.getSnapshot() as TempoWorkspaceManifest,
-      song: { ...song },
-    };
+      return {
+        workspace: saved,
+        song: { ...song },
+      };
+    });
   }
 
   async importUploadedBuffer(
     rawFileName: string,
     bytes: Uint8Array,
+    explicitTarget?: WorkspaceTarget,
   ): Promise<{ workspace: TempoWorkspaceManifest; song: TempoSongSummary }> {
-    if (!this.workspaceDir || !this.stateDir || !this.manifest) {
-      throw new Error("Open a Tempo workspace folder before uploading audio.");
-    }
+    const target = explicitTarget ?? this.captureTarget();
     if (bytes.byteLength === 0) {
       throw new Error("Uploaded audio file is empty.");
     }
-    const workspaceDir = this.workspaceDir;
-    const stateDir = this.stateDir;
+    const { workspaceDir, stateDir } = target;
     const sanitized = sanitizeAudioUploadName(rawFileName);
-    const destPath = await uniqueDestinationPath(workspaceDir, sanitized);
     const tempPath = join(workspaceDir, `.upload.${process.pid}.${randomUUID().slice(0, 8)}.tmp`);
 
     try {
       await writeFile(tempPath, bytes, { flag: "wx" });
-      await rename(tempPath, destPath);
     } catch (error) {
       await rm(tempPath, { force: true }).catch(() => {});
       throw error;
     }
 
-    const canonicalDest = await realpath(destPath);
-    const fileName = basename(canonicalDest);
-    const song = await this.buildOrReconcileSongSummary(
-      workspaceDir,
-      stateDir,
-      canonicalDest,
-      fileName,
-      undefined,
-      Date.now(),
-    );
+    return await this.withStoreLock(async () => {
+      const destPath = await publishTempFileExclusiveWithRetry(tempPath, workspaceDir, sanitized);
+      const canonicalDest = await realpath(destPath);
+      const fileName = basename(canonicalDest);
+      const song = await this.buildOrReconcileSongSummary(
+        workspaceDir,
+        stateDir,
+        canonicalDest,
+        fileName,
+        undefined,
+        Date.now(),
+      );
 
-    const filtered = this.manifest.songs.filter((s) => s.songId !== song.songId);
-    filtered.push(song);
-    this.manifest.songs = sortSongsDeterministically(filtered);
-    this.manifest.activeSongId = song.songId;
-    await this.enqueueSave(this.manifest, stateDir);
+      const targetManifest = await this.loadOrCloneTargetManifest(target);
+      const filtered = targetManifest.songs.filter((s) => s.songId !== song.songId);
+      filtered.push(song);
+      targetManifest.songs = sortSongsDeterministically(filtered);
+      targetManifest.activeSongId = song.songId;
+      const saved = await this.commitTargetManifest(target, targetManifest);
 
-    return {
-      workspace: this.getSnapshot() as TempoWorkspaceManifest,
-      song: { ...song },
-    };
+      return {
+        workspace: saved,
+        song: { ...song },
+      };
+    });
   }
 
-  async setActiveSong(songId: string): Promise<TempoSongSummary> {
-    if (!this.manifest || !this.stateDir) {
-      throw new Error("Open a Tempo workspace folder first.");
-    }
-    const song = this.getSong(songId);
-    if (this.manifest.activeSongId !== songId) {
-      this.manifest.activeSongId = songId;
-      await this.enqueueSave(this.manifest, this.stateDir);
-    }
-    return song;
+  setActiveSong(songId: string): Promise<TempoSongSummary> {
+    assertValidSongId(songId);
+    return this.withStoreLock(async () => {
+      if (!this.manifest || !this.stateDir) {
+        throw new Error("Open a Tempo workspace folder first.");
+      }
+      const song = this.getSong(songId);
+      if (this.manifest.activeSongId !== songId) {
+        this.manifest.activeSongId = songId;
+        await this.enqueueSave(this.manifest, this.stateDir);
+      }
+      return song;
+    });
   }
 
-  async updateSongFromState(
+  updateSongFromState(
     songId: string,
     state: SessionState,
     inboxSpans?: readonly Span[],
   ): Promise<TempoSongSummary> {
-    if (!this.manifest || !this.stateDir) {
-      throw new Error("Open a Tempo workspace folder first.");
-    }
-    const idx = this.manifest.songs.findIndex((s) => s.songId === songId);
-    if (idx < 0) {
-      const err = new Error(`Unknown song "${songId}" in workspace.`);
-      err.name = "NotFoundError";
-      throw err;
-    }
-    const current = this.manifest.songs[idx];
-    if (!current) {
-      throw new Error(`Unknown song "${songId}" in workspace.`);
-    }
-    const updated = summarizeSongFromState(current, state, inboxSpans);
-    this.manifest.songs[idx] = updated;
-    await this.enqueueSave(this.manifest, this.stateDir);
-    return { ...updated };
+    assertValidSongId(songId);
+    return this.withStoreLock(async () => {
+      if (!this.manifest || !this.stateDir) {
+        throw new Error("Open a Tempo workspace folder first.");
+      }
+      const idx = this.manifest.songs.findIndex((s) => s.songId === songId);
+      const current = idx >= 0 ? this.manifest.songs[idx] : undefined;
+      if (!current) {
+        const err = new Error("Requested song was not found in the open workspace.");
+        err.name = "NotFoundError";
+        throw err;
+      }
+      const updated = summarizeSongFromState(current, state, inboxSpans);
+      this.manifest.songs[idx] = updated;
+      await this.enqueueSave(this.manifest, this.stateDir);
+      return { ...updated };
+    });
   }
 }

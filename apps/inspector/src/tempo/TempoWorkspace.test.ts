@@ -20,10 +20,15 @@ const engineSpy = vi.hoisted(() => ({
   plays: 0,
   stops: 0,
   loads: 0,
+  swaps: 0,
+  unloads: 0,
+  lastBufferChannels: null as Float32Array[] | null,
   clicks: [] as (number[] | null)[],
   clickVolumes: [] as number[],
   playing: false,
   positionMs: 0,
+  forceContextSampleRate: null as number | null,
+  overrideHeardAt: undefined as (() => number | undefined) | undefined,
 }));
 
 vi.mock("../stage-audio", async () => {
@@ -33,33 +38,74 @@ vi.mock("../stage-audio", async () => {
     StageAudioEngine: class {
       readonly sampleRate: number;
       readonly context: { decodeAudioData: (buf: ArrayBuffer) => Promise<AudioBuffer> };
+      loaded: AudioBuffer | undefined;
       playing = false;
       starting = false;
       onEnded: ((posMs: number) => void) | undefined;
 
       constructor(sampleRate: number) {
-        this.sampleRate = sampleRate;
+        this.sampleRate = engineSpy.forceContextSampleRate ?? sampleRate;
         this.context = {
-          decodeAudioData: async () =>
-            ({
+          decodeAudioData: async (buf: ArrayBuffer) => {
+            // Support synthetic float32 test payload marker (`AUD!`) or default 16s buffer.
+            if (buf.byteLength >= 12) {
+              const dv = new DataView(buf);
+              if (dv.getUint32(0, true) === 0x21445541) {
+                const len = dv.getUint32(4, true);
+                const fill = dv.getFloat32(8, true);
+                const data = new Float32Array(len).fill(fill);
+                return {
+                  numberOfChannels: 1,
+                  sampleRate: this.sampleRate,
+                  length: len,
+                  duration: len / this.sampleRate,
+                  getChannelData: () => data,
+                } as unknown as AudioBuffer;
+              }
+            }
+            return {
               numberOfChannels: 1,
               sampleRate: this.sampleRate,
               length: this.sampleRate * 16,
               duration: 16,
               getChannelData: () => new Float32Array(this.sampleRate * 16),
-            }) as unknown as AudioBuffer,
+            } as unknown as AudioBuffer;
+          },
         };
+      }
+
+      createBuffer(channels: Float32Array[], frames: number): AudioBuffer {
+        const cloned = channels.map((c) => Float32Array.from(c));
+        return {
+          numberOfChannels: cloned.length,
+          sampleRate: this.sampleRate,
+          length: frames,
+          duration: frames / this.sampleRate,
+          getChannelData: (c: number) => cloned[c] ?? new Float32Array(frames),
+        } as unknown as AudioBuffer;
       }
 
       load(channels: Float32Array[], frames: number): AudioBuffer {
         engineSpy.loads += 1;
-        return {
-          numberOfChannels: channels.length,
-          sampleRate: this.sampleRate,
-          length: frames,
-          duration: frames / this.sampleRate,
-          getChannelData: (c: number) => channels[c] ?? new Float32Array(frames),
-        } as unknown as AudioBuffer;
+        const buf = this.createBuffer(channels, frames);
+        this.loaded = buf;
+        engineSpy.lastBufferChannels = channels.map((c) => Float32Array.from(c));
+        return buf;
+      }
+
+      swapBuffer(nextBuffer: AudioBuffer) {
+        engineSpy.swaps += 1;
+        this.loaded = nextBuffer;
+        engineSpy.lastBufferChannels = Array.from({ length: nextBuffer.numberOfChannels }, (_, c) =>
+          Float32Array.from(nextBuffer.getChannelData(c)),
+        );
+      }
+
+      unload() {
+        engineSpy.unloads += 1;
+        this.playing = false;
+        engineSpy.playing = false;
+        this.loaded = undefined;
       }
 
       async play(opts: { fromMs: number }) {
@@ -85,6 +131,9 @@ vi.mock("../stage-audio", async () => {
         return engineSpy.positionMs;
       }
       heardAt() {
+        if (engineSpy.overrideHeardAt) {
+          return engineSpy.overrideHeardAt();
+        }
         return this.playing ? engineSpy.positionMs : undefined;
       }
       setClicks(beats: number[] | null) {
@@ -292,7 +341,7 @@ function buildPayload(rec: MockSongRecord): TempoSongSessionPayload {
   const serialized = serializeState(st);
   const gridFit = computeGridFit(st.sounds, st.beats, st.segments);
   const inboxSpans = rankInboxSpans(st);
-  const redLineProjection = projectRedLines(st.beats, st.segments);
+  const redLineProjection = projectRedLines(st.beats, st.segments, { spans: st.spans });
   const summary: TempoSongSummary = {
     ...rec.summary,
     durationSec: st.durationSec || 16,
@@ -318,11 +367,13 @@ function buildPayload(rec: MockSongRecord): TempoSongSessionPayload {
     },
     holdingOffers: rec.controller.isHoldingOffers(),
     heldOffers: rec.controller.getHeldOffers(),
+    canUndo: rec.controller.canUndo(),
+    canRedo: rec.controller.canRedo(),
   };
 }
 
 async function flushUi() {
-  for (let i = 0; i < 6; i += 1) {
+  for (let i = 0; i < 10; i += 1) {
     await Promise.resolve();
     await nextTick();
   }
@@ -340,10 +391,15 @@ describe("TempoWorkspace interactive UI", () => {
       plays: 0,
       stops: 0,
       loads: 0,
+      swaps: 0,
+      unloads: 0,
+      lastBufferChannels: null,
       clicks: [],
       clickVolumes: [],
       playing: false,
       positionMs: 0,
+      forceContextSampleRate: null,
+      overrideHeardAt: undefined,
     });
 
     const song1 = makeSongRecord("01-campanella-a1b2c3d4", "01 - Lime - Campanella", "01.mp3");
@@ -429,27 +485,12 @@ describe("TempoWorkspace interactive UI", () => {
 
           if (rest === "edit" && method === "POST") {
             if (body.action === "undo") {
-              const st = rec.controller.getState();
-              const target = [...st.events]
-                .reverse()
-                .find(
-                  (ev) =>
-                    !st.retractedEventIds.has(ev.id) &&
-                    (ev.type === "edit" ||
-                      ev.type === "offer_accept" ||
-                      ev.type === "offer_reject"),
-                );
-              if (target) {
-                const res = rec.controller.retract(target.id);
-                rec.redoStack.push(res.event.id);
-              }
+              rec.controller.undo();
             } else if (body.action === "redo") {
-              const rId = rec.redoStack.pop();
-              if (rId) rec.controller.retract(rId, "Redo");
+              rec.controller.redo();
             } else {
               const ops = (body.ops ?? body.op) as EditOp | EditOp[];
               rec.controller.applyEdit(ops);
-              rec.redoStack.length = 0;
             }
             return jsonRes(buildPayload(rec));
           }
@@ -805,5 +846,418 @@ describe("TempoWorkspace interactive UI", () => {
     editBtn.click();
     await flushUi();
     expect(engineSpy.stops).toBe(0);
+  });
+
+  it("enforces synchronous song-switch isolation: releases Alt hold on old song and blocks mid-load B/cues", async () => {
+    const gate = { resolveSong2Open: null as (() => void) | null };
+    const baseFetch = globalThis.fetch;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const rawUrl = typeof input === "string" ? input : input.toString();
+        if (rawUrl.includes("/songs/02-hyper-vivacity-e5f60718/open")) {
+          await new Promise<void>((resolve) => {
+            gate.resolveSong2Open = resolve;
+          });
+        }
+        return await baseFetch(input, init);
+      }),
+    );
+
+    await mountWorkspace();
+    const song1 = requireSong("01-campanella-a1b2c3d4");
+    const song2 = requireSong("02-hyper-vivacity-e5f60718");
+
+    // Hold Alt on Song 1 -> holdCalls receives `true`
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "Alt" }));
+    await flushUi();
+    expect(song1.holdCalls).toEqual([true]);
+
+    const song1BeatsBefore = song1.controller.getState().beats.size;
+
+    // Click Song 2 while Song 2 `/open` hangs in-flight!
+    const songRows = container.querySelectorAll("#tempo-songs .tempo-list-row");
+    (songRows[1] as HTMLButtonElement).click();
+    await flushUi();
+
+    // 1) Alt hold was synchronously released on Song 1 (`holdCalls` received `false`)!
+    expect(song1.holdCalls).toEqual([true, false]);
+    // 2) Audio buffer was synchronously unloaded!
+    expect(engineSpy.unloads).toBeGreaterThanOrEqual(1);
+
+    // 3) Pressing B while Song 2 is still loading (`loadedSongId === null`) MUST NOT mutate Song 1 or Song 2!
+    stageHook.emit?.("hover-time", 5500);
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "b" }));
+    await flushUi();
+    expect(song1.controller.getState().beats.size).toBe(song1BeatsBefore);
+    expect(song2.controller.getState().beats.size).toBe(0);
+
+    // Finish loading Song 2 -> now B works on Song 2!
+    gate.resolveSong2Open?.();
+    await flushUi();
+    stageHook.emit?.("hover-time", 5500);
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "b" }));
+    await flushUi();
+    expect(
+      Array.from(song2.controller.getState().beats.values()).some(
+        (b) => b.source === "user" && Math.abs(b.timeSec - 5.5) < 1e-4,
+      ),
+    ).toBe(true);
+  });
+
+  it("accumulates exact 100 source-sample nudges at 44.1 kHz under 48 kHz WebAudio, promotes coincident beats, and gates live-tap heardAt", async () => {
+    engineSpy.forceContextSampleRate = 48_000;
+    await mountWorkspace();
+    const song1 = requireSong("01-campanella-a1b2c3d4");
+
+    // 1) Coincident Beat guard: placing B at 1.0003s (within <= 0.5ms of draft beat b-s14-01 at 1.0s)
+    // promotes b-s14-01 to `source: "user"` instead of creating a duplicate beat!
+    const countBefore = song1.controller.getState().beats.size;
+    stageHook.emit?.("hover-time", 1000.3);
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "b" }));
+    await flushUi();
+    expect(song1.controller.getState().beats.size).toBe(countBefore);
+    expect(song1.controller.getState().beats.get("b-s14-01")?.source).toBe("user");
+
+    // 2) Select beat at 2.000000 s (`b-s14-02`) and fire 100 rapid `.` sample nudges synchronously!
+    stageHook.emit?.("select", { kind: "beat", id: "b-s14-02" });
+    await flushUi();
+    const baseFrame = Math.round(2.0 * 44_100);
+    for (let i = 0; i < 100; i += 1) {
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "." }));
+    }
+    await flushUi();
+
+    const movedBeat = song1.controller.getState().beats.get("b-s14-02");
+    expect(movedBeat).toBeDefined();
+    expect(Math.round((movedBeat?.timeSec ?? 0) * 44_100) - baseFrame).toBe(100);
+    expect(movedBeat?.timeSec).toBeCloseTo((baseFrame + 100) / 44_100, 12);
+
+    // 3) Live-tap `heardAt()` guard: while playing, if `heardAt()` returns `undefined` (before audible output starts),
+    // pressing `B` MUST ignore the tap instead of falling back to visual playhead!
+    engineSpy.overrideHeardAt = () => undefined;
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: " " }));
+    await flushUi();
+    expect(engineSpy.playing).toBe(true);
+    const beatsBeforeTap = song1.controller.getState().beats.size;
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "b" }));
+    await flushUi();
+    expect(song1.controller.getState().beats.size).toBe(beatsBeforeTap);
+  });
+
+  it("splices 0-sample-aligned Audition via swapBuffer without stopping playback, and disables Accept/Tab on Stale offers", async () => {
+    const auditionRequests: Array<{ t0: string; t1: string; filter: string }> = [];
+    const baseFetch = globalThis.fetch;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const rawUrl = typeof input === "string" ? input : input.toString();
+        const url = new URL(rawUrl, "http://127.0.0.1");
+        if (url.pathname.endsWith("/audition")) {
+          const t0 = url.searchParams.get("t0") ?? "0";
+          const t1 = url.searchParams.get("t1") ?? "0";
+          const filter = url.searchParams.get("filter") ?? "mix";
+          auditionRequests.push({ t0, t1, filter });
+
+          // Build synthetic `AUD!` marker with 100 samples of amplitude `0.75` starting at exact sample 44100!
+          const marker = new ArrayBuffer(12);
+          const dv = new DataView(marker);
+          dv.setUint32(0, 0x21445541, true);
+          dv.setUint32(4, 100, true);
+          dv.setFloat32(8, 0.75, true);
+          return new Response(marker, {
+            status: 200,
+            headers: {
+              "Content-Type": "audio/wav",
+              "X-Audition-Start-Sample": "44100",
+              "X-Audition-End-Sample": "44200",
+              "X-Audition-Sample-Rate": "44100",
+            },
+          });
+        }
+        return await baseFetch(input, init);
+      }),
+    );
+
+    await mountWorkspace();
+    const song1 = requireSong("01-campanella-a1b2c3d4");
+
+    // Undo and Redo buttons start disabled (`canUndo: false`, `canRedo: false`)!
+    const undoBtn = container.querySelector('button[aria-label="Undo"]') as HTMLButtonElement;
+    const redoBtn = container.querySelector('button[aria-label="Redo"]') as HTMLButtonElement;
+    expect(undoBtn.disabled).toBe(true);
+    expect(redoBtn.disabled).toBe(true);
+
+    // Start playback, switch to Audition -> Perc: swaps buffer seamlessly with ZERO stops and splices at exact sample 44100!
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: " " }));
+    await flushUi();
+    expect(engineSpy.stops).toBe(0);
+
+    const auditionBtn = Array.from(
+      container.querySelectorAll(".frame-toolbar .segmented button"),
+    ).find((b) => b.textContent?.trim() === "Audition") as HTMLButtonElement;
+    auditionBtn.click();
+    await flushUi();
+
+    const percBtn = Array.from(container.querySelectorAll(".stage-toolbar .segmented button")).find(
+      (b) => b.textContent?.trim() === "Perc",
+    ) as HTMLButtonElement;
+    percBtn.click();
+    await flushUi();
+
+    expect(auditionRequests.length).toBe(1);
+    expect(engineSpy.stops).toBe(0);
+    expect(engineSpy.swaps).toBe(1);
+    expect(engineSpy.lastBufferChannels?.[0]?.[44_099]).toBe(0);
+    expect(engineSpy.lastBufferChannels?.[0]?.[44_100]).toBeCloseTo(0.75, 5);
+    expect(engineSpy.lastBufferChannels?.[0]?.[44_199]).toBeCloseTo(0.75, 5);
+    expect(engineSpy.lastBufferChannels?.[0]?.[44_200]).toBe(0);
+
+    // Switch back to Edit, trigger Cmd+K recompute, then mutate beat `b-s14-02` so offers become `stale`!
+    const editBtn = Array.from(container.querySelectorAll(".frame-toolbar .segmented button")).find(
+      (b) => b.textContent?.trim() === "Edit",
+    ) as HTMLButtonElement;
+    editBtn.click();
+    await flushUi();
+
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "k", metaKey: true }));
+    await flushUi();
+
+    // Move `b-s14-02` directly so expectedRevisions mismatch -> offer becomes `stale`!
+    stageHook.emit?.("select", { kind: "beat", id: "b-s14-02" });
+    await flushUi();
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight" }));
+    await flushUi();
+
+    const staleOffers = Array.from(song1.controller.getState().offers.values());
+    expect(staleOffers.some((o) => o.status === "stale")).toBe(true);
+
+    const acceptButtons = Array.from(
+      container.querySelectorAll("#tempo-suggestions .tempo-offer-actions button"),
+    ).filter((b) => b.textContent?.includes("Accept")) as HTMLButtonElement[];
+    expect(acceptButtons.length).toBeGreaterThan(0);
+    expect(acceptButtons.every((b) => b.disabled)).toBe(true);
+
+    // Recompute button is rendered on stale offers, and pressing Tab does NOT accept a stale offer!
+    const recomputeOnStale = Array.from(
+      container.querySelectorAll("#tempo-suggestions .tempo-offer-actions button"),
+    ).find((b) => b.textContent?.includes("Recompute"));
+    expect(recomputeOnStale).toBeDefined();
+
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab" }));
+    await flushUi();
+    expect(
+      Array.from(song1.controller.getState().offers.values()).every((o) => o.status !== "accepted"),
+    ).toBe(true);
+  });
+
+  it("auto-refreshes filtered Audition window when seeking outside [startSec, endSec) on > 60s tracks", async () => {
+    const requestedWindows: Array<{ t0: number; t1: number }> = [];
+    const baseFetch = globalThis.fetch;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const rawUrl = typeof input === "string" ? input : input.toString();
+        const url = new URL(rawUrl, "http://127.0.0.1");
+        if (url.pathname.endsWith("/open")) {
+          const song1 = requireSong("01-campanella-a1b2c3d4");
+          await song1.controller.openSong({
+            songId: "01-campanella-a1b2c3d4",
+            durationSec: 180,
+            sampleRate: 44_100,
+            clock: "source-audio-sec",
+          });
+          return new Response(JSON.stringify(buildPayload(song1)), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        if (url.pathname.endsWith("/audition")) {
+          const t0 = Number(url.searchParams.get("t0") ?? "0");
+          const t1 = Number(url.searchParams.get("t1") ?? "0");
+          requestedWindows.push({ t0, t1 });
+          return new Response(new ArrayBuffer(64), {
+            status: 200,
+            headers: {
+              "Content-Type": "audio/wav",
+              "X-Audition-Start-Sample": String(Math.round(t0 * 44_100)),
+              "X-Audition-End-Sample": String(Math.round(t1 * 44_100)),
+              "X-Audition-Sample-Rate": "44100",
+            },
+          });
+        }
+        return await baseFetch(input, init);
+      }),
+    );
+
+    await mountWorkspace();
+
+    const auditionBtn = Array.from(
+      container.querySelectorAll(".frame-toolbar .segmented button"),
+    ).find((b) => b.textContent?.trim() === "Audition") as HTMLButtonElement;
+    auditionBtn.click();
+    await flushUi();
+
+    const lowBtn = Array.from(container.querySelectorAll(".stage-toolbar .segmented button")).find(
+      (b) => b.textContent?.trim() === "Low",
+    ) as HTMLButtonElement;
+    lowBtn.click();
+    await flushUi();
+
+    // Initial window covers [0, 60)
+    expect(requestedWindows).toEqual([{ t0: 0, t1: 60 }]);
+
+    // Seek outside [0, 60) to 120.0 s (120_000 ms) -> automatically fetches & swaps a new 60s window covering 120s!
+    stageHook.emit?.("seek", 120_000);
+    await flushUi();
+    expect(requestedWindows).toHaveLength(2);
+    expect(requestedWindows[1]?.t0).toBeLessThanOrEqual(120);
+    expect(requestedWindows[1]?.t1).toBeGreaterThan(120);
+  });
+
+  it("tags TempoStage spectrogram worker requests with requestId (ignoring out-of-order Song A replies) and re-crops past 10:00 on > 10 min songs", async () => {
+    const RealTempoStage = (
+      await vi.importActual<{ default: ReturnType<typeof defineComponent> }>("./TempoStage.vue")
+    ).default;
+
+    const postedMessages: Array<{ requestId?: number; startMs: number; endMs: number }> = [];
+    const workerSpy = { onMessage: null as ((ev: MessageEvent) => void) | null };
+    class MockSpecWorker {
+      set onmessage(fn: ((ev: MessageEvent) => void) | null) {
+        workerSpy.onMessage = fn;
+      }
+      get onmessage() {
+        return workerSpy.onMessage;
+      }
+      postMessage(msg: { requestId?: number; startMs: number; endMs: number }) {
+        postedMessages.push({
+          ...(msg.requestId !== undefined ? { requestId: msg.requestId } : {}),
+          startMs: msg.startMs,
+          endMs: msg.endMs,
+        });
+      }
+      terminate() {}
+    }
+    vi.stubGlobal("Worker", MockSpecWorker);
+
+    const makeStubBuffer = (seconds: number, sr = 1000): AudioBuffer =>
+      ({
+        numberOfChannels: 1,
+        sampleRate: sr,
+        length: seconds * sr,
+        duration: seconds,
+        getChannelData: () => new Float32Array(seconds * sr),
+      }) as unknown as AudioBuffer;
+
+    const bufA = makeStubBuffer(720); // 12 minutes (720_000 ms)
+    const bufB = makeStubBuffer(120); // 2 minutes (120_000 ms)
+
+    const currentBuffer = { value: bufA };
+    const currentBounds = { value: { startMs: 0, endMs: 720_000 } };
+    const currentView = { value: { startMs: 0, msPerPx: 10 } };
+
+    const stageHost = document.createElement("div");
+    document.body.appendChild(stageHost);
+
+    const { ref: vueRef } = await import("vue");
+    const rBuf = vueRef<AudioBuffer>(currentBuffer.value);
+    const rBounds = vueRef(currentBounds.value);
+    const rView = vueRef(currentView.value);
+
+    const stageApp = createApp({
+      setup() {
+        return () =>
+          h(RealTempoStage, {
+            buffer: rBuf.value,
+            bounds: rBounds.value,
+            view: rView.value,
+            visualMode: "spec",
+            segments: [],
+            spans: [],
+            beats: [],
+            unbeats: [],
+            sounds: [],
+            gridFit: [],
+            selection: { kind: "none" },
+            activeRange: null,
+            snapCandidates: [],
+            offerPreview: null,
+            abComparing: false,
+            playheadMs: 0,
+            loopRegion: { startMs: 0, endMs: 0 },
+            looping: false,
+          });
+      },
+    });
+
+    try {
+      stageApp.mount(stageHost);
+      await flushUi();
+
+      // Request #1: [0, 600_000] on 12-min track
+      expect(postedMessages).toHaveLength(1);
+      expect(postedMessages[0]).toEqual({ requestId: 1, startMs: 0, endMs: 600_000 });
+
+      // Simulate worker completing Request #1
+      workerSpy.onMessage?.({
+        data: {
+          requestId: 1,
+          sampleRate: 1000,
+          firstFrame: 0,
+          frameCount: 10,
+          bins: 513,
+          db: new Float32Array(10 * 513),
+        },
+      } as MessageEvent);
+      await flushUi();
+
+      // Pan viewport past 10:00 to 650_000 ms (10:50) -> triggers Request #2 covering > 600_000 ms!
+      rView.value = { startMs: 650_000, msPerPx: 10 };
+      await flushUi();
+      expect(postedMessages).toHaveLength(2);
+      expect(postedMessages[1]?.requestId).toBe(2);
+      expect(postedMessages[1]?.endMs).toBe(720_000);
+      expect(postedMessages[1]?.startMs).toBe(120_000);
+
+      // Switch to Song B BEFORE Request #2 replies -> posts fresh request for Song B
+      rBuf.value = bufB;
+      rBounds.value = { startMs: 0, endMs: 120_000 };
+      rView.value = { startMs: 0, msPerPx: 10 };
+      await flushUi();
+      expect(postedMessages).toHaveLength(3);
+      const songBReqId = postedMessages[2]?.requestId ?? 0;
+      expect(songBReqId).toBeGreaterThan(2);
+      expect(postedMessages[2]).toEqual({ requestId: songBReqId, startMs: 0, endMs: 120_000 });
+
+      // Out-of-order stale reply for Request #2 (Song A) arrives -> ignored; Song B stays clean
+      workerSpy.onMessage?.({
+        data: {
+          requestId: 2,
+          sampleRate: 1000,
+          firstFrame: 468,
+          frameCount: 10,
+          bins: 513,
+          db: new Float32Array(10 * 513),
+        },
+      } as MessageEvent);
+      await flushUi();
+
+      // Deliver Song B's matching requestId cleanly
+      workerSpy.onMessage?.({
+        data: {
+          requestId: songBReqId,
+          sampleRate: 1000,
+          firstFrame: 0,
+          frameCount: 10,
+          bins: 513,
+          db: new Float32Array(10 * 513),
+        },
+      } as MessageEvent);
+      await flushUi();
+      expect(postedMessages).toHaveLength(3);
+    } finally {
+      stageApp.unmount();
+      stageHost.remove();
+    }
   });
 });

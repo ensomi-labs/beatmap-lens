@@ -82,7 +82,7 @@ describe("stage-audio module boundary", () => {
   });
 
   it("resolves the hardened ensomi tempo contract cleanly in TypeScript and Vitest", () => {
-    expect(Object.keys(ensomi)).toHaveLength(64);
+    expect(Object.keys(ensomi)).toHaveLength(65);
     expect(SNAP_ROLES).toEqual(["transient_attack", "p_center", "harmonic_change", "release"]);
     expect(TRIGGER_LAYERS).toEqual(["song_open", "micro_assist", "heavy_recompute"]);
 

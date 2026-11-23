@@ -330,3 +330,48 @@ it("hands the source node the plan's loop edges and stop time, on whole frames",
   expect(once?.options?.loopStart).toBeUndefined();
   expect(((once?.stopAt ?? 0) - (once?.at ?? 0)) * 44_100).toBeCloseTo((8821 - 3969) * 2, 6);
 });
+
+it("seamlessly swaps buffers mid-playback on an exact sample-aligned frame without interrupting transport or heardAt", async () => {
+  const engine = new TimingAudioEngine(44_100);
+  const mixBuf = engine.load([new Float32Array(441_000)], 441_000);
+  expect(engine.loaded).toBe(mixBuf);
+
+  const play = engine.play({ fromMs: 0, endMs: 10_000, rate: 1, loop: null });
+  audio.resumes[0]?.();
+  expect(await play).toBe(true);
+
+  const context = audio.context;
+  if (!context) throw new Error("No context");
+  // Advance context to 1.000 s; output is at 0.980 s when page clock is 2000 ms.
+  context.currentTime = 1.0;
+  context.getOutputTimestamp = () => ({ contextTime: 0.98, performanceTime: 2000 });
+  expect(engine.heardAt(2000)).toBeCloseTo(950, 6);
+
+  const filteredBuf = engine.createBuffer([new Float32Array(441_000)], 441_000);
+  engine.swapBuffer(filteredBuf);
+
+  expect(engine.playing).toBe(true);
+  expect(engine.loaded).toBe(filteredBuf);
+  expect(audio.sources).toHaveLength(2);
+
+  const [oldSource, nextSource] = audio.sources;
+  // Swap scheduled at currentTime (1.000) + 0.020 = 1.020 s (frame 44_982).
+  const expectedSwapFrame = Math.ceil((1.0 + 0.02) * 44_100 - 1e-6);
+  expect(Math.ceil((oldSource?.stopAt ?? 0) * 44_100)).toBe(expectedSwapFrame);
+  expect(Math.ceil((nextSource?.at ?? 0) * 44_100)).toBe(expectedSwapFrame);
+  expect(oldSource?.stopAt).toBe(nextSource?.at);
+
+  // Start frame was 0.030 * 44_100 = 1323; elapsed frames at swap = 44_982 - 1323 = 43_659.
+  expect(Math.ceil((nextSource?.offset ?? 0) * 44_100)).toBe(expectedSwapFrame - 1323);
+
+  // Zero undefined window in heardAt() both before and after swapContextTime!
+  expect(engine.heardAt(2000)).toBeCloseTo(950, 6);
+  expect(engine.heardAt(2050)).toBeCloseTo(1000, 6);
+
+  // unload() stops both active and retiring sources cleanly and clears loaded buffer.
+  engine.unload();
+  expect(engine.playing).toBe(false);
+  expect(engine.loaded).toBeUndefined();
+  expect(oldSource?.stopped).toBe(true);
+  expect(nextSource?.stopped).toBe(true);
+});

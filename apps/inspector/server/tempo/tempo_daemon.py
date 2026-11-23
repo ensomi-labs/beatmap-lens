@@ -1648,6 +1648,71 @@ def _build_ops_for_hypothesis(
     return ops, expected_revs
 
 
+def _split_by_free_intervals(
+    seg_id: str,
+    u0: float,
+    u1: float,
+    seg_regime: str,
+    free_intervals: list[tuple[float, float]],
+) -> list[dict]:
+    """Split an unlocked segment interval [u0, u1) at Free span boundaries so Auto smoothness stays intact outside Free."""
+    if seg_regime == "free":
+        return [{"segmentId": seg_id, "t0": round(u0, 6), "t1": round(u1, 6), "isFree": True}]
+
+    raw_cuts = [u0, u1]
+    for f_lo, f_hi in free_intervals:
+        if u0 + 1e-6 < f_lo < u1 - 1e-6:
+            raw_cuts.append(f_lo)
+        if u0 + 1e-6 < f_hi < u1 - 1e-6:
+            raw_cuts.append(f_hi)
+    raw_cuts.sort()
+
+    dedup_cuts: list[float] = []
+    for c in raw_cuts:
+        if not dedup_cuts or c - dedup_cuts[-1] > 1e-6:
+            dedup_cuts.append(c)
+
+    slices: list[dict] = []
+    for c0, c1 in zip(dedup_cuts[:-1], dedup_cuts[1:]):
+        if c1 <= c0 + 1e-4:
+            continue
+        mid = 0.5 * (c0 + c1)
+        sub_free = any(f_lo <= mid < f_hi for f_lo, f_hi in free_intervals)
+        slices.append(
+            {
+                "segmentId": seg_id,
+                "t0": round(c0, 6),
+                "t1": round(c1, 6),
+                "isFree": sub_free,
+            }
+        )
+    return slices
+
+
+def _coalesce_write_scopes(raw_scopes: list[dict]) -> list[dict]:
+    """Merge adjacent solved writeScopes belonging to the same parent segmentId."""
+    if not raw_scopes:
+        return []
+    ordered = sorted(raw_scopes, key=lambda ws: (float(ws["t0"]), float(ws["t1"]), str(ws["segmentId"])))
+    merged: list[dict] = [
+        {
+            "segmentId": str(ordered[0]["segmentId"]),
+            "t0": round(float(ordered[0]["t0"]), 6),
+            "t1": round(float(ordered[0]["t1"]), 6),
+        }
+    ]
+    for ws in ordered[1:]:
+        prev = merged[-1]
+        seg_id = str(ws["segmentId"])
+        t0 = round(float(ws["t0"]), 6)
+        t1 = round(float(ws["t1"]), 6)
+        if prev["segmentId"] == seg_id and abs(float(prev["t1"]) - t0) <= 1e-5:
+            prev["t1"] = max(float(prev["t1"]), t1)
+        else:
+            merged.append({"segmentId": seg_id, "t0": t0, "t1": t1})
+    return merged
+
+
 def recompute_constrained(
     track: "TrackEntry",
     scope: dict | str,
@@ -1697,15 +1762,17 @@ def recompute_constrained(
         if float(fi["t1"]) > float(fi["t0"])
     ]
 
-    # Build unlocked writeScopes strictly inside non-break, non-kept segment slices.
-    write_scopes: list[dict] = []
+    # Build unlocked candidate solve intervals inside non-break, non-kept segment slices,
+    # splitting Auto segments at Free span boundaries so smoothness relaxes ONLY inside Free spans!
+    solve_intervals: list[dict] = []
     skipped_keep_ranges: list[tuple[float, float]] = []
     for seg in segments:
         st0 = max(req_t0, float(seg["t0"]))
         st1 = min(req_t1, float(seg["t1"]))
         if st1 <= st0 + 1e-4:
             continue
-        if seg.get("regime") == "break":
+        seg_regime = str(seg.get("regime") or "auto")
+        if seg_regime == "break":
             continue
         if seg.get("kept"):
             skipped_keep_ranges.append((st0, st1))
@@ -1718,15 +1785,12 @@ def recompute_constrained(
         if overlapping_locks:
             skipped_keep_ranges.extend(overlapping_locks)
         for u0, u1 in _subtract_locks(st0, st1, overlapping_locks):
-            write_scopes.append(
-                {
-                    "segmentId": str(seg["id"]),
-                    "t0": round(u0, 6),
-                    "t1": round(u1, 6),
-                }
-            )
+            for sub in _split_by_free_intervals(str(seg["id"]), u0, u1, seg_regime, free_intervals):
+                sub["parentT0"] = float(seg["t0"])
+                sub["parentT1"] = float(seg["t1"])
+                solve_intervals.append(sub)
 
-    if not write_scopes:
+    if not solve_intervals:
         return {"offers": []}
 
     all_beats = list(state.get("beats") or [])
@@ -1752,19 +1816,21 @@ def recompute_constrained(
         "strings_winds": np.clip(mid_norm * 0.6 + high_norm * 0.4, 0.0, 1.0) * 0.5,
     }
 
-    # Solve pulse per unlocked writeScope and aggregate into coherent primary + optional sibling hypotheses.
+    # Solve pulse per unlocked interval and record ONLY intervals that each hypothesis actually solved!
     primary_beats_all: list[float] = []
     primary_confs_all: list[float] = []
     primary_periods: list[float] = []
     primary_scores: list[float] = []
+    primary_raw_scopes: list[dict] = []
 
     alt_beats_all: list[float] = []
     alt_confs_all: list[float] = []
     alt_periods: list[float] = []
     alt_scores: list[float] = []
+    alt_raw_scopes: list[dict] = []
     has_close_alternative = False
 
-    for ws in write_scopes:
+    for ws in solve_intervals:
         _check_cancel(cancel_event)
         w0 = float(ws["t0"])
         w1 = float(ws["t1"])
@@ -1780,11 +1846,17 @@ def recompute_constrained(
         ws_reps = [r for r in repulsions if w0 - 0.1 <= float(r["timeSec"]) <= w1 + 0.1]
         ws_obs = [o for o in sound_obs if w0 - 0.1 <= float(o["timeSec"]) <= w1 + 0.1]
         ws_old_times = [float(b["timeSec"]) for b in all_beats if w0 <= float(b["timeSec"]) < w1]
+        if len(ws_old_times) < 2:
+            p0 = float(ws.get("parentT0", w0))
+            p1 = float(ws.get("parentT1", w1))
+            period_hint_times = [float(b["timeSec"]) for b in all_beats if p0 <= float(b["timeSec"]) < p1]
+        else:
+            period_hint_times = ws_old_times
 
         pot = _build_cue_potential(sub_grid, sub_onset, ws_guides, ws_reps, ws_obs, sub_fam)
-        is_free = any(f_lo < w1 and w0 < f_hi for f_lo, f_hi in free_intervals)
+        is_free = bool(ws["isFree"])
 
-        periods = _candidate_periods(sub_onset, actual_hop_s, ws_old_times, ws_guides)
+        periods = _candidate_periods(sub_onset, actual_hop_s, period_hint_times, ws_guides)
         hyps: list[dict] = []
         for p_sec in periods:
             solved = _solve_pulse_for_period(w0, w1, sub_grid, pot, sub_onset, p_sec, ws_guides, ws_reps, is_free)
@@ -1805,10 +1877,12 @@ def recompute_constrained(
             hyps.sort(key=lambda h: -h["score"])
             best = hyps[0]
 
+        scope_slice = {"segmentId": str(ws["segmentId"]), "t0": round(w0, 6), "t1": round(w1, 6)}
         primary_beats_all.extend(best["beatTimes"])
         primary_confs_all.extend(best["confidences"])
         primary_periods.append(best["periodSec"])
         primary_scores.append(best["score"])
+        primary_raw_scopes.append(scope_slice)
 
         # Pick best distinct musical alternative (either half/double tempo or alternate phase) if within competitive range.
         chosen_alt = None
@@ -1830,28 +1904,31 @@ def recompute_constrained(
             alt_confs_all.extend(chosen_alt["confidences"])
             alt_periods.append(chosen_alt["periodSec"])
             alt_scores.append(chosen_alt["score"])
+            alt_raw_scopes.append(scope_slice)
         else:
             alt_beats_all.extend(best["beatTimes"])
             alt_confs_all.extend(best["confidences"])
             alt_periods.append(best["periodSec"])
             alt_scores.append(best["score"])
+            alt_raw_scopes.append(scope_slice)
 
-    if not primary_beats_all:
+    if not primary_beats_all or not primary_raw_scopes:
         return {"offers": []}
 
-    scope_beats = [
+    prim_write_scopes = _coalesce_write_scopes(primary_raw_scopes)
+    prim_scope_beats = [
         b
         for b in all_beats
-        if any(float(ws["t0"]) <= float(b["timeSec"]) < float(ws["t1"]) for ws in write_scopes)
+        if any(float(ws["t0"]) <= float(b["timeSec"]) < float(ws["t1"]) for ws in prim_write_scopes)
     ]
-    expected_scope_beat_ids = sorted(str(b["id"]) for b in scope_beats)
+    prim_expected_scope_beat_ids = sorted(str(b["id"]) for b in prim_scope_beats)
 
     # Check passive advisory notes (e.g. outlier mistap saturation or adjacent Keep offset).
     advisories: list[str] = []
     prim_arr = np.asarray(primary_beats_all, dtype=np.float64)
     for g in guides:
         gt = float(g["timeSec"])
-        if any(float(ws["t0"]) <= gt < float(ws["t1"]) for ws in write_scopes):
+        if any(float(ws["t0"]) <= gt < float(ws["t1"]) for ws in prim_write_scopes):
             dist_ms = float(np.min(np.abs(prim_arr - gt))) * 1000.0
             if dist_ms > 35.0:
                 advisories.append(
@@ -1883,11 +1960,6 @@ def recompute_constrained(
                     f"Preserves locked Keep section at {_format_timecode(k0)}–{_format_timecode(k1)} without changes."
                 )
 
-    scope_kind = (
-        "cross_region"
-        if scope == "song" or len(write_scopes) > 1
-        else "local"
-    )
     read_scope = "song" if scope == "song" else {"t0": round(req_t0, 6), "t1": round(req_t1, 6)}
     batch_id = f"batch_g{generation}_s{basis_seq}"
 
@@ -1898,12 +1970,33 @@ def recompute_constrained(
         "bpm": round(60.0 / max(float(np.median(primary_periods)), 1e-4), 1),
     }
     prim_built = _build_ops_for_hypothesis(
-        primary_hyp, scope_beats, entity_revisions, generation, 1, write_scopes
+        primary_hyp, prim_scope_beats, entity_revisions, generation, 1, prim_write_scopes
+    )
+    prim_scope_kind = (
+        "cross_region"
+        if scope == "song" or len({ws["segmentId"] for ws in prim_write_scopes}) > 1
+        else "local"
     )
 
     alt_built = None
     alt_hyp = None
-    if has_close_alternative and alt_beats_all:
+    alt_write_scopes: list[dict] = []
+    alt_scope_beats: list[dict] = []
+    alt_expected_scope_beat_ids: list[str] = []
+    alt_scope_kind = prim_scope_kind
+    if has_close_alternative and alt_beats_all and alt_raw_scopes:
+        alt_write_scopes = _coalesce_write_scopes(alt_raw_scopes)
+        alt_scope_beats = [
+            b
+            for b in all_beats
+            if any(float(ws["t0"]) <= float(b["timeSec"]) < float(ws["t1"]) for ws in alt_write_scopes)
+        ]
+        alt_expected_scope_beat_ids = sorted(str(b["id"]) for b in alt_scope_beats)
+        alt_scope_kind = (
+            "cross_region"
+            if scope == "song" or len({ws["segmentId"] for ws in alt_write_scopes}) > 1
+            else "local"
+        )
         alt_hyp = {
             "beatTimes": alt_beats_all,
             "confidences": alt_confs_all,
@@ -1911,15 +2004,15 @@ def recompute_constrained(
             "bpm": round(60.0 / max(float(np.median(alt_periods)), 1e-4), 1),
         }
         alt_built = _build_ops_for_hypothesis(
-            alt_hyp, scope_beats, entity_revisions, generation, 2, write_scopes
+            alt_hyp, alt_scope_beats, entity_revisions, generation, 2, alt_write_scopes
         )
 
     offers: list[dict] = []
     if prim_built is not None and alt_built is not None and alt_hyp is not None:
         prim_ops, prim_revs = prim_built
         alt_ops, alt_revs = alt_built
-        prim_title = _describe_hypothesis_title(primary_hyp, scope_beats, "primary")
-        alt_title = _describe_hypothesis_title(alt_hyp, scope_beats, "alternate")
+        prim_title = _describe_hypothesis_title(primary_hyp, prim_scope_beats, "primary")
+        alt_title = _describe_hypothesis_title(alt_hyp, alt_scope_beats, "alternate")
         if alt_title == prim_title:
             alt_title = f"Alternate phase alignment ({int(round(alt_hyp['bpm']))} BPM)"
 
@@ -1932,10 +2025,10 @@ def recompute_constrained(
                 "generation": generation,
                 "basisSeq": basis_seq,
                 "expectedRevisions": prim_revs,
-                "expectedScopeBeatIds": expected_scope_beat_ids,
-                "writeScopes": write_scopes,
+                "expectedScopeBeatIds": prim_expected_scope_beat_ids,
+                "writeScopes": prim_write_scopes,
                 "readScope": read_scope,
-                "scopeKind": scope_kind,
+                "scopeKind": prim_scope_kind,
                 "optionIndex": 1,
                 "optionCount": 2,
                 "title": prim_title,
@@ -1952,10 +2045,10 @@ def recompute_constrained(
                 "generation": generation,
                 "basisSeq": basis_seq,
                 "expectedRevisions": alt_revs,
-                "expectedScopeBeatIds": expected_scope_beat_ids,
-                "writeScopes": write_scopes,
+                "expectedScopeBeatIds": alt_expected_scope_beat_ids,
+                "writeScopes": alt_write_scopes,
                 "readScope": read_scope,
-                "scopeKind": scope_kind,
+                "scopeKind": alt_scope_kind,
                 "optionIndex": 2,
                 "optionCount": 2,
                 "title": alt_title,
@@ -1974,11 +2067,11 @@ def recompute_constrained(
                 "generation": generation,
                 "basisSeq": basis_seq,
                 "expectedRevisions": prim_revs,
-                "expectedScopeBeatIds": expected_scope_beat_ids,
-                "writeScopes": write_scopes,
+                "expectedScopeBeatIds": prim_expected_scope_beat_ids,
+                "writeScopes": prim_write_scopes,
                 "readScope": read_scope,
-                "scopeKind": scope_kind,
-                "title": _describe_hypothesis_title(primary_hyp, scope_beats, "primary"),
+                "scopeKind": prim_scope_kind,
+                "title": _describe_hypothesis_title(primary_hyp, prim_scope_beats, "primary"),
                 "advisoryNotes": advisories,
                 "ops": prim_ops,
             }
@@ -1994,11 +2087,11 @@ def recompute_constrained(
                 "generation": generation,
                 "basisSeq": basis_seq,
                 "expectedRevisions": alt_revs,
-                "expectedScopeBeatIds": expected_scope_beat_ids,
-                "writeScopes": write_scopes,
+                "expectedScopeBeatIds": alt_expected_scope_beat_ids,
+                "writeScopes": alt_write_scopes,
                 "readScope": read_scope,
-                "scopeKind": scope_kind,
-                "title": _describe_hypothesis_title(alt_hyp, scope_beats, "alternate"),
+                "scopeKind": alt_scope_kind,
+                "title": _describe_hypothesis_title(alt_hyp, alt_scope_beats, "alternate"),
                 "advisoryNotes": advisories,
                 "ops": alt_ops,
             }
@@ -2144,6 +2237,13 @@ class TrackEntry:
             return self._features
 
 
+@dataclass
+class _InflightLoad:
+    event: threading.Event = field(default_factory=threading.Event)
+    entry: TrackEntry | None = None
+    error: Exception | None = None
+
+
 class TrackCache:
     """Thread-safe bounded LRU track PCM cache (max_cached_tracks = 3)."""
 
@@ -2151,8 +2251,7 @@ class TrackCache:
         self.max_tracks = max(1, int(max_tracks))
         self._lock = threading.Lock()
         self._entries: OrderedDict[tuple[str, int, int], TrackEntry] = OrderedDict()
-        self._inflight: dict[tuple[str, int, int], threading.Event] = {}
-        self._inflight_errors: dict[tuple[str, int, int], Exception] = {}
+        self._inflight: dict[tuple[str, int, int], _InflightLoad] = {}
 
     def __len__(self) -> int:
         with self._lock:
@@ -2191,25 +2290,24 @@ class TrackCache:
                 if existing is not None:
                     self._entries.move_to_end(key)
                     return existing
-                wait_ev = self._inflight.get(key)
-                if wait_ev is None:
-                    wait_ev = threading.Event()
-                    self._inflight[key] = wait_ev
+                inflight = self._inflight.get(key)
+                if inflight is None:
+                    inflight = _InflightLoad()
+                    self._inflight[key] = inflight
                     is_loader = True
                 else:
                     is_loader = False
 
             if not is_loader:
-                while not wait_ev.wait(timeout=0.05):
+                while not inflight.event.wait(timeout=0.05):
                     _check_cancel(cancel_event)
-                with self._lock:
-                    loaded = self._entries.get(key)
-                    if loaded is not None:
-                        self._entries.move_to_end(key)
-                        return loaded
-                    err = self._inflight_errors.get(key)
-                    if err is not None:
-                        raise err
+                if inflight.entry is not None:
+                    with self._lock:
+                        if key in self._entries:
+                            self._entries.move_to_end(key)
+                    return inflight.entry
+                if inflight.error is not None and not isinstance(inflight.error, CancelledError):
+                    raise inflight.error
                 continue
 
             try:
@@ -2239,15 +2337,14 @@ class TrackCache:
                     while len(self._entries) > self.max_tracks:
                         self._entries.popitem(last=False)
                     self._inflight.pop(key, None)
-                    self._inflight_errors.pop(key, None)
-                    wait_ev.set()
+                    inflight.entry = entry
+                    inflight.event.set()
                 return entry
             except Exception as exc:
                 with self._lock:
                     self._inflight.pop(key, None)
-                    if not isinstance(exc, CancelledError):
-                        self._inflight_errors[key] = exc
-                    wait_ev.set()
+                    inflight.error = exc
+                    inflight.event.set()
                 raise
 
 
@@ -2469,46 +2566,37 @@ class TempoEngine:
             raise ValueError(f"Unknown audition filter '{filter_name}'; expected one of {AUDITION_FILTERS}")
 
         _check_cancel(cancel_event)
-        entry = self.cache.peek(audio_path)
-        if entry is not None:
-            sr = entry.sample_rate
-            ch = entry.channels
-            dur = entry.duration_sec
-            start = max(0.0, float(start_s))
-            end = min(float(end_s), dur)
-            if end <= start:
-                raise ValueError(f"Empty span {start_s}-{end_s}")
-            lead = min(AUDITION_PAD_S, start)
-            tail = min(AUDITION_PAD_S, max(0.0, dur - end))
-            i0 = max(0, int(round((start - lead) * sr)))
-            i1 = min(entry.pcm.shape[0], int(round((end + tail) * sr)))
-            sub_pcm = entry.pcm[i0:i1]
-            actual_lead_samples = max(0, int(round(start * sr)) - i0)
-            count = max(1, int(round((end - start) * sr)))
-        else:
-            info = probe(audio_path)
-            sr = int(info["sampleRate"])
-            ch = int(info["channels"])
-            dur = float(info["durationS"])
-            start = max(0.0, float(start_s))
-            end = min(float(end_s), dur)
-            if end <= start:
-                raise ValueError(f"Empty span {start_s}-{end_s}")
-            lead = min(AUDITION_PAD_S, start)
-            sub_pcm = decode(audio_path, ch, start_s=start - lead, duration_s=(end - start) + lead + AUDITION_PAD_S)
-            actual_lead_samples = int(round(lead * sr))
-            count = max(1, int(round((end - start) * sr)))
+        entry = self.cache.get_or_load(audio_path, cancel_event=cancel_event)
+        sr = int(entry.sample_rate)
+        ch = int(entry.channels)
+        total_samples = int(entry.pcm.shape[0])
+        if total_samples <= 0:
+            raise ValueError(f"Empty audio file: {audio_path}")
+
+        start_sample = max(0, min(total_samples, int(round(max(0.0, float(start_s)) * sr))))
+        end_sample = max(0, min(total_samples, int(round(max(0.0, float(end_s)) * sr))))
+        if end_sample <= start_sample:
+            raise ValueError(f"Empty span {start_s}-{end_s}")
+
+        pad_samples = int(round(AUDITION_PAD_S * sr))
+        i0 = max(0, start_sample - pad_samples)
+        i1 = min(total_samples, end_sample + pad_samples)
+        sub_pcm = entry.pcm[i0:i1]
+        actual_lead_samples = start_sample - i0
+        exact_count = end_sample - start_sample
 
         _check_cancel(cancel_event)
         rendered = audition_view(sub_pcm, sr, filter_name)
         _check_cancel(cancel_event)
-        trimmed = rendered[actual_lead_samples : actual_lead_samples + count]
+        trimmed = rendered[actual_lead_samples : actual_lead_samples + exact_count]
         written = write_wav_atomic(output_path, trimmed, sr)
         return {
             "outputPath": written,
             "filter": filter_name,
-            "startSec": round(start, 6),
-            "endSec": round(end, 6),
+            "startSec": round(start_sample / float(sr), 9),
+            "endSec": round(end_sample / float(sr), 9),
+            "startSample": int(start_sample),
+            "endSample": int(end_sample),
             "sampleRate": sr,
             "channels": ch,
             "elapsedSec": round(time.perf_counter() - started, 4),
@@ -2519,10 +2607,12 @@ class TempoEngine:
 
 
 class DaemonServer:
-    """Persistent NDJSON JSON-RPC server with isolated CPU fast_pool and heavy_pool."""
+    """Persistent NDJSON JSON-RPC server with isolated snap_pool, audition_pool, fast_pool, and heavy_pool."""
 
     def __init__(self, engine: TempoEngine | None = None) -> None:
         self.engine = engine or TempoEngine()
+        self._snap_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="tempo-snap")
+        self._audition_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="tempo-audition")
         self._fast_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="tempo-fast")
         self._heavy_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="tempo-heavy")
         self._write_lock = threading.Lock()
@@ -2534,6 +2624,8 @@ class DaemonServer:
             for ev in self._active.values():
                 ev.set()
             self._active.clear()
+        self._snap_pool.shutdown(wait=False, cancel_futures=True)
+        self._audition_pool.shutdown(wait=False, cancel_futures=True)
         self._fast_pool.shutdown(wait=False, cancel_futures=True)
         self._heavy_pool.shutdown(wait=False, cancel_futures=True)
 
@@ -2659,11 +2751,14 @@ class DaemonServer:
                     with self._cancel_lock:
                         self._active[req_id] = cancel_ev
 
-                pool = (
-                    self._fast_pool
-                    if method in ("ping", "prepare", "suggest_snaps", "render_audition", "export_clip")
-                    else self._heavy_pool
-                )
+                if method == "suggest_snaps":
+                    pool = self._snap_pool
+                elif method in ("render_audition", "export_clip"):
+                    pool = self._audition_pool
+                elif method in ("ping", "prepare"):
+                    pool = self._fast_pool
+                else:
+                    pool = self._heavy_pool
                 pool.submit(run_task, req_id, method, params, cancel_ev)
         finally:
             self.close()

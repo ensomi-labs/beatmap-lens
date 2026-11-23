@@ -21,6 +21,8 @@ import {
   nearestFrame,
   rowBins,
   type Spectrogram,
+  type SpectrogramWorkerRequest,
+  type SpectrogramWorkerResponse,
 } from "../stage-audio/spectrogram";
 import {
   formatSourceTime,
@@ -47,6 +49,7 @@ export type LocatePhase = "move" | "end" | "cancel";
 
 const props = defineProps<{
   buffer: AudioBuffer;
+  sourceSampleRate?: number;
   bounds: TimeRange;
   view: TimeView;
   visualMode: StageVisualMode;
@@ -187,56 +190,140 @@ const snapStripLeftPx = computed(() => {
   return Math.round(Math.min(maxLeft, Math.max(8, beatX - 60)));
 });
 
-let worker: Worker | undefined;
-let specGeneration = 0;
+const SPEC_WINDOW_MS = 600_000;
+const SPEC_EDGE_MARGIN_MS = 30_000;
 
-watch(
-  () => [props.buffer, props.bounds.startMs, props.bounds.endMs, props.visualMode] as const,
-  () => {
-    if (props.visualMode === "wave") return;
-    if (spectrogram.value && spectrogram.value.sampleRate === sampleRate.value) {
-      // Reuse computed spectrogram if buffer has not changed.
-    }
-    const request = ++specGeneration;
-    // Avoid blocking large multi-minute tracks synchronously on main thread if Worker exists:
-    // computespectrogram handles arbitrary lengths cleanly inside the Web Worker.
-    const maxSpecEndMs = Math.min(props.bounds.endMs, props.bounds.startMs + 600_000);
-    const crop = cropSamples(
+interface SpecCoverage {
+  buffer: AudioBuffer;
+  startMs: number;
+  endMs: number;
+}
+
+let worker: Worker | undefined;
+let activeSpecRequestId = 0;
+let coveredSpecRange: SpecCoverage | null = null;
+let inFlightSpecRange: SpecCoverage | null = null;
+
+function visibleTimeRangeMs(): { visStartMs: number; visEndMs: number } {
+  const widthPx = Math.max(1, size.value.width || 800);
+  const visStartMs = Math.max(props.bounds.startMs, props.view.startMs);
+  const visEndMs = Math.min(
+    props.bounds.endMs,
+    Math.max(visStartMs + 1, props.view.startMs + props.view.msPerPx * widthPx),
+  );
+  return { visStartMs, visEndMs };
+}
+
+function isViewportCoveredBy(coverage: SpecCoverage | null): boolean {
+  if (!coverage || coverage.buffer !== props.buffer) return false;
+  if (coverage.startMs <= props.bounds.startMs && coverage.endMs >= props.bounds.endMs) {
+    return true;
+  }
+  const { visStartMs, visEndMs } = visibleTimeRangeMs();
+  const visSpan = visEndMs - visStartMs;
+  if (visSpan >= SPEC_WINDOW_MS - 2 * SPEC_EDGE_MARGIN_MS) {
+    return visStartMs >= coverage.startMs && visStartMs < coverage.endMs - SPEC_EDGE_MARGIN_MS;
+  }
+  const leftMargin = coverage.startMs > props.bounds.startMs ? SPEC_EDGE_MARGIN_MS : 0;
+  const rightMargin = coverage.endMs < props.bounds.endMs ? SPEC_EDGE_MARGIN_MS : 0;
+  return (
+    visStartMs >= coverage.startMs + leftMargin && visEndMs <= coverage.endMs - rightMargin
+  );
+}
+
+function computeTargetSpecWindow(): { startMs: number; endMs: number } {
+  const totalSpanMs = props.bounds.endMs - props.bounds.startMs;
+  if (totalSpanMs <= SPEC_WINDOW_MS) {
+    return { startMs: props.bounds.startMs, endMs: props.bounds.endMs };
+  }
+  const { visStartMs, visEndMs } = visibleTimeRangeMs();
+  if (visEndMs - visStartMs >= SPEC_WINDOW_MS) {
+    const startMs = Math.max(
       props.bounds.startMs,
-      maxSpecEndMs,
-      sampleRate.value,
-      props.buffer.length,
+      Math.min(props.bounds.endMs - SPEC_WINDOW_MS, visStartMs),
     );
-    const input = {
-      channels: channels.value.map((data) => data.slice(crop.start, crop.end)),
-      sliceStart: crop.start,
-      totalFrames: props.buffer.length,
-      sampleRate: sampleRate.value,
-      startMs: props.bounds.startMs,
-      endMs: maxSpecEndMs,
-    };
-    if (typeof Worker === "undefined") {
-      spectrogram.value = computeSpectrogram(input);
-      return;
-    }
-    worker ??= createSpectrogramWorker();
-    worker.onmessage = (event: MessageEvent<Spectrogram>) => {
-      if (request === specGeneration) spectrogram.value = event.data;
-    };
-    worker.postMessage(
-      input,
-      input.channels.map((data) => data.buffer),
-    );
-  },
-  { immediate: true },
-);
+    return { startMs, endMs: startMs + SPEC_WINDOW_MS };
+  }
+  const centerMs = 0.5 * (visStartMs + visEndMs);
+  const startMs = Math.max(
+    props.bounds.startMs,
+    Math.min(props.bounds.endMs - SPEC_WINDOW_MS, Math.round(centerMs - SPEC_WINDOW_MS / 2)),
+  );
+  return { startMs, endMs: Math.min(props.bounds.endMs, startMs + SPEC_WINDOW_MS) };
+}
 
 watch(
   () => props.buffer,
   () => {
+    activeSpecRequestId += 1;
+    coveredSpecRange = null;
+    inFlightSpecRange = null;
     spectrogram.value = undefined;
     columnCache.clear();
   },
+);
+
+watch(
+  () =>
+    [
+      props.buffer,
+      props.bounds.startMs,
+      props.bounds.endMs,
+      props.visualMode,
+      props.view.startMs,
+      props.view.msPerPx,
+      size.value.width,
+    ] as const,
+  () => {
+    if (props.visualMode === "wave") return;
+    if (
+      (spectrogram.value && isViewportCoveredBy(coveredSpecRange)) ||
+      isViewportCoveredBy(inFlightSpecRange)
+    ) {
+      return;
+    }
+
+    const targetBuffer = props.buffer;
+    const { startMs, endMs } = computeTargetSpecWindow();
+    const requestId = ++activeSpecRequestId;
+    inFlightSpecRange = { buffer: targetBuffer, startMs, endMs };
+
+    const crop = cropSamples(startMs, endMs, sampleRate.value, targetBuffer.length);
+    const request: SpectrogramWorkerRequest = {
+      requestId,
+      channels: channels.value.map((data) => data.slice(crop.start, crop.end)),
+      sliceStart: crop.start,
+      totalFrames: targetBuffer.length,
+      sampleRate: sampleRate.value,
+      startMs,
+      endMs,
+    };
+
+    if (typeof Worker === "undefined") {
+      const computedSpec = computeSpectrogram(request);
+      coveredSpecRange = { buffer: targetBuffer, startMs, endMs };
+      inFlightSpecRange = null;
+      columnCache.clear();
+      spectrogram.value = computedSpec;
+      return;
+    }
+
+    worker ??= createSpectrogramWorker();
+    worker.onmessage = (event: MessageEvent<SpectrogramWorkerResponse>) => {
+      if (event.data.requestId !== activeSpecRequestId || props.buffer !== targetBuffer) {
+        return;
+      }
+      coveredSpecRange = { buffer: targetBuffer, startMs, endMs };
+      inFlightSpecRange = null;
+      columnCache.clear();
+      spectrogram.value = event.data;
+    };
+    worker.postMessage(
+      request,
+      request.channels.map((data) => data.buffer),
+    );
+  },
+  { immediate: true },
 );
 
 let observer: ResizeObserver | undefined;
@@ -853,7 +940,9 @@ function drawOverlay() {
     }
     const digits = props.view.msPerPx < 0.1 ? 2 : props.view.msPerPx < 1 ? 1 : 0;
     let label = formatSourceTime(timeMs, digits);
-    if (props.view.msPerPx < 1) label += ` · n ${nearestSample(timeMs, sampleRate.value)}`;
+    if (props.view.msPerPx < 1) {
+      label += ` · n ${nearestSample(timeMs, props.sourceSampleRate ?? sampleRate.value)}`;
+    }
     context.font = `${10 * dpr}px "Azeret Mono Variable", ui-monospace, monospace`;
     context.textBaseline = "top";
     const textWidth = context.measureText(label).width;

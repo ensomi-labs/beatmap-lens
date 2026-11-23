@@ -25,6 +25,8 @@ export interface TempoSongSummary {
   title: string;
   fileName: string;
   audioPath: string;
+  audioSizeBytes?: number;
+  audioSha256Sample?: string;
   durationSec: number | null;
   analyzed: boolean;
   segmentCount: number;
@@ -60,6 +62,8 @@ export interface TempoSongSessionPayload {
   layerStates: Record<TriggerLayer, LayerLifecycleState>;
   holdingOffers: boolean;
   heldOffers: PatchOffer[];
+  canUndo: boolean;
+  canRedo: boolean;
 }
 
 export interface TempoSuggestSnapsResponse {
@@ -279,14 +283,27 @@ export async function fetchSongAudioBytes(
   return await response.arrayBuffer();
 }
 
-export async function fetchAuditionAudioBytes(
+export interface AuditionAudioSlice {
+  bytes: ArrayBuffer;
+  startSample: number | null;
+  endSample: number | null;
+  sampleRate: number | null;
+}
+
+function parseOptionalHeaderInt(value: string | null): number | null {
+  if (!value) return null;
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : null;
+}
+
+export async function fetchAuditionAudio(
   songId: string,
   params: { t0: number; t1: number; filter: AuditionFilter },
   signal?: AbortSignal,
-): Promise<ArrayBuffer> {
+): Promise<AuditionAudioSlice> {
   const query = new URLSearchParams({
-    t0: params.t0.toFixed(4),
-    t1: params.t1.toFixed(4),
+    t0: String(params.t0),
+    t1: String(params.t1),
     filter: params.filter,
   });
   const response = await fetch(
@@ -297,9 +314,40 @@ export async function fetchAuditionAudioBytes(
   );
   if (!response.ok) {
     const text = await response.text().catch(() => "");
-    throw new Error(text || `Failed to render audition audio (HTTP ${response.status}).`);
+    let message = `Failed to render audition audio (HTTP ${response.status}).`;
+    if (text.trim().length > 0) {
+      try {
+        const parsed = JSON.parse(text) as { error?: unknown };
+        if (typeof parsed.error === "string" && parsed.error.length > 0) {
+          message = parsed.error;
+        } else {
+          message = text.slice(0, 200);
+        }
+      } catch {
+        message = text.slice(0, 200);
+      }
+    }
+    throw new Error(message);
   }
-  return await response.arrayBuffer();
+  const startSample = parseOptionalHeaderInt(response.headers.get("X-Audition-Start-Sample"));
+  const endSample = parseOptionalHeaderInt(response.headers.get("X-Audition-End-Sample"));
+  const sampleRate = parseOptionalHeaderInt(response.headers.get("X-Audition-Sample-Rate"));
+  const bytes = await response.arrayBuffer();
+  return {
+    bytes,
+    startSample,
+    endSample,
+    sampleRate: sampleRate !== null && sampleRate > 0 ? sampleRate : null,
+  };
+}
+
+export async function fetchAuditionAudioBytes(
+  songId: string,
+  params: { t0: number; t1: number; filter: AuditionFilter },
+  signal?: AbortSignal,
+): Promise<ArrayBuffer> {
+  const slice = await fetchAuditionAudio(songId, params, signal);
+  return slice.bytes;
 }
 
 export function applySongOps(

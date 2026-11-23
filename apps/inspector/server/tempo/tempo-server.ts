@@ -156,13 +156,14 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
       "state-dir": { type: "string" },
       port: { type: "string" },
       host: { type: "string" },
+      "allow-remote": { type: "boolean" },
       static: { type: "string" },
       help: { type: "boolean" },
     },
   });
   if (values.help) {
     process.stdout.write(
-      "Inspector tempo workspace\n  node apps/inspector/server/tempo/tempo-server.ts [--dir FOLDER] [--state-dir DIR] [--port 4179] [--host 127.0.0.1] [--static DIR]\n\nOpen the printed address. Workspace state and traces persist under <folder>/.ensomi-tempo/.\n",
+      "Inspector tempo workspace\n  node apps/inspector/server/tempo/tempo-server.ts [--dir FOLDER] [--state-dir DIR] [--port 4179] [--host 127.0.0.1] [--allow-remote] [--static DIR]\n\nOpen the printed address. Workspace state and traces persist under <folder>/.ensomi-tempo/.\n",
     );
     process.exit(0);
   }
@@ -171,6 +172,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     ...(values["state-dir"] ? { stateDir: values["state-dir"] } : {}),
     ...(values.port ? { port: Number(values.port) } : {}),
     ...(values.host ? { host: values.host } : {}),
+    ...(values["allow-remote"] ? { allowRemote: true } : {}),
     ...(values.static ? { staticRoot: values.static } : {}),
   }).catch((error: Error) => {
     process.stderr.write(`${error.message}\n`);

@@ -79,6 +79,9 @@ export {
   rangeDb,
   rowBins,
   type Spectrogram,
+  type SpectrogramInput,
+  type SpectrogramWorkerRequest,
+  type SpectrogramWorkerResponse,
 } from "./spectrogram";
 export {
   clampView,

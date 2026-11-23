@@ -11,7 +11,7 @@ import type {
   Span,
   UnbeatCue,
 } from "ensomi";
-import { computed, onBeforeUnmount, onMounted, ref, shallowRef, watch } from "vue";
+import { computed, onBeforeUnmount, onMounted, reactive, ref, shallowRef, watch } from "vue";
 import PanelSection from "../layout/PanelSection.vue";
 import type { PaneSpec } from "../layout/pane-layout";
 import WorkspaceFrame from "../layout/WorkspaceFrame.vue";
@@ -44,7 +44,7 @@ import {
   applySongAction,
   applySongOps,
   exportSong,
-  fetchAuditionAudioBytes,
+  fetchAuditionAudio,
   fetchSongAudioBytes,
   fetchWorkspace,
   isAbortError,
@@ -74,6 +74,7 @@ import {
   SNAP_FAMILY_LABELS,
   SNAP_ROLE_LABELS,
   type StageVisualMode,
+  sanitizeUserFacingText,
   type TempoSelection,
   type TempoSubMode,
 } from "./state";
@@ -160,7 +161,8 @@ function savePreferences() {
 // Workspace & song session state
 const workspaceDir = ref<string | null>(null);
 const songs = ref<TempoSongSummary[]>([]);
-const activeSongId = ref<string | null>(null);
+const selectedSongId = ref<string | null>(null);
+const loadedSongId = ref<string | null>(null);
 const sessionPayload = shallowRef<TempoSongSessionPayload | null>(null);
 
 const subMode = ref<TempoSubMode>("edit");
@@ -176,23 +178,48 @@ const folderPathInput = ref("");
 // Async lifecycle flags & notices
 const loadingWorkspace = ref(false);
 const openingSong = ref(false);
-const updatingEdit = ref(false);
+const inFlightEditCount = ref(0);
+const updatingEdit = computed(() => inFlightEditCount.value > 0);
 const recomputing = ref(false);
+const auditionRendering = ref(false);
 const exportingFormat = ref<string | null>(null);
 const error = ref("");
 const notice = ref("");
 const silenceMs = ref<number | undefined>(undefined);
 const cuesDirty = ref(false);
 
-// Selection, range, snaps, and offers
+interface BoundSnapState {
+  songId: string;
+  beatId: string;
+  beatTimeSec: number;
+  generation: number;
+  candidates: SnapCandidate[];
+}
+
+interface ActiveAuditionCoverage {
+  songId: string;
+  filter: AuditionFilter;
+  startSec: number;
+  endSec: number;
+}
+
+interface QueuedNudge {
+  kind: "beat" | "unbeat" | "sound";
+  id: string;
+  timeSec: number;
+}
+
+// Selection, range, snaps, nudges, and offers
 const selection = ref<TempoSelection>({ kind: "none" });
 const activeRange = ref<Range | null>(null);
 const rangeStartCursorSec = ref<number | null>(null);
 const rangeEndCursorSec = ref<number | null>(null);
-const snapCandidates = ref<SnapCandidate[]>([]);
+const snapState = ref<BoundSnapState | null>(null);
 const snapsLoading = ref(false);
 const selectedOfferId = ref<string | null>(null);
 const holdingAlt = ref(false);
+const activeAuditionWindow = ref<ActiveAuditionCoverage | null>(null);
+const pendingEntityTimeSec = reactive(new Map<string, number>());
 const flamSavedState = ref<{
   rate: (typeof playbackRates)[number];
   looping: boolean;
@@ -218,6 +245,14 @@ const looping = ref(false);
 const loopRegion = ref<TimeRange>({ startMs: 0, endMs: 0 });
 const rate = ref<(typeof playbackRates)[number]>(1);
 
+let songEpoch = 0;
+let holdOwnerSongId: string | null = null;
+let localSnapSeq = 0;
+let editChain: Promise<void> = Promise.resolve();
+const queuedEntityNudges = new Map<string, QueuedNudge>();
+const activeNudgeDrains = new Map<string, Promise<void>>();
+let inFlightAuditionTarget: ActiveAuditionCoverage | null = null;
+
 let engine: StageAudioEngine | undefined;
 let mixChannels: Float32Array[] | null = null;
 let mixFrames = 0;
@@ -235,10 +270,20 @@ let snapDebounceTimer: ReturnType<typeof setTimeout> | undefined;
 let auditionAbort: AbortController | null = null;
 let recomputeAbort: AbortController | null = null;
 
+const isSongReadyForActions = computed(
+  () =>
+    loadedSongId.value !== null &&
+    loadedSongId.value === selectedSongId.value &&
+    sessionPayload.value !== null,
+);
+
+const canUndo = computed(() => Boolean(sessionPayload.value?.canUndo));
+const canRedo = computed(() => Boolean(sessionPayload.value?.canRedo));
+
 const activeSongSummary = computed(() => {
-  if (!activeSongId.value) return sessionPayload.value?.songSummary ?? null;
+  if (!selectedSongId.value) return sessionPayload.value?.songSummary ?? null;
   return (
-    songs.value.find((s) => s.songId === activeSongId.value) ??
+    songs.value.find((s) => s.songId === selectedSongId.value) ??
     sessionPayload.value?.songSummary ??
     null
   );
@@ -251,15 +296,36 @@ const bounds = computed<TimeRange>(() => ({
   startMs: 0,
   endMs: Math.max(100, durationSec.value * 1000),
 }));
-const sampleRate = computed(
-  () => mixBuffer.value?.sampleRate ?? sessionPayload.value?.state.audio?.sampleRate ?? 44_100,
+const sourceSampleRate = computed(
+  () => sessionPayload.value?.state.audio?.sampleRate ?? 44_100,
 );
 
 const segments = computed<Segment[]>(() => sessionPayload.value?.state.segments ?? []);
 const spans = computed<Span[]>(() => sessionPayload.value?.state.spans ?? []);
-const beats = computed<Beat[]>(() => sessionPayload.value?.state.beats ?? []);
-const unbeats = computed<UnbeatCue[]>(() => sessionPayload.value?.state.unbeats ?? []);
-const sounds = computed<SoundAnchor[]>(() => sessionPayload.value?.state.sounds ?? []);
+const beats = computed<Beat[]>(() => {
+  const raw = sessionPayload.value?.state.beats ?? [];
+  if (pendingEntityTimeSec.size === 0) return raw;
+  return raw.map((b) => {
+    const pending = pendingEntityTimeSec.get(`beat:${b.id}`);
+    return pending !== undefined ? { ...b, timeSec: pending } : b;
+  });
+});
+const unbeats = computed<UnbeatCue[]>(() => {
+  const raw = sessionPayload.value?.state.unbeats ?? [];
+  if (pendingEntityTimeSec.size === 0) return raw;
+  return raw.map((u) => {
+    const pending = pendingEntityTimeSec.get(`unbeat:${u.id}`);
+    return pending !== undefined ? { ...u, timeSec: pending } : u;
+  });
+});
+const sounds = computed<SoundAnchor[]>(() => {
+  const raw = sessionPayload.value?.state.sounds ?? [];
+  if (pendingEntityTimeSec.size === 0) return raw;
+  return raw.map((s) => {
+    const pending = pendingEntityTimeSec.get(`sound:${s.id}`);
+    return pending !== undefined ? { ...s, timeSec: pending } : s;
+  });
+});
 const gridFit = computed(() => sessionPayload.value?.gridFit ?? []);
 const inboxSpans = computed<Span[]>(() => sessionPayload.value?.inboxSpans ?? []);
 
@@ -274,8 +340,10 @@ watch(
       selectedOfferId.value = null;
       return;
     }
-    if (!selectedOfferId.value || !items.some((i) => i.offer.id === selectedOfferId.value)) {
-      selectedOfferId.value = items[0]?.offer.id ?? null;
+    const cur = items.find((i) => i.offer.id === selectedOfferId.value);
+    const firstValid = items.find((i) => i.offer.status === "valid");
+    if (!cur || (cur.offer.status !== "valid" && firstValid !== undefined)) {
+      selectedOfferId.value = (firstValid ?? items[0])?.offer.id ?? null;
     }
   },
   { immediate: true },
@@ -315,6 +383,23 @@ const selectedBeat = computed(() => {
   return beats.value.find((b) => b.id === id);
 });
 
+const snapCandidates = computed<SnapCandidate[]>(() => {
+  const current = snapState.value;
+  const beat = selectedBeat.value;
+  if (
+    !current ||
+    !beat ||
+    !isSongReadyForActions.value ||
+    current.songId !== loadedSongId.value ||
+    selection.value.kind !== "beat" ||
+    beat.id !== current.beatId ||
+    Math.abs(beat.timeSec - current.beatTimeSec) > 1e-6
+  ) {
+    return [];
+  }
+  return current.candidates;
+});
+
 const selectedUnbeat = computed(() => {
   if (selection.value.kind !== "unbeat") return undefined;
   const id = selection.value.id;
@@ -349,7 +434,7 @@ const devicePxMs = computed(() => view.value.msPerPx / Math.max(1, devicePixelRa
 const zoomLabel = computed(() => {
   const msPerPx = devicePxMs.value;
   if (msPerPx >= 0.1) return `${msPerPx.toFixed(msPerPx < 1 ? 2 : 1)} ms/px`;
-  const pxPerSample = 1000 / sampleRate.value / msPerPx;
+  const pxPerSample = 1000 / sourceSampleRate.value / msPerPx;
   return `${pxPerSample.toFixed(1)} px/smp`;
 });
 
@@ -357,13 +442,16 @@ const counterSubText = computed(() => {
   if (activeRange.value && activeRange.value.t1 > activeRange.value.t0) {
     return formatSecSpan(activeRange.value.t0, activeRange.value.t1, 1);
   }
-  return `n ${nearestSample(playheadMs.value, sampleRate.value)}`;
+  return `n ${nearestSample(playheadMs.value, sourceSampleRate.value)}`;
 });
 
 const toolbarStatus = computed(() => {
   if (error.value) return { tone: "error", text: "Attention" };
   if (openingSong.value || loadingWorkspace.value || audioState.value === "loading") {
     return { tone: "warn", text: "Analyzing…" };
+  }
+  if (auditionRendering.value) {
+    return { tone: "warn", text: "Rendering filter…" };
   }
   if (recomputing.value || updatingEdit.value) {
     return { tone: "warn", text: "Updating…" };
@@ -472,17 +560,47 @@ async function ensureEngine(preferredRate: number): Promise<StageAudioEngine> {
   return created;
 }
 
-async function loadSongAudio(songId: string, preferredRate: number, signal: AbortSignal) {
+async function loadSongAudio(
+  songId: string,
+  preferredRate: number,
+  capturedEpoch: number,
+  signal: AbortSignal,
+) {
   audioState.value = "loading";
   auditionAbort?.abort();
+  auditionAbort = null;
+  inFlightAuditionTarget = null;
+  auditionRendering.value = false;
+  activeAuditionWindow.value = null;
   activeEngineFilterKey = "mix";
   try {
     const bytes = await fetchSongAudioBytes(songId, signal);
-    if (signal.aborted || disposed) return;
+    if (
+      signal.aborted ||
+      disposed ||
+      capturedEpoch !== songEpoch ||
+      selectedSongId.value !== songId
+    ) {
+      return;
+    }
     const eng = await ensureEngine(preferredRate);
-    if (signal.aborted || disposed) return;
+    if (
+      signal.aborted ||
+      disposed ||
+      capturedEpoch !== songEpoch ||
+      selectedSongId.value !== songId
+    ) {
+      return;
+    }
     const decoded = await decodeBytesToChannels(bytes, eng.context);
-    if (signal.aborted || disposed) return;
+    if (
+      signal.aborted ||
+      disposed ||
+      capturedEpoch !== songEpoch ||
+      selectedSongId.value !== songId
+    ) {
+      return;
+    }
     mixChannels = decoded.channels;
     mixFrames = decoded.frames;
     const loaded = eng.load(decoded.channels, decoded.frames);
@@ -499,76 +617,151 @@ async function loadSongAudio(songId: string, preferredRate: number, signal: Abor
       void syncAuditionBuffer();
     }
   } catch (cause) {
-    if (isAbortError(cause) || signal.aborted) return;
+    if (isAbortError(cause) || signal.aborted || capturedEpoch !== songEpoch) return;
     audioState.value = "none";
     reportError(cause);
   }
 }
 
-async function hotSwapEngineChannels(channels: Float32Array[], frames: number, key: string) {
-  if (!engine || activeEngineFilterKey === key) return;
-  const wasPlaying = playing.value || Boolean(engine.starting);
-  const currentPosMs = wasPlaying ? shownPlayheadMs() : playheadMs.value;
-  clearTimeout(transportTimer);
-  engine.stop(0);
-  engine.load(channels, frames);
-  activeEngineFilterKey = key;
-  syncClicks();
-  playheadMs.value = clampToBounds(currentPosMs);
-  if (wasPlaying) {
-    const endMs = looping.value ? loopRegion.value.endMs : bounds.value.endMs;
-    const started = await engine.play({
-      fromMs: clampToBounds(currentPosMs),
-      endMs,
-      rate: rate.value,
-      loop: looping.value ? { ...loopRegion.value } : null,
-    });
-    if (started) {
-      playing.value = true;
-      readoutAtMs = Number.NEGATIVE_INFINITY;
-      transportStep();
-    }
+function maybeRefreshAuditionWindow(anchorSec: number, forwardBias = false) {
+  if (
+    subMode.value !== "audition" ||
+    auditionFilter.value === "mix" ||
+    !isSongReadyForActions.value ||
+    audioState.value !== "ready"
+  ) {
+    return;
   }
+  const songId = loadedSongId.value;
+  if (!songId) return;
+  const cur = activeAuditionWindow.value;
+  const outsideCurrent =
+    !cur ||
+    cur.songId !== songId ||
+    cur.filter !== auditionFilter.value ||
+    anchorSec < cur.startSec ||
+    anchorSec >= cur.endSec;
+  const nearingEdge =
+    cur !== null &&
+    cur.songId === songId &&
+    cur.filter === auditionFilter.value &&
+    cur.endSec < durationSec.value - 1e-3 &&
+    cur.endSec - anchorSec <= 5.0;
+
+  if (!outsideCurrent && !nearingEdge) return;
+
+  if (
+    inFlightAuditionTarget &&
+    inFlightAuditionTarget.songId === songId &&
+    inFlightAuditionTarget.filter === auditionFilter.value &&
+    anchorSec >= inFlightAuditionTarget.startSec &&
+    (anchorSec < inFlightAuditionTarget.endSec - 5.0 ||
+      inFlightAuditionTarget.endSec >= durationSec.value - 1e-3)
+  ) {
+    return;
+  }
+
+  void syncAuditionBuffer({ anchorSec, forwardBias: forwardBias || nearingEdge });
 }
 
-async function syncAuditionBuffer() {
-  auditionAbort?.abort();
-  auditionAbort = null;
-  const songId = activeSongId.value;
-  if (!engine || !mixChannels || !songId || audioState.value !== "ready") return;
+async function syncAuditionBuffer(options?: { anchorSec?: number; forwardBias?: boolean }) {
+  const songId = loadedSongId.value;
+  const capturedEpoch = songEpoch;
+  if (
+    !engine ||
+    !mixChannels ||
+    !mixBuffer.value ||
+    !songId ||
+    songId !== selectedSongId.value ||
+    audioState.value !== "ready"
+  ) {
+    return;
+  }
 
   const targetFilter: AuditionFilter =
     subMode.value === "audition" ? auditionFilter.value : "mix";
 
   if (targetFilter === "mix") {
-    await hotSwapEngineChannels(mixChannels, mixFrames, "mix");
+    auditionAbort?.abort();
+    auditionAbort = null;
+    inFlightAuditionTarget = null;
+    auditionRendering.value = false;
+    activeAuditionWindow.value = null;
+    if (activeEngineFilterKey !== "mix") {
+      engine.swapBuffer(mixBuffer.value);
+      activeEngineFilterKey = "mix";
+      syncClicks();
+    }
     return;
   }
 
+  const playheadSec = options?.anchorSec ?? shownPlayheadMs() / 1000;
   const win = computeAuditionWindow({
     durationSec: durationSec.value,
-    playheadSec: shownPlayheadMs() / 1000,
+    playheadSec,
     activeRange: activeRange.value,
     looping: looping.value,
     loopStartSec: loopRegion.value.startMs / 1000,
     loopEndSec: loopRegion.value.endMs / 1000,
+    ...(options?.forwardBias ? { forwardBias: true } : {}),
   });
-  const cacheKey = `${songId}:${targetFilter}:${win.t0.toFixed(2)}-${win.t1.toFixed(2)}`;
-  if (activeEngineFilterKey === cacheKey) return;
 
+  const cacheKey = `${songId}:${targetFilter}:${win.t0}:${win.t1}`;
+  if (activeEngineFilterKey === cacheKey) {
+    return;
+  }
+
+  auditionAbort?.abort();
   const controller = new AbortController();
   auditionAbort = controller;
+  inFlightAuditionTarget = {
+    songId,
+    filter: targetFilter,
+    startSec: win.t0,
+    endSec: win.t1,
+  };
+  auditionRendering.value = true;
+
   try {
-    const wavBytes = await fetchAuditionAudioBytes(
+    const slice = await fetchAuditionAudio(
       songId,
       { t0: win.t0, t1: win.t1, filter: targetFilter },
       controller.signal,
     );
-    if (controller.signal.aborted || disposed || !engine || !mixChannels) return;
-    const decoded = await decodeBytesToChannels(wavBytes, engine.context);
-    if (controller.signal.aborted || disposed || !engine || !mixChannels) return;
+    if (
+      controller.signal.aborted ||
+      disposed ||
+      capturedEpoch !== songEpoch ||
+      selectedSongId.value !== songId ||
+      loadedSongId.value !== songId ||
+      !engine ||
+      !mixChannels
+    ) {
+      return;
+    }
+    const decoded = await decodeBytesToChannels(slice.bytes, engine.context);
+    if (
+      controller.signal.aborted ||
+      disposed ||
+      capturedEpoch !== songEpoch ||
+      selectedSongId.value !== songId ||
+      loadedSongId.value !== songId ||
+      !engine ||
+      !mixChannels
+    ) {
+      return;
+    }
+    const liveTargetFilter: AuditionFilter =
+      subMode.value === "audition" ? auditionFilter.value : "mix";
+    if (liveTargetFilter !== targetFilter) return;
 
-    const startFrame = Math.max(0, Math.round(win.t0 * engine.sampleRate));
+    const startFrame =
+      slice.startSample !== null && slice.sampleRate !== null && slice.sampleRate > 0
+        ? engine.sampleRate === slice.sampleRate
+          ? slice.startSample
+          : Math.round((slice.startSample * engine.sampleRate) / slice.sampleRate)
+        : Math.max(0, Math.round(win.t0 * engine.sampleRate));
+
     const numCh = mixChannels.length;
     const spliced: Float32Array[] = mixChannels.map((ch) => Float32Array.from(ch));
     for (let c = 0; c < numCh; c += 1) {
@@ -580,15 +773,90 @@ async function syncAuditionBuffer() {
         dst.set(src.subarray(0, copyLen), startFrame);
       }
     }
-    await hotSwapEngineChannels(spliced, mixFrames, cacheKey);
+
+    const splicedBuffer = engine.createBuffer(spliced, mixFrames);
+    engine.swapBuffer(splicedBuffer);
+    activeEngineFilterKey = cacheKey;
+    activeAuditionWindow.value = {
+      songId,
+      filter: targetFilter,
+      startSec: win.t0,
+      endSec: win.t1,
+    };
+    syncClicks();
   } catch (cause) {
-    if (isAbortError(cause) || controller.signal.aborted) return;
+    if (isAbortError(cause) || controller.signal.aborted || capturedEpoch !== songEpoch) return;
     reportError(cause);
+  } finally {
+    if (auditionAbort === controller) {
+      auditionAbort = null;
+      inFlightAuditionTarget = null;
+      auditionRendering.value = false;
+    }
   }
 }
 
 function reportError(cause: unknown) {
-  error.value = cause instanceof Error ? cause.message : String(cause);
+  const raw = cause instanceof Error ? cause.message : String(cause);
+  error.value = sanitizeUserFacingText(raw);
+}
+
+function clearSnapState() {
+  localSnapSeq += 1;
+  clearTimeout(snapDebounceTimer);
+  snapDebounceTimer = undefined;
+  snapsAbort?.abort();
+  snapsAbort = null;
+  snapsLoading.value = false;
+  snapState.value = null;
+}
+
+function releaseHoldOwnerSynchronously() {
+  const owner = holdOwnerSongId;
+  holdingAlt.value = false;
+  holdOwnerSongId = null;
+  if (owner) {
+    void setHoldOffers(owner, false).catch(() => {});
+  }
+}
+
+function resetActiveSongContext() {
+  releaseHoldOwnerSynchronously();
+  songEpoch += 1;
+
+  songOpenAbort?.abort();
+  songOpenAbort = null;
+  recomputeAbort?.abort();
+  recomputeAbort = null;
+  auditionAbort?.abort();
+  auditionAbort = null;
+  inFlightAuditionTarget = null;
+  auditionRendering.value = false;
+  activeAuditionWindow.value = null;
+  clearSnapState();
+
+  stop();
+  engine?.unload();
+  mixBuffer.value = undefined;
+  mixChannels = null;
+  mixFrames = 0;
+  silenceMs.value = undefined;
+  audioState.value = "none";
+  activeEngineFilterKey = "mix";
+  flamSavedState.value = null;
+
+  loadedSongId.value = null;
+  sessionPayload.value = null;
+  inFlightEditCount.value = 0;
+  queuedEntityNudges.clear();
+  activeNudgeDrains.clear();
+  pendingEntityTimeSec.clear();
+
+  selection.value = { kind: "none" };
+  activeRange.value = null;
+  rangeStartCursorSec.value = null;
+  rangeEndCursorSec.value = null;
+  hoverTimeMs.value = undefined;
 }
 
 function syncSummaryIntoSongsList(summary: TempoSongSummary) {
@@ -664,6 +932,8 @@ async function initializeWorkspace() {
 async function handleOpenFolder() {
   const dir = folderPathInput.value.trim();
   if (!dir) return;
+  resetActiveSongContext();
+  selectedSongId.value = null;
   loadingWorkspace.value = true;
   error.value = "";
   folderMenuOpen.value = false;
@@ -679,7 +949,8 @@ async function handleOpenFolder() {
     if (targetSong) {
       await selectSong(targetSong);
     } else {
-      activeSongId.value = null;
+      selectedSongId.value = null;
+      loadedSongId.value = null;
       sessionPayload.value = null;
     }
   } catch (cause) {
@@ -702,10 +973,8 @@ async function onImportFilesSelected(event: Event) {
   loadingWorkspace.value = true;
   error.value = "";
   try {
-    const uploaded = await uploadAudioFiles(
-      fileList,
-      workspaceDir.value ? { dir: workspaceDir.value } : undefined,
-    );
+    // Do NOT pass `?dir=` when uploading into an already-open workspace so custom stateDir is preserved!
+    const uploaded = await uploadAudioFiles(fileList);
     if (disposed) return;
     workspaceDir.value = uploaded.workspaceDir;
     folderPathInput.value = uploaded.workspaceDir ?? "";
@@ -722,29 +991,29 @@ async function onImportFilesSelected(event: Event) {
 }
 
 async function selectSong(songId: string) {
-  songOpenAbort?.abort();
-  snapsAbort?.abort();
-  recomputeAbort?.abort();
-  auditionAbort?.abort();
-  stop();
+  resetActiveSongContext();
 
+  const capturedEpoch = songEpoch;
   const controller = new AbortController();
   songOpenAbort = controller;
-  activeSongId.value = songId;
+  selectedSongId.value = songId;
   openingSong.value = true;
   error.value = "";
   notice.value = "";
   cuesDirty.value = false;
-  selection.value = { kind: "none" };
-  activeRange.value = null;
-  rangeStartCursorSec.value = null;
-  rangeEndCursorSec.value = null;
-  snapCandidates.value = [];
 
   try {
     const payload = await openSongSession(songId, controller.signal);
-    if (controller.signal.aborted || disposed) return;
+    if (
+      controller.signal.aborted ||
+      disposed ||
+      capturedEpoch !== songEpoch ||
+      selectedSongId.value !== songId
+    ) {
+      return;
+    }
     applyPayload(payload);
+    loadedSongId.value = songId;
     playheadMs.value = 0;
     const durMs = Math.max(1000, payload.state.durationSec * 1000);
     loopRegion.value = { startMs: 0, endMs: Math.min(durMs, 16_000) };
@@ -752,12 +1021,12 @@ async function selectSong(songId: string) {
     fitPending = true;
     if (stageWidth.value > 0) fitWholeSong();
     const targetRate = payload.state.audio?.sampleRate ?? 44_100;
-    await loadSongAudio(songId, targetRate, controller.signal);
+    await loadSongAudio(songId, targetRate, capturedEpoch, controller.signal);
   } catch (cause) {
-    if (isAbortError(cause) || controller.signal.aborted) return;
+    if (isAbortError(cause) || controller.signal.aborted || capturedEpoch !== songEpoch) return;
     reportError(cause);
   } finally {
-    if (songOpenAbort === controller) {
+    if (songOpenAbort === controller && capturedEpoch === songEpoch) {
       openingSong.value = false;
     }
   }
@@ -780,7 +1049,7 @@ function setView(next: TimeView) {
     next,
     bounds.value,
     stageWidth.value,
-    zoomLimits(bounds.value, stageWidth.value, sampleRate.value, devicePixelRatio.value),
+    zoomLimits(bounds.value, stageWidth.value, sourceSampleRate.value, devicePixelRatio.value),
   );
 }
 
@@ -889,6 +1158,7 @@ function transportStep() {
       playheadMs.value = shownMs;
       readoutAtMs = nowMs;
     }
+    maybeRefreshAuditionWindow(shownMs / 1000, true);
   }
   const followAt =
     current && follow.value && stageWidth.value > 0
@@ -932,6 +1202,7 @@ function seek(timeMs: number) {
   restartIfPlaying(() => {
     playheadMs.value = clampToBounds(timeMs);
   });
+  maybeRefreshAuditionWindow(playheadMs.value / 1000, false);
 }
 
 let locateFromMs: number | undefined;
@@ -1034,33 +1305,67 @@ function toggleFlamCheck() {
   togglePlayback();
 }
 
-// Micro-assist snaps (`suggestSongSnaps` — zero `.jsonl` trace writes!)
-function requestSnapsForTime(timeSec: number, debounced = true) {
-  clearTimeout(snapDebounceTimer);
-  snapsAbort?.abort();
-  const songId = activeSongId.value;
-  if (!songId) return;
+// Micro-assist snaps (`suggestSongSnaps` — selection-bound & zero `.jsonl` trace writes!)
+function requestSnapsForBeat(beatId: string, beatTimeSec: number, debounced = true) {
+  clearSnapState();
+  if (!isSongReadyForActions.value) return;
+  const capturedSongId = loadedSongId.value;
+  const capturedEpoch = songEpoch;
+  const reqSeq = ++localSnapSeq;
+  if (!capturedSongId || capturedSongId !== selectedSongId.value) return;
 
   const run = async () => {
+    if (
+      disposed ||
+      reqSeq !== localSnapSeq ||
+      capturedEpoch !== songEpoch ||
+      loadedSongId.value !== capturedSongId ||
+      selection.value.kind !== "beat" ||
+      selection.value.id !== beatId
+    ) {
+      return;
+    }
     const controller = new AbortController();
     snapsAbort = controller;
     snapsLoading.value = true;
     try {
       const res = await suggestSongSnaps(
-        songId,
-        { timeSec, windowSec: 0.12, immediate: true },
+        capturedSongId,
+        { timeSec: beatTimeSec, windowSec: 0.12, immediate: true },
         controller.signal,
       );
-      if (controller.signal.aborted || disposed) return;
-      if (res.status === "ok") {
-        snapCandidates.value = res.candidates;
+      if (
+        controller.signal.aborted ||
+        disposed ||
+        reqSeq !== localSnapSeq ||
+        capturedEpoch !== songEpoch ||
+        loadedSongId.value !== capturedSongId ||
+        selectedSongId.value !== capturedSongId
+      ) {
+        return;
+      }
+      const liveBeat = selectedBeat.value;
+      if (
+        res.status === "ok" &&
+        selection.value.kind === "beat" &&
+        liveBeat &&
+        liveBeat.id === beatId &&
+        Math.abs(liveBeat.timeSec - beatTimeSec) <= 1e-6
+      ) {
+        snapState.value = {
+          songId: capturedSongId,
+          beatId,
+          beatTimeSec,
+          generation: res.generation,
+          candidates: res.candidates,
+        };
       }
     } catch (cause) {
-      if (!isAbortError(cause) && !controller.signal.aborted) {
-        snapCandidates.value = [];
+      if (!isAbortError(cause) && !controller.signal.aborted && reqSeq === localSnapSeq) {
+        snapState.value = null;
       }
     } finally {
-      if (snapsAbort === controller) {
+      if (snapsAbort === controller && reqSeq === localSnapSeq) {
         snapsLoading.value = false;
       }
     }
@@ -1068,6 +1373,7 @@ function requestSnapsForTime(timeSec: number, debounced = true) {
 
   if (debounced) {
     snapDebounceTimer = setTimeout(() => {
+      snapDebounceTimer = undefined;
       void run();
     }, 35);
   } else {
@@ -1076,19 +1382,19 @@ function requestSnapsForTime(timeSec: number, debounced = true) {
 }
 
 function handleStageSelect(next: TempoSelection) {
+  clearSnapState();
   selection.value = next;
   if (next.kind !== "range") {
     activeRange.value = null;
   }
-  if (next.kind === "beat") {
+  if (next.kind === "beat" && isSongReadyForActions.value) {
     const beat = beats.value.find((b) => b.id === next.id);
-    if (beat) requestSnapsForTime(beat.timeSec, true);
-  } else {
-    snapCandidates.value = [];
+    if (beat) requestSnapsForBeat(beat.id, beat.timeSec, true);
   }
 }
 
 function handleRangeSelect(range: Range) {
+  clearSnapState();
   activeRange.value = range;
   selection.value = { kind: "range", t0: range.t0, t1: range.t1 };
   loopRegion.value = { startMs: range.t0 * 1000, endMs: range.t1 * 1000 };
@@ -1098,6 +1404,7 @@ function handleRangeSelect(range: Range) {
 }
 
 function setRangeCursorPoint(edge: "start" | "end") {
+  if (!isSongReadyForActions.value) return;
   const cursorMs =
     !playing.value && hoverTimeMs.value !== undefined ? hoverTimeMs.value : shownPlayheadMs();
   const cursorSec = Number(
@@ -1127,62 +1434,298 @@ function setRangeCursorPoint(edge: "start" | "end") {
   }
 }
 
+let editChainPendingCount = 0;
+
+function enqueueOnEditChain(task: () => Promise<void>): Promise<void> {
+  if (editChainPendingCount === 0) {
+    editChainPendingCount += 1;
+    const direct = task().finally(() => {
+      editChainPendingCount = Math.max(0, editChainPendingCount - 1);
+    });
+    editChain = direct.catch(() => {});
+    return direct;
+  }
+  editChainPendingCount += 1;
+  const chained = editChain.catch(() => {}).then(() =>
+    task().finally(() => {
+      editChainPendingCount = Math.max(0, editChainPendingCount - 1);
+    }),
+  );
+  editChain = chained.catch(() => {});
+  return chained;
+}
+
+function scheduleEntityNudge(kind: "beat" | "unbeat" | "sound", id: string, nextTimeSec: number) {
+  if (!isSongReadyForActions.value) return;
+  const capturedSongId = loadedSongId.value;
+  const capturedEpoch = songEpoch;
+  if (!capturedSongId) return;
+
+  if (kind === "beat") {
+    clearSnapState();
+  }
+  const entityKey = `${kind}:${id}`;
+  pendingEntityTimeSec.set(entityKey, nextTimeSec);
+  queuedEntityNudges.set(entityKey, { kind, id, timeSec: nextTimeSec });
+  cuesDirty.value = true;
+
+  if (activeNudgeDrains.has(entityKey)) {
+    return;
+  }
+
+  const drainPromise = (async () => {
+    try {
+      while (queuedEntityNudges.has(entityKey)) {
+        if (
+          disposed ||
+          capturedEpoch !== songEpoch ||
+          selectedSongId.value !== capturedSongId ||
+          loadedSongId.value !== capturedSongId
+        ) {
+          queuedEntityNudges.delete(entityKey);
+          pendingEntityTimeSec.delete(entityKey);
+          return;
+        }
+        const item = queuedEntityNudges.get(entityKey);
+        queuedEntityNudges.delete(entityKey);
+        if (!item) break;
+
+        const op: EditOp =
+          item.kind === "beat"
+            ? { op: "move_beat", id: item.id, timeSec: item.timeSec, source: "user" }
+            : item.kind === "unbeat"
+              ? { op: "move_unbeat", id: item.id, timeSec: item.timeSec }
+              : { op: "move_sound", id: item.id, timeSec: item.timeSec, source: "user" };
+
+        let failed = false;
+        await enqueueOnEditChain(async () => {
+          if (
+            disposed ||
+            capturedEpoch !== songEpoch ||
+            selectedSongId.value !== capturedSongId ||
+            loadedSongId.value !== capturedSongId
+          ) {
+            return;
+          }
+          inFlightEditCount.value += 1;
+          error.value = "";
+          try {
+            const payload = await applySongOps(capturedSongId, op);
+            if (
+              !disposed &&
+              capturedEpoch === songEpoch &&
+              selectedSongId.value === capturedSongId &&
+              loadedSongId.value === capturedSongId
+            ) {
+              applyPayload(payload, { checkLocalInvalidation: true });
+            }
+          } catch (cause) {
+            failed = true;
+            if (
+              !disposed &&
+              capturedEpoch === songEpoch &&
+              selectedSongId.value === capturedSongId
+            ) {
+              queuedEntityNudges.delete(entityKey);
+              pendingEntityTimeSec.delete(entityKey);
+              reportError(cause);
+            }
+          } finally {
+            if (capturedEpoch === songEpoch) {
+              inFlightEditCount.value = Math.max(0, inFlightEditCount.value - 1);
+            }
+          }
+        });
+        if (failed) return;
+      }
+
+      if (
+        !disposed &&
+        capturedEpoch === songEpoch &&
+        selectedSongId.value === capturedSongId &&
+        loadedSongId.value === capturedSongId &&
+        !queuedEntityNudges.has(entityKey)
+      ) {
+        const finalSec = pendingEntityTimeSec.get(entityKey);
+        pendingEntityTimeSec.delete(entityKey);
+        if (
+          kind === "beat" &&
+          finalSec !== undefined &&
+          selection.value.kind === "beat" &&
+          selection.value.id === id
+        ) {
+          requestSnapsForBeat(id, finalSec, true);
+        }
+      }
+    } finally {
+      activeNudgeDrains.delete(entityKey);
+    }
+  })();
+
+  activeNudgeDrains.set(entityKey, drainPromise);
+}
+
 // Edits & Undo/Redo
 async function commitOps(
   ops: EditOp | EditOp[],
-  options?: { markCuesDirty?: boolean; afterSelect?: TempoSelection; snapTimeSec?: number },
+  options?: {
+    markCuesDirty?: boolean;
+    afterSelect?: TempoSelection;
+    snapBeat?: { id: string; timeSec: number };
+  },
 ) {
-  const songId = activeSongId.value;
-  if (!songId) return;
-  updatingEdit.value = true;
-  error.value = "";
-  try {
-    const payload = await applySongOps(songId, ops);
-    if (disposed) return;
-    applyPayload(payload, { checkLocalInvalidation: true });
-    if (options?.markCuesDirty) cuesDirty.value = true;
-    if (options?.afterSelect) {
-      selection.value = options.afterSelect;
-    }
-    if (options?.snapTimeSec !== undefined) {
-      requestSnapsForTime(options.snapTimeSec, false);
-    }
-  } catch (cause) {
-    reportError(cause);
-  } finally {
-    updatingEdit.value = false;
+  if (!isSongReadyForActions.value) return;
+  const capturedSongId = loadedSongId.value;
+  const capturedEpoch = songEpoch;
+  if (!capturedSongId) return;
+
+  if (activeNudgeDrains.size > 0) {
+    await Promise.allSettled(Array.from(activeNudgeDrains.values()));
   }
+  await enqueueOnEditChain(async () => {
+    if (
+      disposed ||
+      capturedEpoch !== songEpoch ||
+      selectedSongId.value !== capturedSongId ||
+      loadedSongId.value !== capturedSongId
+    ) {
+      return;
+    }
+    inFlightEditCount.value += 1;
+    error.value = "";
+    try {
+      const payload = await applySongOps(capturedSongId, ops);
+      if (
+        disposed ||
+        capturedEpoch !== songEpoch ||
+        selectedSongId.value !== capturedSongId ||
+        loadedSongId.value !== capturedSongId
+      ) {
+        return;
+      }
+      applyPayload(payload, { checkLocalInvalidation: true });
+      if (options?.markCuesDirty) cuesDirty.value = true;
+      if (options?.afterSelect) {
+        selection.value = options.afterSelect;
+      }
+      if (options?.snapBeat) {
+        requestSnapsForBeat(options.snapBeat.id, options.snapBeat.timeSec, false);
+      }
+    } catch (cause) {
+      if (!disposed && capturedEpoch === songEpoch && selectedSongId.value === capturedSongId) {
+        reportError(cause);
+      }
+    } finally {
+      if (capturedEpoch === songEpoch) {
+        inFlightEditCount.value = Math.max(0, inFlightEditCount.value - 1);
+      }
+    }
+  });
 }
 
 async function performUndoRedo(action: "undo" | "redo") {
-  const songId = activeSongId.value;
-  if (!songId) return;
-  updatingEdit.value = true;
-  error.value = "";
-  try {
-    const payload = await applySongAction(songId, action);
-    if (disposed) return;
-    applyPayload(payload);
-    snapCandidates.value = [];
-  } catch (cause) {
-    reportError(cause);
-  } finally {
-    updatingEdit.value = false;
+  if (!isSongReadyForActions.value) return;
+  if (activeNudgeDrains.size > 0) {
+    await Promise.allSettled(Array.from(activeNudgeDrains.values()));
   }
+  if (action === "undo" && !canUndo.value) return;
+  if (action === "redo" && !canRedo.value) return;
+
+  const capturedSongId = loadedSongId.value;
+  const capturedEpoch = songEpoch;
+  if (!capturedSongId) return;
+
+  clearSnapState();
+  await enqueueOnEditChain(async () => {
+    if (
+      disposed ||
+      capturedEpoch !== songEpoch ||
+      selectedSongId.value !== capturedSongId ||
+      loadedSongId.value !== capturedSongId
+    ) {
+      return;
+    }
+    inFlightEditCount.value += 1;
+    error.value = "";
+    try {
+      const payload = await applySongAction(capturedSongId, action);
+      if (
+        disposed ||
+        capturedEpoch !== songEpoch ||
+        selectedSongId.value !== capturedSongId ||
+        loadedSongId.value !== capturedSongId
+      ) {
+        return;
+      }
+      applyPayload(payload);
+      clearSnapState();
+    } catch (cause) {
+      if (!disposed && capturedEpoch === songEpoch && selectedSongId.value === capturedSongId) {
+        reportError(cause);
+      }
+    } finally {
+      if (capturedEpoch === songEpoch) {
+        inFlightEditCount.value = Math.max(0, inFlightEditCount.value - 1);
+      }
+    }
+  });
 }
 
-function actionCursorSec(eventTimeStamp = performance.now()): number | null {
-  if (durationSec.value <= 0) return null;
+/**
+ * Live-tap cursor for `Beat` (`B`), `Unbeat` (`U`), and `Sound` (`N`):
+ * while playing, strictly uses `engine.heardAt(eventTimeStamp)` and ignores taps
+ * (`null`) if audible output has not started yet instead of falling back to visual playhead!
+ */
+function liveTapCursorSec(eventTimeStamp: number): number | null {
+  if (!isSongReadyForActions.value || durationSec.value <= 0) return null;
   if (playing.value || engine?.starting) {
-    const heardMs = engine?.heardAt(eventTimeStamp) ?? shownPlayheadMs();
+    const heardMs = engine?.heardAt(eventTimeStamp);
+    if (heardMs === undefined) return null;
     return Number(Math.min(durationSec.value, Math.max(0, heardMs / 1000)).toFixed(6));
   }
   const targetMs = hoverTimeMs.value ?? playheadMs.value;
   return Number(Math.min(durationSec.value, Math.max(0, targetMs / 1000)).toFixed(6));
 }
 
+function structuralCursorSec(): number | null {
+  if (!isSongReadyForActions.value || durationSec.value <= 0) return null;
+  const targetMs = playing.value ? shownPlayheadMs() : (hoverTimeMs.value ?? playheadMs.value);
+  return Number(Math.min(durationSec.value, Math.max(0, targetMs / 1000)).toFixed(6));
+}
+
 function placeBeatAt(timeSec: number) {
+  if (!isSongReadyForActions.value) return;
   const clamped = Number(Math.min(durationSec.value, Math.max(0, timeSec)).toFixed(6));
+  clearSnapState();
+
+  let coincidentBeat: Beat | undefined;
+  let nearestDist = Number.POSITIVE_INFINITY;
+  for (const b of beats.value) {
+    const dist = Math.abs(b.timeSec - clamped);
+    if (dist <= 0.0005 && dist < nearestDist) {
+      coincidentBeat = b;
+      nearestDist = dist;
+    }
+  }
+
+  if (coincidentBeat) {
+    selection.value = { kind: "beat", id: coincidentBeat.id };
+    void commitOps(
+      {
+        op: "move_beat",
+        id: coincidentBeat.id,
+        timeSec: clamped,
+        source: "user",
+      },
+      {
+        markCuesDirty: true,
+        afterSelect: { kind: "beat", id: coincidentBeat.id },
+        snapBeat: { id: coincidentBeat.id, timeSec: clamped },
+      },
+    );
+    return;
+  }
+
   const id = crypto.randomUUID();
   void commitOps(
     {
@@ -1192,16 +1735,17 @@ function placeBeatAt(timeSec: number) {
     {
       markCuesDirty: true,
       afterSelect: { kind: "beat", id },
-      snapTimeSec: clamped,
+      snapBeat: { id, timeSec: clamped },
     },
   );
 }
 
 function placeUnbeatAt(timeSec: number, isLivePlaying = false) {
+  if (!isSongReadyForActions.value) return;
   const clamped = Number(Math.min(durationSec.value, Math.max(0, timeSec)).toFixed(6));
   const id = crypto.randomUUID();
   const captureRadiusSec = computeUnbeatCaptureRadiusSec(view.value.msPerPx, isLivePlaying);
-  snapCandidates.value = [];
+  clearSnapState();
   void commitOps(
     {
       op: "apply_unbeat_cue",
@@ -1218,9 +1762,10 @@ function placeUnbeatAt(timeSec: number, isLivePlaying = false) {
 }
 
 function placeSoundAt(timeSec: number) {
+  if (!isSongReadyForActions.value) return;
   const clamped = Number(Math.min(durationSec.value, Math.max(0, timeSec)).toFixed(6));
   const id = crypto.randomUUID();
-  snapCandidates.value = [];
+  clearSnapState();
   void commitOps(
     {
       op: "upsert_sound",
@@ -1234,9 +1779,10 @@ function placeSoundAt(timeSec: number) {
 }
 
 function onToolbarCuePress(kind: "beat" | "unbeat" | "sound", event: MouseEvent) {
+  if (!isSongReadyForActions.value) return;
   if (event.type === "pointerdown" && event.button !== 0) return;
   if (event.type === "click" && event.detail !== 0) return;
-  const sec = actionCursorSec(event.timeStamp);
+  const sec = liveTapCursorSec(event.timeStamp);
   if (sec === null) return;
   if (kind === "beat") placeBeatAt(sec);
   else if (kind === "unbeat") placeUnbeatAt(sec, playing.value || Boolean(engine?.starting));
@@ -1244,8 +1790,19 @@ function onToolbarCuePress(kind: "beat" | "unbeat" | "sound", event: MouseEvent)
 }
 
 function applySnapCandidate(candidate: SnapCandidate) {
+  if (!isSongReadyForActions.value) return;
+  const bound = snapState.value;
   const beat = selectedBeat.value;
-  if (!beat) return;
+  if (
+    !bound ||
+    !beat ||
+    bound.songId !== loadedSongId.value ||
+    bound.beatId !== beat.id ||
+    Math.abs(bound.beatTimeSec - beat.timeSec) > 1e-6
+  ) {
+    return;
+  }
+  clearSnapState();
   void commitOps(
     {
       op: "snap_beat",
@@ -1264,62 +1821,98 @@ function applySnapCandidate(candidate: SnapCandidate) {
 }
 
 function nudgeSelection(deltaMs: number) {
+  if (!isSongReadyForActions.value) return;
   const deltaSec = deltaMs / 1000;
   if (selectedBeat.value) {
     const b = selectedBeat.value;
-    const nextSec = Number(
-      Math.min(durationSec.value, Math.max(0, b.timeSec + deltaSec)).toFixed(6),
+    const nextSec = Math.min(
+      durationSec.value,
+      Math.max(0, Number((b.timeSec + deltaSec).toFixed(9))),
     );
-    void commitOps(
-      { op: "move_beat", id: b.id, timeSec: nextSec, source: "user" },
-      { markCuesDirty: true, snapTimeSec: nextSec },
-    );
+    scheduleEntityNudge("beat", b.id, nextSec);
     return;
   }
   if (selectedUnbeat.value) {
     const u = selectedUnbeat.value;
-    const nextSec = Number(
-      Math.min(durationSec.value, Math.max(0, u.timeSec + deltaSec)).toFixed(6),
+    const nextSec = Math.min(
+      durationSec.value,
+      Math.max(0, Number((u.timeSec + deltaSec).toFixed(9))),
     );
-    void commitOps(
-      { op: "move_unbeat", id: u.id, timeSec: nextSec },
-      { markCuesDirty: true },
-    );
+    scheduleEntityNudge("unbeat", u.id, nextSec);
     return;
   }
   if (selectedSound.value) {
     const s = selectedSound.value;
-    const nextSec = Number(
-      Math.min(durationSec.value, Math.max(0, s.timeSec + deltaSec)).toFixed(6),
+    const nextSec = Math.min(
+      durationSec.value,
+      Math.max(0, Number((s.timeSec + deltaSec).toFixed(9))),
     );
-    void commitOps(
-      { op: "move_sound", id: s.id, timeSec: nextSec, source: "user" },
-      { markCuesDirty: true },
-    );
+    scheduleEntityNudge("sound", s.id, nextSec);
     return;
   }
   if (!playing.value) {
     playheadMs.value = clampToBounds(playheadMs.value + deltaMs);
     bringIntoView(playheadMs.value);
+    maybeRefreshAuditionWindow(playheadMs.value / 1000, false);
+  }
+}
+
+function nudgeSelectionFrames(deltaFrames: number) {
+  if (!isSongReadyForActions.value) return;
+  const sr = sourceSampleRate.value;
+  const maxFrames = Math.max(0, Math.round(durationSec.value * sr));
+
+  if (selectedBeat.value) {
+    const b = selectedBeat.value;
+    const nextFrame = Math.min(maxFrames, Math.max(0, Math.round(b.timeSec * sr) + deltaFrames));
+    const nextTimeSec = Math.min(durationSec.value, Math.max(0, nextFrame / sr));
+    scheduleEntityNudge("beat", b.id, nextTimeSec);
+    return;
+  }
+  if (selectedUnbeat.value) {
+    const u = selectedUnbeat.value;
+    const nextFrame = Math.min(maxFrames, Math.max(0, Math.round(u.timeSec * sr) + deltaFrames));
+    const nextTimeSec = Math.min(durationSec.value, Math.max(0, nextFrame / sr));
+    scheduleEntityNudge("unbeat", u.id, nextTimeSec);
+    return;
+  }
+  if (selectedSound.value) {
+    const s = selectedSound.value;
+    const nextFrame = Math.min(maxFrames, Math.max(0, Math.round(s.timeSec * sr) + deltaFrames));
+    const nextTimeSec = Math.min(durationSec.value, Math.max(0, nextFrame / sr));
+    scheduleEntityNudge("sound", s.id, nextTimeSec);
+    return;
+  }
+  if (!playing.value) {
+    playheadMs.value = clampToBounds(playheadMs.value + (deltaFrames * 1000) / sr);
+    bringIntoView(playheadMs.value);
+    maybeRefreshAuditionWindow(playheadMs.value / 1000, false);
   }
 }
 
 function deleteSelectedEntity() {
+  if (!isSongReadyForActions.value) return;
+  clearSnapState();
   if (selectedBeat.value) {
     const id = selectedBeat.value.id;
+    pendingEntityTimeSec.delete(`beat:${id}`);
+    queuedEntityNudges.delete(`beat:${id}`);
     selection.value = { kind: "none" };
-    snapCandidates.value = [];
     void commitOps({ op: "remove_beat", id }, { markCuesDirty: true });
     return;
   }
   if (selectedUnbeat.value) {
     const id = selectedUnbeat.value.id;
+    pendingEntityTimeSec.delete(`unbeat:${id}`);
+    queuedEntityNudges.delete(`unbeat:${id}`);
     selection.value = { kind: "none" };
     void commitOps({ op: "remove_unbeat", id }, { markCuesDirty: true });
     return;
   }
   if (selectedSound.value) {
     const id = selectedSound.value.id;
+    pendingEntityTimeSec.delete(`sound:${id}`);
+    queuedEntityNudges.delete(`sound:${id}`);
     selection.value = { kind: "none" };
     void commitOps({ op: "remove_sound", id }, { markCuesDirty: true });
     return;
@@ -1392,6 +1985,8 @@ function setSegmentRegime(seg: Segment, regime: SegmentRegime) {
 }
 
 function onSelectSegmentFromStrip(segmentId: string, jumpToStart: boolean) {
+  if (!isSongReadyForActions.value) return;
+  clearSnapState();
   activeRange.value = null;
   selection.value = { kind: "segment", id: segmentId };
   const seg = segments.value.find((s) => s.id === segmentId);
@@ -1424,10 +2019,11 @@ function onMoveSegmentBoundary(leftSegmentId: string, rightSegmentId: string, ti
 }
 
 function splitActiveSegment() {
-  const sec = actionCursorSec();
+  const sec = structuralCursorSec();
   if (sec === null) return;
   const seg = findSegmentAtTime(segments.value, sec);
   if (!seg || sec <= seg.t0 + 0.05 || sec >= seg.t1 - 0.05) return;
+  clearSnapState();
   const newSegmentId = crypto.randomUUID();
   void commitOps(
     {
@@ -1445,6 +2041,7 @@ function splitActiveSegment() {
 }
 
 function mergeSelectedSegment(direction: "prev" | "next" = "next") {
+  if (!isSongReadyForActions.value) return;
   const seg = selectedSegment.value;
   if (!seg || segments.value.length < 2) return;
   const idx = segments.value.findIndex((s) => s.id === seg.id);
@@ -1460,6 +2057,7 @@ function mergeSelectedSegment(direction: "prev" | "next" = "next") {
   const left = segments.value[pairIdx];
   const right = segments.value[pairIdx + 1];
   if (!left || !right) return;
+  clearSnapState();
   void commitOps(
     {
       op: "merge_segments",
@@ -1475,8 +2073,10 @@ function mergeSelectedSegment(direction: "prev" | "next" = "next") {
 }
 
 function shiftBeatsInRange(deltaMs: number) {
+  if (!isSongReadyForActions.value) return;
   const r = activeRange.value;
   if (!r) return;
+  clearSnapState();
   void commitOps(
     {
       op: "shift_beats",
@@ -1489,10 +2089,12 @@ function shiftBeatsInRange(deltaMs: number) {
 }
 
 function deleteBeatsInRange() {
+  if (!isSongReadyForActions.value) return;
   const r = activeRange.value;
   if (!r) return;
   const inRange = beats.value.filter((b) => b.timeSec >= r.t0 && b.timeSec < r.t1);
   if (inRange.length === 0) return;
+  clearSnapState();
   void commitOps(
     inRange.map((b) => ({ op: "remove_beat" as const, id: b.id })),
     { markCuesDirty: true },
@@ -1500,8 +2102,10 @@ function deleteBeatsInRange() {
 }
 
 function promoteRangeToSegment() {
+  if (!isSongReadyForActions.value) return;
   const r = activeRange.value;
   if (!r) return;
+  clearSnapState();
   const idA = crypto.randomUUID();
   const idB = crypto.randomUUID();
   void commitOps(
@@ -1518,6 +2122,8 @@ function promoteRangeToSegment() {
 
 // Inbox navigation (`J` / `⇧J`)
 function focusInboxSpan(span: Span) {
+  if (!isSongReadyForActions.value) return;
+  clearSnapState();
   const range: Range = { t0: span.t0, t1: span.t1 };
   activeRange.value = range;
   selection.value = { kind: "range", t0: range.t0, t1: range.t1 };
@@ -1539,6 +2145,7 @@ function focusInboxSpan(span: Span) {
 }
 
 function stepInbox(delta: 1 | -1) {
+  if (!isSongReadyForActions.value) return;
   const items = inboxSpans.value;
   if (items.length === 0) return;
   const curRange = activeRange.value;
@@ -1559,8 +2166,23 @@ function stepInbox(delta: 1 | -1) {
 
 // Heavy Recompute (`⌘K`) & Offers (`Alt`, `\`, `Tab`, `⇧Tab`)
 async function triggerRecompute() {
-  const songId = activeSongId.value;
-  if (!songId) return;
+  if (!isSongReadyForActions.value) return;
+  const capturedSongId = loadedSongId.value;
+  const capturedEpoch = songEpoch;
+  if (!capturedSongId) return;
+
+  if (activeNudgeDrains.size > 0) {
+    await Promise.allSettled(Array.from(activeNudgeDrains.values()));
+  }
+  if (
+    disposed ||
+    capturedEpoch !== songEpoch ||
+    selectedSongId.value !== capturedSongId ||
+    loadedSongId.value !== capturedSongId
+  ) {
+    return;
+  }
+
   recomputeAbort?.abort();
   const controller = new AbortController();
   recomputeAbort = controller;
@@ -1572,14 +2194,22 @@ async function triggerRecompute() {
         ? { t0: activeRange.value.t0, t1: activeRange.value.t1 }
         : "song";
     const res = await recomputeSong(
-      songId,
+      capturedSongId,
       {
         scope,
         reason: scope === "song" ? "Song recompute" : "Range recompute",
       },
       controller.signal,
     );
-    if (controller.signal.aborted || disposed) return;
+    if (
+      controller.signal.aborted ||
+      disposed ||
+      capturedEpoch !== songEpoch ||
+      selectedSongId.value !== capturedSongId ||
+      loadedSongId.value !== capturedSongId
+    ) {
+      return;
+    }
     cuesDirty.value = false;
     applyPayload(res);
     if (res.suppressedOffers.length > 0 && res.offers.length > 0) {
@@ -1590,40 +2220,65 @@ async function triggerRecompute() {
       workspaceFrame.value?.showPane("right");
     }
   } catch (cause) {
-    if (!isAbortError(cause) && !controller.signal.aborted) {
+    if (!isAbortError(cause) && !controller.signal.aborted && capturedEpoch === songEpoch) {
       reportError(cause);
     }
   } finally {
-    if (recomputeAbort === controller) {
+    if (recomputeAbort === controller && capturedEpoch === songEpoch) {
       recomputing.value = false;
     }
   }
 }
 
 async function beginHoldCompare(offerId?: string) {
+  if (!isSongReadyForActions.value) return;
+  const capturedSongId = loadedSongId.value;
+  const capturedEpoch = songEpoch;
+  if (!capturedSongId) return;
+
   if (offerId) selectedOfferId.value = offerId;
   if (holdingAlt.value) return;
   holdingAlt.value = true;
-  const songId = activeSongId.value;
-  if (!songId) return;
+  holdOwnerSongId = capturedSongId;
+
   try {
-    const res = await setHoldOffers(songId, true);
-    if (!disposed && holdingAlt.value) applyPayload(res);
+    const res = await setHoldOffers(capturedSongId, true);
+    if (
+      !disposed &&
+      holdingAlt.value &&
+      holdOwnerSongId === capturedSongId &&
+      capturedEpoch === songEpoch &&
+      selectedSongId.value === capturedSongId &&
+      loadedSongId.value === capturedSongId
+    ) {
+      applyPayload(res);
+    }
   } catch {}
 }
 
 async function endHoldCompare() {
-  if (!holdingAlt.value) return;
+  if (!holdingAlt.value && !holdOwnerSongId) return;
+  const ownerSongId = holdOwnerSongId;
+  const capturedEpoch = songEpoch;
   holdingAlt.value = false;
-  const songId = activeSongId.value;
-  if (!songId) return;
+  holdOwnerSongId = null;
+  if (!ownerSongId) return;
+
   try {
-    const res = await setHoldOffers(songId, false);
-    if (!disposed) applyPayload(res);
+    const res = await setHoldOffers(ownerSongId, false);
+    if (
+      !disposed &&
+      capturedEpoch === songEpoch &&
+      selectedSongId.value === ownerSongId &&
+      loadedSongId.value === ownerSongId
+    ) {
+      applyPayload(res);
+    }
   } catch {}
 }
 
 function cycleOfferOption() {
+  if (!isSongReadyForActions.value) return;
   const items = displayOffers.value;
   if (items.length <= 1) return;
   const curIdx = items.findIndex((i) => i.offer.id === selectedOfferId.value);
@@ -1638,40 +2293,99 @@ function cycleOfferOption() {
 }
 
 async function handleAcceptOffer(offerId?: string) {
-  const songId = activeSongId.value;
-  const targetId = offerId ?? activeOffer.value?.id;
-  if (!songId || !targetId) return;
-  updatingEdit.value = true;
-  error.value = "";
-  try {
-    const res = await acceptOffer(songId, targetId);
-    if (disposed) return;
-    applyPayload(res);
-    if (!res.ok && res.conflicts?.length) {
-      notice.value = res.conflicts[0]?.message ?? "Suggestion conflicted with a protected Keep lock.";
-    }
-  } catch (cause) {
-    reportError(cause);
-  } finally {
-    updatingEdit.value = false;
+  if (!isSongReadyForActions.value) return;
+  const capturedSongId = loadedSongId.value;
+  const capturedEpoch = songEpoch;
+  const targetOffer = offerId
+    ? displayOffers.value.find((i) => i.offer.id === offerId)?.offer
+    : activeOffer.value;
+  if (!capturedSongId || !targetOffer || targetOffer.status !== "valid") return;
+
+  if (activeNudgeDrains.size > 0) {
+    await Promise.allSettled(Array.from(activeNudgeDrains.values()));
   }
+  clearSnapState();
+  await enqueueOnEditChain(async () => {
+    if (
+      disposed ||
+      capturedEpoch !== songEpoch ||
+      selectedSongId.value !== capturedSongId ||
+      loadedSongId.value !== capturedSongId
+    ) {
+      return;
+    }
+    inFlightEditCount.value += 1;
+    error.value = "";
+    try {
+      const res = await acceptOffer(capturedSongId, targetOffer.id);
+      if (
+        disposed ||
+        capturedEpoch !== songEpoch ||
+        selectedSongId.value !== capturedSongId ||
+        loadedSongId.value !== capturedSongId
+      ) {
+        return;
+      }
+      applyPayload(res);
+      if (!res.ok && res.conflicts?.length) {
+        notice.value = sanitizeUserFacingText(
+          res.conflicts[0]?.message ?? "Suggestion conflicted with a protected Keep lock.",
+        );
+      }
+    } catch (cause) {
+      if (!disposed && capturedEpoch === songEpoch && selectedSongId.value === capturedSongId) {
+        reportError(cause);
+      }
+    } finally {
+      if (capturedEpoch === songEpoch) {
+        inFlightEditCount.value = Math.max(0, inFlightEditCount.value - 1);
+      }
+    }
+  });
 }
 
 async function handleRejectOffer(offerId?: string) {
-  const songId = activeSongId.value;
+  if (!isSongReadyForActions.value) return;
+  const capturedSongId = loadedSongId.value;
+  const capturedEpoch = songEpoch;
   const targetId = offerId ?? activeOffer.value?.id;
-  if (!songId || !targetId) return;
-  updatingEdit.value = true;
-  error.value = "";
-  try {
-    const res = await rejectOffer(songId, targetId);
-    if (disposed) return;
-    applyPayload(res);
-  } catch (cause) {
-    reportError(cause);
-  } finally {
-    updatingEdit.value = false;
+  if (!capturedSongId || !targetId) return;
+
+  if (activeNudgeDrains.size > 0) {
+    await Promise.allSettled(Array.from(activeNudgeDrains.values()));
   }
+  await enqueueOnEditChain(async () => {
+    if (
+      disposed ||
+      capturedEpoch !== songEpoch ||
+      selectedSongId.value !== capturedSongId ||
+      loadedSongId.value !== capturedSongId
+    ) {
+      return;
+    }
+    inFlightEditCount.value += 1;
+    error.value = "";
+    try {
+      const res = await rejectOffer(capturedSongId, targetId);
+      if (
+        disposed ||
+        capturedEpoch !== songEpoch ||
+        selectedSongId.value !== capturedSongId ||
+        loadedSongId.value !== capturedSongId
+      ) {
+        return;
+      }
+      applyPayload(res);
+    } catch (cause) {
+      if (!disposed && capturedEpoch === songEpoch && selectedSongId.value === capturedSongId) {
+        reportError(cause);
+      }
+    } finally {
+      if (capturedEpoch === songEpoch) {
+        inFlightEditCount.value = Math.max(0, inFlightEditCount.value - 1);
+      }
+    }
+  });
 }
 
 // Export actions
@@ -1686,7 +2400,9 @@ function downloadTextFile(fileName: string, content: string, mimeType = "text/pl
 }
 
 async function handleExport(action: "osu-copy" | "osu-download" | "jsonl" | "clip") {
-  const songId = activeSongId.value;
+  if (!isSongReadyForActions.value) return;
+  const songId = loadedSongId.value;
+  const capturedEpoch = songEpoch;
   if (!songId) return;
   exportMenuOpen.value = false;
   exportingFormat.value = action;
@@ -1694,6 +2410,7 @@ async function handleExport(action: "osu-copy" | "osu-download" | "jsonl" | "cli
   try {
     if (action === "osu-copy" || action === "osu-download") {
       const res = await exportSong(songId, { format: "osu" });
+      if (disposed || capturedEpoch !== songEpoch) return;
       if (res.format === "osu") {
         if (action === "osu-copy" && navigator.clipboard?.writeText) {
           await navigator.clipboard.writeText(res.content);
@@ -1705,6 +2422,7 @@ async function handleExport(action: "osu-copy" | "osu-download" | "jsonl" | "cli
     }
     if (action === "jsonl") {
       const res = await exportSong(songId, { format: "jsonl" });
+      if (disposed || capturedEpoch !== songEpoch) return;
       if (res.format === "jsonl") {
         downloadTextFile(res.fileName, res.content, "application/x-ndjson;charset=utf-8");
       }
@@ -1725,6 +2443,7 @@ async function handleExport(action: "osu-copy" | "osu-download" | "jsonl" | "cli
       t1: Math.max(t0 + 0.25, t1),
       filter: subMode.value === "audition" ? auditionFilter.value : "mix",
     });
+    if (disposed || capturedEpoch !== songEpoch) return;
     if (res.format === "clip") {
       const anchor = document.createElement("a");
       anchor.href = res.downloadUrl;
@@ -1732,7 +2451,7 @@ async function handleExport(action: "osu-copy" | "osu-download" | "jsonl" | "cli
       anchor.click();
     }
   } catch (cause) {
-    reportError(cause);
+    if (!disposed && capturedEpoch === songEpoch) reportError(cause);
   } finally {
     exportingFormat.value = null;
   }
@@ -1765,9 +2484,7 @@ function handleKeyup(event: KeyboardEvent) {
 }
 
 function handleWindowBlur() {
-  if (holdingAlt.value) {
-    void endHoldCompare();
-  }
+  releaseHoldOwnerSynchronously();
 }
 
 function handleKeydown(event: KeyboardEvent) {
@@ -1792,12 +2509,14 @@ function handleKeydown(event: KeyboardEvent) {
   if (event.metaKey || event.ctrlKey) {
     if (lower === "k") {
       event.preventDefault();
-      if (!event.repeat) void triggerRecompute();
+      if (!event.repeat && isSongReadyForActions.value) void triggerRecompute();
       return;
     }
     if (lower === "z") {
       event.preventDefault();
-      if (!event.repeat) void performUndoRedo(event.shiftKey ? "redo" : "undo");
+      if (!event.repeat && isSongReadyForActions.value) {
+        void performUndoRedo(event.shiftKey ? "redo" : "undo");
+      }
       return;
     }
     return;
@@ -1810,10 +2529,13 @@ function handleKeydown(event: KeyboardEvent) {
     return;
   }
 
-  if (key === "Tab" && activeOffer.value) {
+  if (key === "Tab" && activeOffer.value && isSongReadyForActions.value) {
     event.preventDefault();
-    if (event.shiftKey) void handleRejectOffer();
-    else void handleAcceptOffer();
+    if (event.shiftKey) {
+      void handleRejectOffer();
+    } else if (activeOffer.value.status === "valid") {
+      void handleAcceptOffer();
+    }
     return;
   }
 
@@ -1824,7 +2546,12 @@ function handleKeydown(event: KeyboardEvent) {
     return;
   }
 
-  if (/^[1-4]$/.test(key) && selection.value.kind === "beat" && snapCandidates.value.length > 0) {
+  if (
+    /^[1-4]$/.test(key) &&
+    isSongReadyForActions.value &&
+    selection.value.kind === "beat" &&
+    snapCandidates.value.length > 0
+  ) {
     const candidate = snapCandidates.value[Number(key) - 1];
     if (candidate) {
       event.preventDefault();
@@ -1834,7 +2561,6 @@ function handleKeydown(event: KeyboardEvent) {
   }
 
   const fineMs = event.shiftKey ? 0.1 : 1;
-  const sampleStepMs = 1000 / sampleRate.value;
 
   const actions: Record<string, () => void> = {
     Escape: () => {
@@ -1844,6 +2570,7 @@ function handleKeydown(event: KeyboardEvent) {
         return;
       }
       if (stageRef.value?.cancelDrag()) return;
+      clearSnapState();
       if (activeRange.value) {
         activeRange.value = null;
         selection.value = { kind: "none" };
@@ -1863,26 +2590,37 @@ function handleKeydown(event: KeyboardEvent) {
     "-": () => zoom(2),
     "0": fitWholeSong,
     b: () => {
-      const sec = actionCursorSec(event.timeStamp);
+      const sec = liveTapCursorSec(event.timeStamp);
       if (sec !== null) placeBeatAt(sec);
     },
     u: () => {
-      const sec = actionCursorSec(event.timeStamp);
+      const sec = liveTapCursorSec(event.timeStamp);
       if (sec !== null) placeUnbeatAt(sec, playing.value || Boolean(engine?.starting));
     },
     n: () => {
-      const sec = actionCursorSec(event.timeStamp);
+      const sec = liveTapCursorSec(event.timeStamp);
       if (sec !== null) placeSoundAt(sec);
     },
-    r: toggleFreeSelection,
-    v: toggleKeepSelection,
-    s: splitActiveSegment,
-    m: () => mergeSelectedSegment("next"),
+    r: () => {
+      if (isSongReadyForActions.value) toggleFreeSelection();
+    },
+    v: () => {
+      if (isSongReadyForActions.value) toggleKeepSelection();
+    },
+    s: () => {
+      if (isSongReadyForActions.value) splitActiveSegment();
+    },
+    m: () => {
+      if (isSongReadyForActions.value) mergeSelectedSegment("next");
+    },
     "[": () => setRangeCursorPoint("start"),
     "]": () => setRangeCursorPoint("end"),
     j: () => stepInbox(event.shiftKey ? -1 : 1),
-    g: toggleFlamCheck,
+    g: () => {
+      if (isSongReadyForActions.value) toggleFlamCheck();
+    },
     x: () => {
+      if (!isSongReadyForActions.value) return;
       const sec =
         selectedBeat.value?.timeSec ??
         selectedUnbeat.value?.timeSec ??
@@ -1892,8 +2630,8 @@ function handleKeydown(event: KeyboardEvent) {
     "\\": cycleOfferOption,
     ArrowLeft: () => nudgeSelection(-fineMs),
     ArrowRight: () => nudgeSelection(fineMs),
-    ",": () => nudgeSelection(-sampleStepMs),
-    ".": () => nudgeSelection(sampleStepMs),
+    ",": () => nudgeSelectionFrames(-1),
+    ".": () => nudgeSelectionFrames(1),
     Delete: deleteSelectedEntity,
     Backspace: deleteSelectedEntity,
   };
@@ -1916,6 +2654,8 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   disposed = true;
+  releaseHoldOwnerSynchronously();
+  songEpoch += 1;
   songOpenAbort?.abort();
   snapsAbort?.abort();
   recomputeAbort?.abort();
@@ -2015,7 +2755,7 @@ onBeforeUnmount(() => {
             <button
               type="button"
               class="tool-button"
-              :disabled="!activeSongId || Boolean(exportingFormat)"
+              :disabled="!isSongReadyForActions || Boolean(exportingFormat)"
               :aria-expanded="exportMenuOpen"
               :aria-pressed="exportMenuOpen"
               title="Export timing points, trace, or WAV clip"
@@ -2170,7 +2910,7 @@ onBeforeUnmount(() => {
           <button
             type="button"
             class="tool-button tool-button--icon"
-            :disabled="!sessionPayload || updatingEdit"
+            :disabled="!isSongReadyForActions || !canUndo || updatingEdit"
             aria-label="Undo"
             aria-keyshortcuts="Meta+Z Control+Z"
             title="Undo (⌘Z)"
@@ -2184,7 +2924,7 @@ onBeforeUnmount(() => {
           <button
             type="button"
             class="tool-button tool-button--icon"
-            :disabled="!sessionPayload || updatingEdit"
+            :disabled="!isSongReadyForActions || !canRedo || updatingEdit"
             aria-label="Redo"
             aria-keyshortcuts="Meta+Shift+Z Control+Shift+Z"
             title="Redo (⇧⌘Z)"
@@ -2227,8 +2967,8 @@ onBeforeUnmount(() => {
                 :key="song.songId"
                 type="button"
                 class="tempo-list-row"
-                :class="{ 'is-active': song.songId === activeSongId }"
-                :aria-current="song.songId === activeSongId ? 'true' : undefined"
+                :class="{ 'is-active': song.songId === selectedSongId }"
+                :aria-current="song.songId === selectedSongId ? 'true' : undefined"
                 :title="song.title"
                 @click="selectSong(song.songId)"
               >
@@ -2544,6 +3284,7 @@ onBeforeUnmount(() => {
             v-if="sessionPayload && mixBuffer"
             ref="stageRef"
             :buffer="mixBuffer"
+            :source-sample-rate="sourceSampleRate"
             :bounds="bounds"
             :view="view"
             :visual-mode="visualMode"
@@ -2606,11 +3347,20 @@ onBeforeUnmount(() => {
                 v-for="item in displayOffers"
                 :key="`${item.scopeLabel}-${item.spanLabel}-${item.optionLabel ?? item.offer.title}`"
                 class="tempo-offer-item"
-                :class="{ 'is-selected': activeOffer?.id === item.offer.id }"
+                :class="{
+                  'is-selected': activeOffer?.id === item.offer.id,
+                  'is-stale': item.offer.status === 'stale',
+                }"
               >
                 <div class="tempo-offer-head">
                   <span v-if="item.optionLabel" class="tempo-offer-badge">
                     {{ item.optionLabel }}
+                  </span>
+                  <span
+                    v-if="item.offer.status === 'stale'"
+                    class="tempo-offer-badge tempo-offer-badge--stale"
+                  >
+                    Stale
                   </span>
                   <span class="tempo-offer-scope">{{ item.scopeLabel }}</span>
                   <span class="tempo-offer-span">{{ item.spanLabel }}</span>
@@ -2624,6 +3374,14 @@ onBeforeUnmount(() => {
                   {{ item.offer.title }}
                 </button>
                 <p class="tempo-offer-summary">{{ item.offer.consequenceSummary }}</p>
+                <p v-if="item.offer.status === 'stale'" class="tempo-offer-conflict">
+                  {{
+                    sanitizeUserFacingText(
+                      item.offer.conflicts[0]?.message ??
+                        "Outdated after newer edits in this section.",
+                    )
+                  }}
+                </p>
                 <p
                   v-for="(note, nIdx) in item.offer.advisoryNotes"
                   :key="nIdx"
@@ -2647,10 +3405,21 @@ onBeforeUnmount(() => {
                   <button
                     type="button"
                     class="tool-button tool-button--primary"
+                    :disabled="item.offer.status !== 'valid' || updatingEdit"
                     title="Accept suggestion (Tab)"
                     @click.stop="handleAcceptOffer(item.offer.id)"
                   >
                     Accept <kbd>Tab</kbd>
+                  </button>
+                  <button
+                    v-if="item.offer.status === 'stale'"
+                    type="button"
+                    class="tool-button"
+                    :disabled="recomputing"
+                    title="Recompute updated suggestion (⌘K)"
+                    @click.stop="triggerRecompute"
+                  >
+                    Recompute <kbd>⌘K</kbd>
                   </button>
                   <button
                     type="button"
@@ -2674,7 +3443,7 @@ onBeforeUnmount(() => {
               <div class="prop-row">
                 <span>Sample</span>
                 <span class="data">
-                  n {{ nearestSample(selectedBeat.timeSec * 1000, sampleRate) }}
+                  n {{ nearestSample(selectedBeat.timeSec * 1000, sourceSampleRate) }}
                 </span>
               </div>
               <div v-if="selectedBeat.snapRole" class="prop-row">
@@ -2707,7 +3476,7 @@ onBeforeUnmount(() => {
                   type="button"
                   class="tool-button"
                   title="Move beat 1 sample earlier (,)"
-                  @click="nudgeSelection(-1000 / sampleRate)"
+                  @click="nudgeSelectionFrames(-1)"
                 >
                   −1 smp <kbd>,</kbd>
                 </button>
@@ -2715,7 +3484,7 @@ onBeforeUnmount(() => {
                   type="button"
                   class="tool-button"
                   title="Move beat 1 sample later (.)"
-                  @click="nudgeSelection(1000 / sampleRate)"
+                  @click="nudgeSelectionFrames(1)"
                 >
                   +1 smp <kbd>.</kbd>
                 </button>
@@ -2771,7 +3540,7 @@ onBeforeUnmount(() => {
               <div class="prop-row">
                 <span>Sample</span>
                 <span class="data">
-                  n {{ nearestSample(selectedUnbeat.timeSec * 1000, sampleRate) }}
+                  n {{ nearestSample(selectedUnbeat.timeSec * 1000, sourceSampleRate) }}
                 </span>
               </div>
               <div class="tempo-inspector-group">
@@ -3417,6 +4186,21 @@ onBeforeUnmount(() => {
   background: var(--surface-3);
   font-family: var(--font-data);
   font-weight: 600;
+}
+
+.tempo-offer-badge--stale {
+  color: var(--warning);
+  border: 1px solid var(--warning);
+  background: transparent;
+}
+
+.tempo-offer-conflict {
+  margin: 0;
+  padding-left: 6px;
+  border-left: 2px solid var(--danger);
+  color: var(--ink-secondary);
+  font-size: var(--text-2xs);
+  line-height: 1.4;
 }
 
 .tempo-offer-scope {

@@ -396,5 +396,205 @@ class StudentTRecomputeAndLruTest(unittest.TestCase):
                 proc.wait(timeout=5)
 
 
+class AstraDaemonHardeningTest(unittest.TestCase):
+    def test_failed_load_retains_zero_inflight_exceptions(self):
+        with tempfile.TemporaryDirectory() as folder:
+            bad_wav = Path(folder) / "corrupt.wav"
+            bad_wav.write_bytes(b"not a valid riff wav file")
+            cache = daemon.TrackCache(max_tracks=3)
+            with self.assertRaises(Exception):
+                cache.get_or_load(bad_wav)
+            self.assertEqual(len(cache), 0)
+            self.assertEqual(cache._inflight, {})
+            self.assertFalse(hasattr(cache, "_inflight_errors"))
+
+    def test_dedicated_snap_pool_never_starves_behind_concurrent_audition_renders(self):
+        with tempfile.TemporaryDirectory() as folder:
+            wav_path = Path(folder) / "track.wav"
+            write_wav(wav_path, click_train([0.5, 1.0, 1.5], 2.0, rate=RATE), rate=RATE)
+
+            proc = subprocess.Popen(
+                [sys.executable, str(Path(daemon.__file__).resolve()), "--backend", "dsp"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+            )
+            try:
+                assert proc.stdin is not None and proc.stdout is not None
+                proc.stdin.write(
+                    json.dumps({"id": "prep", "method": "prepare", "params": {"audioPath": str(wav_path)}}) + "\n"
+                )
+                proc.stdin.flush()
+                prep_msg = json.loads(proc.stdout.readline())
+                self.assertTrue(prep_msg["ok"])
+
+                # Launch 2 heavy HPSS percussive renders on a 25 s synthetic track to occupy both audition_pool workers!
+                long_wav = Path(folder) / "long_hpss.wav"
+                write_wav(long_wav, click_train(np.arange(0.5, 24.5, 0.5), 25.0, rate=RATE), rate=RATE)
+                proc.stdin.write(
+                    json.dumps({"id": "prep_long", "method": "prepare", "params": {"audioPath": str(long_wav)}}) + "\n"
+                )
+                proc.stdin.flush()
+                self.assertTrue(json.loads(proc.stdout.readline())["ok"])
+
+                for idx in (1, 2):
+                    proc.stdin.write(
+                        json.dumps(
+                            {
+                                "id": f"aud_{idx}",
+                                "method": "render_audition",
+                                "params": {
+                                    "audioPath": str(long_wav),
+                                    "startSec": 0.0,
+                                    "endSec": 25.0,
+                                    "filter": "percussive",
+                                    "outputPath": str(Path(folder) / f"out_{idx}.wav"),
+                                },
+                            }
+                        )
+                        + "\n"
+                    )
+                proc.stdin.flush()
+                time.sleep(0.03)
+
+                snap_t0 = time.perf_counter()
+                proc.stdin.write(
+                    json.dumps(
+                        {
+                            "id": "snap_fast",
+                            "method": "suggest_snaps",
+                            "params": {"audioPath": str(wav_path), "timeSec": 1.01, "windowSec": 0.12},
+                        }
+                    )
+                    + "\n"
+                )
+                proc.stdin.flush()
+
+                # Read responses until snap_fast arrives — must arrive BEFORE slow 25s HPSS renders finish!
+                received_ids: list[str] = []
+                snap_wall_ms = 0.0
+                for _ in range(3):
+                    msg = json.loads(proc.stdout.readline())
+                    received_ids.append(msg["id"])
+                    if msg["id"] == "snap_fast":
+                        snap_wall_ms = (time.perf_counter() - snap_t0) * 1000.0
+                        self.assertTrue(msg["ok"], msg)
+                        break
+
+                self.assertEqual(received_ids[0], "snap_fast", received_ids)
+                self.assertLess(snap_wall_ms, 120.0, snap_wall_ms)
+            finally:
+                for stream in (proc.stdin, proc.stdout, proc.stderr):
+                    if stream is not None:
+                        try:
+                            stream.close()
+                        except OSError:
+                            pass
+                proc.terminate()
+                proc.wait(timeout=5)
+
+    def test_hypothesis_local_scopes_preserve_unsolved_short_segment_beats_and_split_subsegment_free(self):
+        # 20 s track: steady 0.5 s clicks in [0.5, 4.0) and [5.0, 19.5), plus faster rubato clicks in [4.0, 5.0)!
+        steady_pre = np.arange(0.5, 4.0, 0.5)
+        rubato_free = np.array([4.02, 4.33, 4.66])
+        steady_post = np.arange(5.0, 19.6, 0.5)
+        sig = click_train(np.concatenate([steady_pre, rubato_free, steady_post]), 20.0, rate=RATE)
+
+        with tempfile.TemporaryDirectory() as folder:
+            wav_path = Path(folder) / "sub_free.wav"
+            write_wav(wav_path, sig, rate=RATE)
+            engine = daemon.TempoEngine(backend="dsp")
+
+            # Include a short 0.25 s intro segment [0, 0.25) with a user beat at 0.12 s that cannot be DP-solved,
+            # followed by a 19.75 s Auto segment [0.25, 20.0) containing a 1 s Free span [4.0, 5.0)!
+            old_beats = [{"id": "b_user_intro", "timeSec": 0.12, "source": "user", "revision": 1}]
+            for idx, bt in enumerate(np.arange(0.56, 19.6, 0.5)):
+                old_beats.append({"id": f"b_old_{idx}", "timeSec": round(float(bt), 6), "source": "draft", "revision": 1})
+
+            revs = {b["id"]: f"1:ev_{b['id']}" for b in old_beats}
+            revs["seg_short"] = "1:ev_s0"
+            revs["seg_auto"] = "1:ev_s1"
+
+            res = engine.recompute(
+                {
+                    "audioPath": str(wav_path),
+                    "scope": "song",
+                    "reason": "Test sub-segment Free and short segment safety",
+                    "generation": 1,
+                    "basisSeq": 2,
+                    "state": {
+                        "segments": [
+                            {"id": "seg_short", "t0": 0.0, "t1": 0.25, "regime": "auto", "kept": False, "source": "user", "revision": 1},
+                            {"id": "seg_auto", "t0": 0.25, "t1": 20.0, "regime": "auto", "kept": False, "source": "user", "revision": 1},
+                        ],
+                        "beats": old_beats,
+                        "entityRevisions": revs,
+                    },
+                    "constraints": {
+                        "beatGuides": [
+                            {"beatId": "g_rub1", "timeSec": 4.02, "toleranceSec": 0.015},
+                            {"beatId": "g_rub2", "timeSec": 4.33, "toleranceSec": 0.015},
+                            {"beatId": "g_rub3", "timeSec": 4.66, "toleranceSec": 0.015},
+                        ],
+                        "unbeatRepulsions": [],
+                        "soundObservations": [],
+                        "freeIntervals": [{"segmentId": "seg_auto", "spanId": "sp_free_1", "t0": 4.0, "t1": 5.0}],
+                        "keepLocks": [],
+                    },
+                }
+            )
+
+            splits = daemon._split_by_free_intervals("seg_auto", 0.25, 20.0, "auto", [(4.0, 5.0)])
+            self.assertEqual(
+                splits,
+                [
+                    {"segmentId": "seg_auto", "t0": 0.25, "t1": 4.0, "isFree": False},
+                    {"segmentId": "seg_auto", "t0": 4.0, "t1": 5.0, "isFree": True},
+                    {"segmentId": "seg_auto", "t0": 5.0, "t1": 20.0, "isFree": False},
+                ],
+            )
+
+            offers = res["offers"]
+            self.assertGreaterEqual(len(offers), 1, res)
+            for off in offers:
+                # Short unsolved segment [0, 0.25) MUST NOT appear in writeScopes or expectedScopeBeatIds,
+                # and b_user_intro MUST NOT be deleted!
+                for ws in off["writeScopes"]:
+                    self.assertNotEqual(ws["segmentId"], "seg_short", off)
+                    self.assertGreaterEqual(ws["t0"], 0.25, off)
+                self.assertNotIn("b_user_intro", off.get("expectedScopeBeatIds", []))
+                self.assertNotIn("b_user_intro", off["ops"].get("removeBeatIds", []))
+
+            # Inside [4.0, 5.0), Free smoothness tracks the 0.31-0.33 s rubato pulses!
+            prim_times = sorted(b["timeSec"] for b in offers[0]["ops"].get("upsertBeats", []))
+            for target in (4.02, 4.33, 4.66):
+                self.assertLess(min(abs(t - target) for t in prim_times), 0.025, (target, prim_times))
+
+    def test_exact_sample_audition_slice_boundaries(self):
+        with tempfile.TemporaryDirectory() as folder:
+            wav_path = Path(folder) / "exact.wav"
+            total_frames = RATE * 4
+            sig = np.sin(2.0 * np.pi * 440.0 * np.arange(total_frames) / RATE)
+            write_wav(wav_path, sig, rate=RATE)
+
+            engine = daemon.TempoEngine(backend="dsp")
+            out_wav = Path(folder) / "slice.wav"
+            t0 = 1.1234567
+            t1 = 2.6543219
+            rendered = engine.render_span_wav(wav_path, t0, t1, "mix", out_wav)
+
+            expected_start = int(round(t0 * RATE))
+            expected_end = int(round(t1 * RATE))
+            self.assertEqual(rendered["startSample"], expected_start)
+            self.assertEqual(rendered["endSample"], expected_end)
+            self.assertEqual(rendered["sampleRate"], RATE)
+
+            with wave.open(str(out_wav), "rb") as wf:
+                self.assertEqual(wf.getframerate(), RATE)
+                self.assertEqual(wf.getnframes(), expected_end - expected_start)
+
+
 if __name__ == "__main__":
     unittest.main()

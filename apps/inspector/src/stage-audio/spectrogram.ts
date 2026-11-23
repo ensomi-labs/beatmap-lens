@@ -25,6 +25,23 @@ export interface Spectrogram {
   db: Float32Array;
 }
 
+export interface SpectrogramInput {
+  channels: Float32Array[];
+  sliceStart: number;
+  totalFrames: number;
+  sampleRate: number;
+  startMs: number;
+  endMs: number;
+}
+
+export interface SpectrogramWorkerRequest extends SpectrogramInput {
+  requestId?: number;
+}
+
+export interface SpectrogramWorkerResponse extends Spectrogram {
+  requestId?: number;
+}
+
 export function frameCentreMs(frame: number, sampleRate: number): number {
   return (frame * hop * 1000) / sampleRate;
 }
