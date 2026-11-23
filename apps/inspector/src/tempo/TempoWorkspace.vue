@@ -223,7 +223,7 @@ const holdingAlt = ref(false);
 const activeAuditionWindow = ref<ActiveAuditionCoverage | null>(null);
 const pendingEntityTimeSec = reactive(new Map<string, number>());
 const inFlightPlacedBeats = reactive(
-  new Map<string, { songId: string; id: string; timeSec: number }>(),
+  new Map<string, { epoch: number; songId: string; id: string; timeSec: number }>(),
 );
 const audioLoadSettledForSongId = ref<string | null>(null);
 const flamSavedState = ref<{
@@ -261,8 +261,13 @@ const queuedEntityNudges = new Map<string, QueuedNudge>();
 const activeNudgeDrains = new Map<string, Promise<void>>();
 let inFlightAuditionTarget: ActiveAuditionCoverage | null = null;
 
-function entityNudgeKey(songId: string, kind: "beat" | "unbeat" | "sound", id: string): string {
-  return `${songId}::${kind}:${id}`;
+function entityNudgeKey(
+  epoch: number,
+  songId: string,
+  kind: "beat" | "unbeat" | "sound",
+  id: string,
+): string {
+  return `${epoch}::${songId}::${kind}:${id}`;
 }
 
 let engine: StageAudioEngine | undefined;
@@ -322,15 +327,17 @@ const beats = computed<Beat[]>(() => {
   const mapped = raw.map((b) => {
     seenIds.add(b.id);
     const pending = curSong
-      ? pendingEntityTimeSec.get(entityNudgeKey(curSong, "beat", b.id))
+      ? pendingEntityTimeSec.get(entityNudgeKey(songEpoch, curSong, "beat", b.id))
       : undefined;
-    const optimistic = curSong ? inFlightPlacedBeats.get(`${curSong}::${b.id}`) : undefined;
+    const optimistic = curSong
+      ? inFlightPlacedBeats.get(`${songEpoch}::${curSong}::${b.id}`)
+      : undefined;
     const nextSec = pending ?? optimistic?.timeSec;
     return nextSec !== undefined ? { ...b, timeSec: nextSec } : b;
   });
   if (curSong && inFlightPlacedBeats.size > 0) {
     for (const entry of inFlightPlacedBeats.values()) {
-      if (entry.songId === curSong && !seenIds.has(entry.id)) {
+      if (entry.epoch === songEpoch && entry.songId === curSong && !seenIds.has(entry.id)) {
         mapped.push({
           id: entry.id,
           timeSec: entry.timeSec,
@@ -348,7 +355,7 @@ const unbeats = computed<UnbeatCue[]>(() => {
   const curSong = loadedSongId.value;
   if (!curSong || pendingEntityTimeSec.size === 0) return raw;
   return raw.map((u) => {
-    const pending = pendingEntityTimeSec.get(entityNudgeKey(curSong, "unbeat", u.id));
+    const pending = pendingEntityTimeSec.get(entityNudgeKey(songEpoch, curSong, "unbeat", u.id));
     return pending !== undefined ? { ...u, timeSec: pending } : u;
   });
 });
@@ -357,7 +364,7 @@ const sounds = computed<SoundAnchor[]>(() => {
   const curSong = loadedSongId.value;
   if (!curSong || pendingEntityTimeSec.size === 0) return raw;
   return raw.map((s) => {
-    const pending = pendingEntityTimeSec.get(entityNudgeKey(curSong, "sound", s.id));
+    const pending = pendingEntityTimeSec.get(entityNudgeKey(songEpoch, curSong, "sound", s.id));
     return pending !== undefined ? { ...s, timeSec: pending } : s;
   });
 });
@@ -681,9 +688,12 @@ function maybeRefreshAuditionWindow(anchorSec: number, forwardBias = false) {
     anchorSec < cur.startSec ||
     anchorSec >= cur.endSec;
   const nearingEdge =
+    forwardBias &&
     cur !== null &&
     cur.songId === songId &&
     cur.filter === auditionFilter.value &&
+    anchorSec >= cur.startSec &&
+    anchorSec < cur.endSec &&
     cur.endSec < durationSec.value - 1e-3 &&
     cur.endSec - anchorSec <= 5.0;
 
@@ -1546,7 +1556,7 @@ function scheduleEntityNudge(kind: "beat" | "unbeat" | "sound", id: string, next
   if (kind === "beat") {
     clearSnapState();
   }
-  const entityKey = entityNudgeKey(capturedSongId, kind, id);
+  const entityKey = entityNudgeKey(capturedEpoch, capturedSongId, kind, id);
   pendingEntityTimeSec.set(entityKey, nextTimeSec);
   queuedEntityNudges.set(entityKey, { kind, id, timeSec: nextTimeSec });
   cuesDirty.value = true;
@@ -1781,6 +1791,7 @@ function structuralCursorSec(): number | null {
 function placeBeatAt(timeSec: number) {
   if (!isSongReadyForActions.value) return;
   const curSong = loadedSongId.value;
+  const capturedEpoch = songEpoch;
   if (!curSong) return;
   const clamped = Number(Math.min(durationSec.value, Math.max(0, timeSec)).toFixed(6));
   clearSnapState();
@@ -1795,7 +1806,7 @@ function placeBeatAt(timeSec: number) {
     }
   }
   for (const entry of inFlightPlacedBeats.values()) {
-    if (entry.songId !== curSong) continue;
+    if (entry.epoch !== capturedEpoch || entry.songId !== curSong) continue;
     const dist = Math.abs(entry.timeSec - clamped);
     if (dist <= 0.0005 && dist < nearestDist) {
       coincidentId = entry.id;
@@ -1805,8 +1816,13 @@ function placeBeatAt(timeSec: number) {
 
   if (coincidentId) {
     const targetId = coincidentId;
-    const optKey = `${curSong}::${targetId}`;
-    inFlightPlacedBeats.set(optKey, { songId: curSong, id: targetId, timeSec: clamped });
+    const optKey = `${capturedEpoch}::${curSong}::${targetId}`;
+    inFlightPlacedBeats.set(optKey, {
+      epoch: capturedEpoch,
+      songId: curSong,
+      id: targetId,
+      timeSec: clamped,
+    });
     selection.value = { kind: "beat", id: targetId };
     void commitOps(
       {
@@ -1830,8 +1846,13 @@ function placeBeatAt(timeSec: number) {
   }
 
   const id = crypto.randomUUID();
-  const optKey = `${curSong}::${id}`;
-  inFlightPlacedBeats.set(optKey, { songId: curSong, id, timeSec: clamped });
+  const optKey = `${capturedEpoch}::${curSong}::${id}`;
+  inFlightPlacedBeats.set(optKey, {
+    epoch: capturedEpoch,
+    songId: curSong,
+    id,
+    timeSec: clamped,
+  });
   selection.value = { kind: "beat", id };
   void commitOps(
     {
@@ -2008,17 +2029,17 @@ function deleteSelectedEntity() {
   clearSnapState();
   if (selectedBeat.value) {
     const id = selectedBeat.value.id;
-    const key = entityNudgeKey(curSong, "beat", id);
+    const key = entityNudgeKey(songEpoch, curSong, "beat", id);
     pendingEntityTimeSec.delete(key);
     queuedEntityNudges.delete(key);
-    inFlightPlacedBeats.delete(`${curSong}::${id}`);
+    inFlightPlacedBeats.delete(`${songEpoch}::${curSong}::${id}`);
     selection.value = { kind: "none" };
     void commitOps({ op: "remove_beat", id }, { markCuesDirty: true });
     return;
   }
   if (selectedUnbeat.value) {
     const id = selectedUnbeat.value.id;
-    const key = entityNudgeKey(curSong, "unbeat", id);
+    const key = entityNudgeKey(songEpoch, curSong, "unbeat", id);
     pendingEntityTimeSec.delete(key);
     queuedEntityNudges.delete(key);
     selection.value = { kind: "none" };
@@ -2027,7 +2048,7 @@ function deleteSelectedEntity() {
   }
   if (selectedSound.value) {
     const id = selectedSound.value.id;
-    const key = entityNudgeKey(curSong, "sound", id);
+    const key = entityNudgeKey(songEpoch, curSong, "sound", id);
     pendingEntityTimeSec.delete(key);
     queuedEntityNudges.delete(key);
     selection.value = { kind: "none" };

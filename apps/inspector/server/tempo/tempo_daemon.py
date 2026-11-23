@@ -2217,6 +2217,9 @@ class TrackEntry:
     pcm: np.ndarray
     mono_analysis: np.ndarray
     analysis_sr: int
+    ctime_ns: int = 0
+    ino: int = 0
+    audio_sha256: str | None = None
     feature_lock: threading.Lock = field(default_factory=threading.Lock)
     _features: dict | None = None
 
@@ -2250,8 +2253,19 @@ class TrackCache:
     def __init__(self, max_tracks: int = MAX_CACHED_TRACKS) -> None:
         self.max_tracks = max(1, int(max_tracks))
         self._lock = threading.Lock()
-        self._entries: OrderedDict[tuple[str, int, int], TrackEntry] = OrderedDict()
-        self._inflight: dict[tuple[str, int, int], _InflightLoad] = {}
+        self._entries: OrderedDict[tuple, TrackEntry] = OrderedDict()
+        self._inflight: dict[tuple, _InflightLoad] = {}
+
+    @staticmethod
+    def _make_key(
+        resolved: Path,
+        st: os.stat_result,
+        audio_sha256: str | None = None,
+    ) -> tuple:
+        norm_sha = str(audio_sha256).strip().lower() if audio_sha256 else ""
+        if norm_sha:
+            return (str(resolved), norm_sha)
+        return (str(resolved), st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_ino)
 
     def __len__(self) -> int:
         with self._lock:
@@ -2261,13 +2275,17 @@ class TrackCache:
         with self._lock:
             return [entry.path for entry in self._entries.values()]
 
-    def peek(self, audio_path: str | Path) -> TrackEntry | None:
+    def peek(
+        self,
+        audio_path: str | Path,
+        audio_sha256: str | None = None,
+    ) -> TrackEntry | None:
         resolved = Path(audio_path).resolve()
         try:
             st = resolved.stat()
         except OSError:
             return None
-        key = (str(resolved), st.st_mtime_ns, st.st_size)
+        key = self._make_key(resolved, st, audio_sha256)
         with self._lock:
             entry = self._entries.get(key)
             if entry is not None:
@@ -2278,11 +2296,13 @@ class TrackCache:
         self,
         audio_path: str | Path,
         cancel_event: threading.Event | None = None,
+        audio_sha256: str | None = None,
     ) -> TrackEntry:
         _check_cancel(cancel_event)
         resolved = Path(audio_path).resolve()
         st = resolved.stat()
-        key = (str(resolved), st.st_mtime_ns, st.st_size)
+        norm_sha = str(audio_sha256).strip().lower() if audio_sha256 else None
+        key = self._make_key(resolved, st, norm_sha)
 
         while True:
             with self._lock:
@@ -2330,6 +2350,9 @@ class TrackCache:
                     pcm=pcm,
                     mono_analysis=mono_an,
                     analysis_sr=an_sr,
+                    ctime_ns=st.st_ctime_ns,
+                    ino=st.st_ino,
+                    audio_sha256=norm_sha,
                 )
                 with self._lock:
                     self._entries[key] = entry
@@ -2359,6 +2382,7 @@ class TempoEngine:
         device: str | None = None,
     ) -> None:
         self.cache = TrackCache(max_tracks=max_cached_tracks)
+        self._track_cache = self.cache
         self.backend = (backend or os.environ.get("TEMPO_ANALYZER_BACKEND") or "auto").strip().lower()
         self.checkpoint_name = checkpoint_name or os.environ.get("ENSOMI_BEATTHIS_CHECKPOINT", "final0")
         self.requested_device = device or os.environ.get("ENSOMI_BEATTHIS_DEVICE")
@@ -2410,8 +2434,11 @@ class TempoEngine:
         self,
         audio_path: str | Path,
         cancel_event: threading.Event | None = None,
+        audio_sha256: str | None = None,
     ) -> dict:
-        entry = self.cache.get_or_load(audio_path, cancel_event=cancel_event)
+        entry = self.cache.get_or_load(
+            audio_path, cancel_event=cancel_event, audio_sha256=audio_sha256
+        )
         return {
             "audioPath": entry.path,
             "durationSec": round(entry.duration_sec, 6),
@@ -2425,9 +2452,12 @@ class TempoEngine:
         audio_path: str | Path,
         use_beatthis: bool | None = None,
         cancel_event: threading.Event | None = None,
+        audio_sha256: str | None = None,
     ) -> dict:
         started = time.perf_counter()
-        entry = self.cache.get_or_load(audio_path, cancel_event=cancel_event)
+        entry = self.cache.get_or_load(
+            audio_path, cancel_event=cancel_event, audio_sha256=audio_sha256
+        )
         _check_cancel(cancel_event)
         feats = entry.get_features()
         _check_cancel(cancel_event)
@@ -2482,11 +2512,12 @@ class TempoEngine:
         time_sec: float,
         window_sec: float = 0.12,
         cancel_event: threading.Event | None = None,
+        audio_sha256: str | None = None,
     ) -> dict:
         """Dedicated CPU fast-path over cached PCM (or localized window decode if uncached)."""
         started = time.perf_counter()
         _check_cancel(cancel_event)
-        entry = self.cache.peek(audio_path)
+        entry = self.cache.peek(audio_path, audio_sha256=audio_sha256)
         if entry is not None:
             candidates = suggest_snaps_cpu(
                 entry.pcm,
@@ -2536,7 +2567,12 @@ class TempoEngine:
         cancel_event: threading.Event | None = None,
     ) -> dict:
         started = time.perf_counter()
-        entry = self.cache.get_or_load(params["audioPath"], cancel_event=cancel_event)
+        audio_sha = params.get("audioSha256") or params.get("audio_sha256")
+        entry = self.cache.get_or_load(
+            params["audioPath"],
+            cancel_event=cancel_event,
+            audio_sha256=str(audio_sha) if audio_sha else None,
+        )
         res = recompute_constrained(
             track=entry,
             scope=params.get("scope", "song"),
@@ -2560,13 +2596,16 @@ class TempoEngine:
         filter_name: str,
         output_path: str | Path,
         cancel_event: threading.Event | None = None,
+        audio_sha256: str | None = None,
     ) -> dict:
         started = time.perf_counter()
         if filter_name not in AUDITION_FILTERS:
             raise ValueError(f"Unknown audition filter '{filter_name}'; expected one of {AUDITION_FILTERS}")
 
         _check_cancel(cancel_event)
-        entry = self.cache.get_or_load(audio_path, cancel_event=cancel_event)
+        entry = self.cache.get_or_load(
+            audio_path, cancel_event=cancel_event, audio_sha256=audio_sha256
+        )
         sr = int(entry.sample_rate)
         ch = int(entry.channels)
         total_samples = int(entry.pcm.shape[0])
@@ -2630,6 +2669,8 @@ class DaemonServer:
         self._heavy_pool.shutdown(wait=False, cancel_futures=True)
 
     def dispatch_sync(self, method: str, params: dict, cancel_event: threading.Event | None = None) -> dict:
+        raw_sha = params.get("audioSha256") or params.get("audio_sha256")
+        audio_sha = str(raw_sha) if raw_sha else None
         if method == "ping":
             return {
                 "pong": True,
@@ -2637,12 +2678,15 @@ class DaemonServer:
                 "cachedTracks": len(self.engine.cache),
             }
         if method == "prepare":
-            return self.engine.prepare(params["audioPath"], cancel_event=cancel_event)
+            return self.engine.prepare(
+                params["audioPath"], cancel_event=cancel_event, audio_sha256=audio_sha
+            )
         if method == "analyze":
             return self.engine.analyze(
                 params["audioPath"],
                 use_beatthis=params.get("useBeatThis"),
                 cancel_event=cancel_event,
+                audio_sha256=audio_sha,
             )
         if method == "suggest_snaps":
             return self.engine.suggest_snaps(
@@ -2650,6 +2694,7 @@ class DaemonServer:
                 time_sec=float(params["timeSec"]),
                 window_sec=float(params.get("windowSec", 0.12)),
                 cancel_event=cancel_event,
+                audio_sha256=audio_sha,
             )
         if method == "recompute":
             return self.engine.recompute(params, cancel_event=cancel_event)
@@ -2661,6 +2706,7 @@ class DaemonServer:
                 filter_name=str(params.get("filter", "mix")),
                 output_path=params["outputPath"],
                 cancel_event=cancel_event,
+                audio_sha256=audio_sha,
             )
         raise ValueError(f"Unknown daemon method: {method}")
 

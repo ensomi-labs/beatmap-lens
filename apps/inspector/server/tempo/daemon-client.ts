@@ -364,13 +364,24 @@ export class TempoDaemonClient {
     });
   }
 
-  prepare(audioPath: string, signal?: AbortSignal): Promise<DaemonPrepareResponse> {
-    return this.request<DaemonPrepareResponse>("prepare", { audioPath }, signal);
+  prepare(
+    audioPath: string,
+    signal?: AbortSignal,
+    options?: { audioSha256?: string },
+  ): Promise<DaemonPrepareResponse> {
+    return this.request<DaemonPrepareResponse>(
+      "prepare",
+      {
+        audioPath,
+        ...(options?.audioSha256 ? { audioSha256: options.audioSha256 } : {}),
+      },
+      signal,
+    );
   }
 
   analyze(
     audioPath: string,
-    options?: { useBeatThis?: boolean },
+    options?: { useBeatThis?: boolean; audioSha256?: string },
     signal?: AbortSignal,
   ): Promise<DaemonAnalyzeResponse> {
     return this.request<DaemonAnalyzeResponse>(
@@ -378,6 +389,7 @@ export class TempoDaemonClient {
       {
         audioPath,
         ...(options?.useBeatThis !== undefined ? { useBeatThis: options.useBeatThis } : {}),
+        ...(options?.audioSha256 ? { audioSha256: options.audioSha256 } : {}),
       },
       signal,
     );
@@ -388,10 +400,16 @@ export class TempoDaemonClient {
     timeSec: number,
     windowSec = 0.12,
     signal?: AbortSignal,
+    options?: { audioSha256?: string },
   ): Promise<DaemonSuggestSnapsResponse> {
     return this.request<DaemonSuggestSnapsResponse>(
       "suggest_snaps",
-      { audioPath, timeSec, windowSec },
+      {
+        audioPath,
+        timeSec,
+        windowSec,
+        ...(options?.audioSha256 ? { audioSha256: options.audioSha256 } : {}),
+      },
       signal,
     );
   }
@@ -406,6 +424,7 @@ export class TempoDaemonClient {
   renderAudition(
     params: {
       audioPath: string;
+      audioSha256?: string;
       startSec: number;
       endSec: number;
       filter: AuditionFilter;
@@ -419,6 +438,7 @@ export class TempoDaemonClient {
   exportClip(
     params: {
       audioPath: string;
+      audioSha256?: string;
       startSec: number;
       endSec: number;
       filter: AuditionFilter;
@@ -542,6 +562,7 @@ export class TempoDaemonClient {
 export interface TempoTimingProviderOptions {
   daemon: TempoDaemonClient;
   resolveAudioPath: (songId: string) => string;
+  resolveAudioSha256?: (songId: string) => string | undefined;
   initialKind?: ProviderKind;
 }
 
@@ -551,11 +572,13 @@ export interface TempoTimingProviderOptions {
 export class TempoTimingProvider implements TimingProvider {
   private readonly daemon: TempoDaemonClient;
   private readonly resolveAudioPath: (songId: string) => string;
+  private readonly resolveAudioSha256: ((songId: string) => string | undefined) | undefined;
   private kind: ProviderKind;
 
   constructor(options: TempoTimingProviderOptions) {
     this.daemon = options.daemon;
     this.resolveAudioPath = options.resolveAudioPath;
+    this.resolveAudioSha256 = options.resolveAudioSha256;
     this.kind = options.initialKind ?? "model";
   }
 
@@ -580,11 +603,17 @@ export class TempoTimingProvider implements TimingProvider {
 
   async prepare(audio: AudioDescriptor, signal?: AbortSignal): Promise<PreparedEvidence> {
     const audioPath = this.resolveAudioPath(audio.songId);
-    const info = await this.daemon.prepare(audioPath, signal);
+    const audioSha256 = this.resolveAudioSha256?.(audio.songId);
+    const info = await this.daemon.prepare(
+      audioPath,
+      signal,
+      audioSha256 ? { audioSha256 } : undefined,
+    );
     this.kind = info.providerKind;
     return {
       songId: audio.songId,
       audioPath: info.audioPath,
+      ...(audioSha256 ? { audioSha256 } : {}),
       durationSec: info.durationSec,
       sampleRate: info.sampleRate,
       channels: info.channels,
@@ -593,7 +622,12 @@ export class TempoTimingProvider implements TimingProvider {
 
   async analyze(evidence: PreparedEvidence, signal?: AbortSignal): Promise<AnalysisDraft> {
     const audioPath = this.extractAudioPath(evidence);
-    const result = await this.daemon.analyze(audioPath, undefined, signal);
+    const audioSha256 = this.extractAudioSha256(evidence);
+    const result = await this.daemon.analyze(
+      audioPath,
+      audioSha256 ? { audioSha256 } : undefined,
+      signal,
+    );
     this.kind = result.providerKind;
     return {
       segments: result.segments,
@@ -604,16 +638,18 @@ export class TempoTimingProvider implements TimingProvider {
 
   async suggestSnaps(
     evidence: PreparedEvidence,
-    _state: SessionState,
+    state: SessionState,
     request: SuggestSnapsRequest,
     signal?: AbortSignal,
   ): Promise<SnapCandidate[]> {
     const audioPath = this.extractAudioPath(evidence);
+    const audioSha256 = this.extractAudioSha256(evidence, state.audio?.songId);
     const result = await this.daemon.suggestSnaps(
       audioPath,
       request.timeSec,
       request.windowSec,
       signal,
+      audioSha256 ? { audioSha256 } : undefined,
     );
     return result.candidates;
   }
@@ -625,10 +661,12 @@ export class TempoTimingProvider implements TimingProvider {
     signal?: AbortSignal,
   ): Promise<RecomputeResult> {
     const audioPath = this.extractAudioPath(evidence);
+    const audioSha256 = this.extractAudioSha256(evidence, state.audio?.songId);
     const serialized = serializeState(state);
     const result = await this.daemon.recompute(
       {
         audioPath,
+        ...(audioSha256 ? { audioSha256 } : {}),
         scope: request.scope,
         reason: request.reason,
         generation: request.generation,
@@ -661,5 +699,27 @@ export class TempoTimingProvider implements TimingProvider {
       return this.resolveAudioPath(evidence.songId);
     }
     throw new Error("Audio path is not bound for this song session.");
+  }
+
+  private extractAudioSha256(
+    evidence: PreparedEvidence,
+    fallbackSongId?: string,
+  ): string | undefined {
+    if (typeof evidence.audioSha256 === "string" && evidence.audioSha256.length > 0) {
+      return evidence.audioSha256;
+    }
+    const songId =
+      typeof evidence.songId === "string" && evidence.songId.length > 0
+        ? evidence.songId
+        : fallbackSongId;
+    if (songId && this.resolveAudioSha256) {
+      try {
+        const sha = this.resolveAudioSha256(songId);
+        return sha && sha.length > 0 ? sha : undefined;
+      } catch {
+        return undefined;
+      }
+    }
+    return undefined;
   }
 }

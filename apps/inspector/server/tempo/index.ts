@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream, existsSync } from "node:fs";
-import { mkdir, readFile, realpath, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, stat } from "node:fs/promises";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { tmpdir } from "node:os";
 import { basename, extname, join } from "node:path";
 import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
@@ -207,52 +208,101 @@ interface AuditionRenderMeta {
 export class SongSessionHost {
   readonly songId: string;
   readonly stateDir: string;
+  readonly boundStateDir: string;
   readonly tracePath: string;
   readonly boundFingerprint: string;
+  readonly boundAudioSha256: string;
   readonly traceEpoch: number;
+  readonly boundTraceEpoch: number;
   readonly controller: SessionController;
+  disposed = false;
+  healedOnDisk: boolean;
   openingCount = 0;
   private persistedCount: number;
   private flushChain: Promise<void> = Promise.resolve();
   private readonly traceWriter: TempoWorkspaceStore["traceWriter"];
+  private readonly store: TempoWorkspaceStore | undefined;
 
   constructor(options: {
     songId: string;
     stateDir?: string;
+    boundStateDir?: string;
     tracePath: string;
     boundFingerprint?: string;
+    boundAudioSha256?: string;
     traceEpoch?: number;
+    boundTraceEpoch?: number;
+    healedOnDisk?: boolean;
+    store?: TempoWorkspaceStore;
     controller: SessionController;
     persistedCount: number;
     traceWriter: TempoWorkspaceStore["traceWriter"];
   }) {
+    const resolvedStateDir = options.boundStateDir ?? options.stateDir ?? "";
+    const resolvedSha = options.boundAudioSha256 ?? options.boundFingerprint ?? "";
+    const resolvedEpoch = options.boundTraceEpoch ?? options.traceEpoch ?? 0;
     this.songId = options.songId;
-    this.stateDir = options.stateDir ?? "";
+    this.stateDir = resolvedStateDir;
+    this.boundStateDir = resolvedStateDir;
     this.tracePath = options.tracePath;
-    this.boundFingerprint = options.boundFingerprint ?? "";
-    this.traceEpoch = options.traceEpoch ?? 0;
+    this.boundFingerprint = resolvedSha;
+    this.boundAudioSha256 = resolvedSha;
+    this.traceEpoch = resolvedEpoch;
+    this.boundTraceEpoch = resolvedEpoch;
+    this.healedOnDisk = options.healedOnDisk ?? true;
+    this.store = options.store;
     this.controller = options.controller;
     this.persistedCount = options.persistedCount;
     this.traceWriter = options.traceWriter;
+  }
+
+  dispose(): void {
+    this.disposed = true;
+    this.controller.close();
+  }
+
+  isCurrent(): boolean {
+    if (this.disposed || this.controller.isClosed()) return false;
+    if (!this.store) return true;
+    if (this.store.currentStateDir !== this.boundStateDir) return false;
+    if (this.store.traceEpochFor(this.songId, this.boundStateDir) !== this.boundTraceEpoch) {
+      return false;
+    }
+    try {
+      const liveSong = this.store.getSong(this.songId);
+      if (this.boundAudioSha256.length > 0 && liveSong.audioSha256 !== this.boundAudioSha256) {
+        return false;
+      }
+    } catch {
+      return false;
+    }
+    return true;
   }
 
   /**
    * Serializes `.jsonl` persistence across concurrent edits via `this.flushChain`.
    * Advances `this.persistedCount` ONLY after `traceWriter.append` resolves, keeping
    * `this.flushChain` alive on failure so subsequent flushes retry the full unsaved suffix.
+   * Aborts without writing a single byte if this host was disposed or its trace rotated!
    */
   flushTrace(): Promise<void> {
+    if (!this.isCurrent()) {
+      return Promise.resolve();
+    }
     const task = this.flushChain.then(async () => {
+      if (!this.isCurrent()) return;
       const allEvents = this.controller.getState().events;
       if (allEvents.length <= this.persistedCount) return;
       const delta = allEvents.slice(this.persistedCount);
       if (delta.length === 0) return;
+      if (!this.isCurrent()) return;
       await this.traceWriter.append(
         this.tracePath,
         delta,
-        this.stateDir.length > 0 ? this.stateDir : undefined,
+        this.boundStateDir.length > 0 ? this.boundStateDir : undefined,
       );
       this.persistedCount = allEvents.length;
+      this.healedOnDisk = true;
     });
     this.flushChain = task.catch(() => {});
     return task;
@@ -498,10 +548,28 @@ export interface TempoService {
   readonly daemon: TempoDaemonClient;
   readonly store: TempoWorkspaceStore;
   readonly activeHostCount: number;
-  ensureInitialWorkspace(): Promise<TempoWorkspaceManifest | null>;
-  openWorkspace(dir: string, stateDir?: string): Promise<TempoWorkspaceResponse>;
+  ensureInitialWorkspace(options?: { persist?: boolean }): Promise<TempoWorkspaceManifest | null>;
+  openWorkspace(
+    dir: string,
+    stateDir?: string,
+    options?: { persist?: boolean },
+  ): Promise<TempoWorkspaceResponse>;
   handle(request: IncomingMessage, response: ServerResponse, url: URL): Promise<void>;
   close(): Promise<void>;
+}
+
+interface CapturedWorkspaceGuard {
+  expectedHeaderDir: string | null;
+  targetWorkspaceDir: string | null;
+  targetStateDir: string | null;
+}
+
+function makeWorkspaceConflictError(
+  message = "Active workspace changed in another tab — reopen workspace.",
+): Error {
+  const err = new Error(message);
+  err.name = "ConflictError";
+  return err;
 }
 
 export function createTempoService(options: TempoServiceOptions = {}): TempoService {
@@ -516,11 +584,21 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
   const provider = new TempoTimingProvider({
     daemon,
     resolveAudioPath: (songId) => store.getSong(songId).audioPath,
+    resolveAudioSha256: (songId) => store.getSong(songId).audioSha256 || undefined,
     initialKind: env.TEMPO_ANALYZER_BACKEND === "dsp" ? "rule" : "model",
   });
 
   const hosts = new Map<string, SongSessionHost>();
   const hostInitLocks = new Map<string, Promise<SongSessionHost>>();
+
+  store.setOnTraceRotated((stateDir, songId) => {
+    const key = `${stateDir}::${songId}`;
+    const existing = hosts.get(key);
+    if (existing) {
+      hosts.delete(key);
+      existing.dispose();
+    }
+  });
 
   const configuredDir = options.workspaceDir ?? env.TEMPO_WORKSPACE_DIR;
   const configuredStateDir = options.stateDir ?? env.TEMPO_STATE_DIR;
@@ -545,6 +623,20 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
     };
   }
 
+  async function flushHostsForCurrentStateDir(): Promise<void> {
+    const curStateDir = store.currentStateDir;
+    if (!curStateDir) return;
+    const toFlush: SongSessionHost[] = [];
+    for (const [key, host] of hosts) {
+      if (key.startsWith(`${curStateDir}::`) && host.isCurrent()) {
+        toFlush.push(host);
+      }
+    }
+    for (const host of toFlush) {
+      await host.flushTrace().catch(() => {});
+    }
+  }
+
   async function closeHostsForOtherStateDir(nextStateDir: string | null): Promise<void> {
     const toClose: Array<[string, SongSessionHost]> = [];
     for (const [key, host] of hosts) {
@@ -554,8 +646,7 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
     }
     for (const [key, host] of toClose) {
       hosts.delete(key);
-      await host.flushTrace().catch(() => {});
-      host.controller.close();
+      host.dispose();
     }
   }
 
@@ -565,14 +656,16 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
     const existing = hosts.get(key);
     if (!existing) return;
     hosts.delete(key);
-    existing.controller.close();
+    existing.dispose();
   }
 
-  async function evictIdleHostsIfNeeded(protectKey?: string): Promise<void> {
+  async function evictIdleHostsIfNeeded(protectKey?: string, allowDiskFlush = true): Promise<void> {
     for (const [key, host] of hosts) {
       if (hosts.size <= maxActiveHosts) break;
       if (key === protectKey || !host.isIdle()) continue;
-      await host.flushTrace();
+      if (allowDiskFlush && store.isPersistedToDisk) {
+        await host.flushTrace();
+      }
       if (
         hosts.size > maxActiveHosts &&
         hosts.get(key) === host &&
@@ -580,7 +673,7 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
         host.isIdle()
       ) {
         hosts.delete(key);
-        host.controller.close();
+        host.dispose();
       }
     }
   }
@@ -589,29 +682,47 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
     dir: string,
     stateDir?: string,
     createIfMissing = false,
+    openOptions?: { persist?: boolean },
   ): Promise<TempoWorkspaceManifest> {
+    const persist = openOptions?.persist !== false;
+    if (persist && store.isOpen && store.isPersistedToDisk) {
+      await flushHostsForCurrentStateDir();
+    }
     const manifest = await store.openWorkspace(dir, {
       ...(stateDir ? { stateDir } : {}),
       createIfMissing,
+      persist,
     });
     await closeHostsForOtherStateDir(store.currentStateDir);
     return manifest;
   }
 
-  function ensureInitialWorkspace(): Promise<TempoWorkspaceManifest | null> {
+  async function ensureInitialWorkspace(ensureOptions?: {
+    persist?: boolean;
+  }): Promise<TempoWorkspaceManifest | null> {
+    const persist = ensureOptions?.persist !== false;
     if (store.isOpen) {
-      return Promise.resolve(store.getSnapshot());
+      if (persist && !store.isPersistedToDisk) {
+        return await store.persistCurrentWorkspace();
+      }
+      return store.getSnapshot();
     }
     if (!configuredDir) {
-      return Promise.resolve(null);
+      return null;
     }
     if (!initPromise) {
-      initPromise = openWorkspaceInternal(configuredDir, configuredStateDir).catch((err) => {
+      initPromise = openWorkspaceInternal(configuredDir, configuredStateDir, false, {
+        persist,
+      }).catch((err) => {
         initPromise = null;
         throw err;
       });
     }
-    return initPromise;
+    const opened = await initPromise;
+    if (persist && store.isOpen && !store.isPersistedToDisk) {
+      return await store.persistCurrentWorkspace();
+    }
+    return opened;
   }
 
   async function ensureWorkspaceForImport(
@@ -666,27 +777,160 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
     };
   }
 
-  async function getOrLoadHost(songId: string, signal?: AbortSignal): Promise<SongSessionHost> {
+  async function parseCanonicalExpectedWorkspaceHeader(
+    request: IncomingMessage,
+  ): Promise<{ raw: string; canonical: string } | null> {
+    const rawExpected = request.headers["x-tempo-workspace-dir"];
+    if (typeof rawExpected !== "string" || !rawExpected.trim()) {
+      return null;
+    }
+    let decoded = rawExpected.trim();
+    try {
+      decoded = decodeURIComponent(decoded).trim();
+    } catch {
+      // Keep raw string if not URI-encoded.
+    }
+    if (!decoded) return null;
+
+    let canonical = decoded;
+    try {
+      const expanded = fullPath(decoded);
+      canonical = await realpath(expanded).catch(() => expanded);
+    } catch {}
+    return { raw: decoded, canonical };
+  }
+
+  async function captureAndVerifyRequestWorkspace(
+    request: IncomingMessage,
+    captureOptions?: { persist?: boolean },
+  ): Promise<CapturedWorkspaceGuard> {
+    const parsedHeader = await parseCanonicalExpectedWorkspaceHeader(request);
+    await ensureInitialWorkspace({ persist: captureOptions?.persist ?? false });
+
+    if (parsedHeader) {
+      if (
+        !store.isOpen ||
+        (store.currentWorkspaceDir !== parsedHeader.canonical &&
+          store.currentWorkspaceDir !== parsedHeader.raw)
+      ) {
+        throw makeWorkspaceConflictError();
+      }
+    }
+
+    return {
+      expectedHeaderDir: store.currentWorkspaceDir ?? parsedHeader?.canonical ?? null,
+      targetWorkspaceDir: store.currentWorkspaceDir,
+      targetStateDir: store.currentStateDir,
+    };
+  }
+
+  function reassertRequestWorkspace(guard: CapturedWorkspaceGuard | undefined): void {
+    if (!guard) return;
+    if (guard.expectedHeaderDir) {
+      if (!store.isOpen || store.currentWorkspaceDir !== guard.expectedHeaderDir) {
+        throw makeWorkspaceConflictError();
+      }
+    }
+    if (guard.targetWorkspaceDir !== null || guard.targetStateDir !== null) {
+      if (
+        !store.isOpen ||
+        store.currentWorkspaceDir !== guard.targetWorkspaceDir ||
+        store.currentStateDir !== guard.targetStateDir
+      ) {
+        throw makeWorkspaceConflictError();
+      }
+    }
+  }
+
+  function assertHostMatchesLiveWorkspace(
+    host: SongSessionHost,
+    guard?: CapturedWorkspaceGuard,
+    conflictMessage?: string,
+  ): void {
+    reassertRequestWorkspace(guard);
+    if (!host.isCurrent()) {
+      throw makeWorkspaceConflictError(
+        conflictMessage ?? "Song audio or active workspace changed — reopen song.",
+      );
+    }
+  }
+
+  async function getOrLoadHost(
+    songId: string,
+    loadOptions?:
+      | AbortSignal
+      | {
+          signal?: AbortSignal | undefined;
+          expectedStateDir?: string | null | undefined;
+          expectedWorkspaceDir?: string | null | undefined;
+          healOnDisk?: boolean | undefined;
+          persistWorkspace?: boolean | undefined;
+        },
+  ): Promise<SongSessionHost> {
+    const opts =
+      loadOptions && "aborted" in loadOptions ? { signal: loadOptions } : (loadOptions ?? {});
+    const signal = opts.signal;
+    const healOnDisk = opts.healOnDisk ?? true;
+    const persistWorkspace = opts.persistWorkspace ?? true;
+    const guard: CapturedWorkspaceGuard | undefined =
+      opts.expectedStateDir || opts.expectedWorkspaceDir
+        ? {
+            expectedHeaderDir: opts.expectedWorkspaceDir ?? null,
+            targetWorkspaceDir: opts.expectedWorkspaceDir ?? store.currentWorkspaceDir,
+            targetStateDir: opts.expectedStateDir ?? store.currentStateDir,
+          }
+        : undefined;
+
     assertValidSongId(songId);
     signal?.throwIfAborted?.();
-    await ensureInitialWorkspace();
+    reassertRequestWorkspace(guard);
+    await ensureInitialWorkspace({ persist: persistWorkspace });
     signal?.throwIfAborted?.();
+    reassertRequestWorkspace(guard);
+
     const stateDir = store.currentStateDir;
-    if (!stateDir) {
+    const workspaceDir = store.currentWorkspaceDir;
+    if (!stateDir || !workspaceDir) {
       throw new Error("Open a Tempo workspace folder first.");
     }
+    if (opts.expectedStateDir && stateDir !== opts.expectedStateDir) {
+      throw makeWorkspaceConflictError();
+    }
+    if (opts.expectedWorkspaceDir && workspaceDir !== opts.expectedWorkspaceDir) {
+      throw makeWorkspaceConflictError();
+    }
+
+    const activeGuard: CapturedWorkspaceGuard = guard ?? {
+      expectedHeaderDir: null,
+      targetWorkspaceDir: workspaceDir,
+      targetStateDir: stateDir,
+    };
+
     const song = store.getSong(songId);
-    const expectedEpoch = store.getTraceEpoch(songId, stateDir);
+    const expectedEpoch = store.traceEpochFor(songId, stateDir);
     const key = `${stateDir}::${songId}`;
     const existing = hosts.get(key);
     if (existing) {
       const fingerprintChanged =
-        existing.boundFingerprint.length > 0 && existing.boundFingerprint !== song.audioSha256;
-      const epochChanged = existing.traceEpoch !== expectedEpoch;
-      if (existing.controller.isClosed() || fingerprintChanged || epochChanged) {
+        existing.boundAudioSha256.length > 0 && existing.boundAudioSha256 !== song.audioSha256;
+      const epochChanged = existing.boundTraceEpoch !== expectedEpoch;
+      if (
+        existing.disposed ||
+        existing.controller.isClosed() ||
+        fingerprintChanged ||
+        epochChanged
+      ) {
         hosts.delete(key);
-        existing.controller.close();
+        existing.dispose();
       } else {
+        if (healOnDisk && !existing.healedOnDisk) {
+          await store.traceWriter.read(existing.tracePath, {
+            expectedStateDir: stateDir,
+            healOnDisk: true,
+          });
+          reassertRequestWorkspace(activeGuard);
+          existing.healedOnDisk = true;
+        }
         hosts.delete(key);
         hosts.set(key, existing);
         return existing;
@@ -697,23 +941,39 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
     if (inflight) {
       const resolvedHost = await inflight;
       signal?.throwIfAborted?.();
-      if (
-        !resolvedHost.controller.isClosed() &&
-        resolvedHost.boundFingerprint === store.getSong(songId).audioSha256 &&
-        resolvedHost.traceEpoch === store.getTraceEpoch(songId, stateDir)
-      ) {
+      reassertRequestWorkspace(activeGuard);
+      if (resolvedHost.isCurrent()) {
+        if (healOnDisk && !resolvedHost.healedOnDisk) {
+          await store.traceWriter.read(resolvedHost.tracePath, {
+            expectedStateDir: stateDir,
+            healOnDisk: true,
+          });
+          reassertRequestWorkspace(activeGuard);
+          resolvedHost.healedOnDisk = true;
+        }
         return resolvedHost;
       }
       hosts.delete(key);
-      resolvedHost.controller.close();
+      resolvedHost.dispose();
     }
 
     const loader = (async () => {
       try {
+        reassertRequestWorkspace(activeGuard);
         const liveSong = store.getSong(songId);
-        const liveEpoch = store.getTraceEpoch(songId, stateDir);
+        const liveEpoch = store.traceEpochFor(songId, stateDir);
         const tracePath = await store.resolveContainedStatePath("traces", `${songId}.jsonl`);
-        const initialEvents = await store.traceWriter.read(tracePath, stateDir);
+        const initialEvents = await store.traceWriter.read(tracePath, {
+          expectedStateDir: stateDir,
+          healOnDisk,
+        });
+        reassertRequestWorkspace(activeGuard);
+        if (
+          store.traceEpochFor(songId, stateDir) !== liveEpoch ||
+          store.getSong(songId).audioSha256 !== liveSong.audioSha256
+        ) {
+          throw makeWorkspaceConflictError("Song audio or workspace changed while loading trace.");
+        }
         const controller = new SessionController({
           provider,
           ...(options.triggerPolicy ? { triggerPolicy: options.triggerPolicy } : {}),
@@ -721,16 +981,18 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
         });
         const host = new SongSessionHost({
           songId,
-          stateDir,
+          boundStateDir: stateDir,
           tracePath,
-          boundFingerprint: liveSong.audioSha256,
-          traceEpoch: liveEpoch,
+          boundAudioSha256: liveSong.audioSha256,
+          boundTraceEpoch: liveEpoch,
+          healedOnDisk: healOnDisk,
+          store,
           controller,
           persistedCount: initialEvents.length,
           traceWriter: store.traceWriter,
         });
         hosts.set(key, host);
-        await evictIdleHostsIfNeeded(key);
+        await evictIdleHostsIfNeeded(key, persistWorkspace);
         return host;
       } finally {
         hostInitLocks.delete(key);
@@ -740,6 +1002,7 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
     hostInitLocks.set(key, loader);
     const created = await loader;
     signal?.throwIfAborted?.();
+    assertHostMatchesLiveWorkspace(created, activeGuard);
     return created;
   }
 
@@ -776,13 +1039,23 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
   async function openSongSession(
     songId: string,
     signal?: AbortSignal,
+    guard?: CapturedWorkspaceGuard,
   ): Promise<TempoSongSessionPayload> {
     assertValidSongId(songId);
     signal?.throwIfAborted?.();
-    await ensureInitialWorkspace();
+    reassertRequestWorkspace(guard);
+    await ensureInitialWorkspace({ persist: true });
     signal?.throwIfAborted?.();
 
+    const effectiveGuard: CapturedWorkspaceGuard = {
+      expectedHeaderDir: guard?.expectedHeaderDir ?? null,
+      targetWorkspaceDir: guard?.targetWorkspaceDir ?? store.currentWorkspaceDir,
+      targetStateDir: guard?.targetStateDir ?? store.currentStateDir,
+    };
+    reassertRequestWorkspace(effectiveGuard);
+
     const freshness = await store.verifySongAudioFreshness(songId);
+    reassertRequestWorkspace(effectiveGuard);
     if (freshness.rotated) {
       await evictHostForSong(store.currentStateDir, songId);
     }
@@ -790,7 +1063,15 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
 
     const song = await store.setActiveSong(songId);
     signal?.throwIfAborted?.();
-    const host = await getOrLoadHost(songId, signal);
+    reassertRequestWorkspace(effectiveGuard);
+
+    const host = await getOrLoadHost(songId, {
+      signal,
+      expectedStateDir: effectiveGuard.targetStateDir,
+      expectedWorkspaceDir: effectiveGuard.targetWorkspaceDir,
+      healOnDisk: true,
+      persistWorkspace: true,
+    });
 
     const hasDraftLoaded = (st: ReturnType<SessionController["getState"]>) =>
       st.events.some((ev) => !st.retractedEventIds.has(ev.id) && ev.type === "draft_loaded");
@@ -806,8 +1087,17 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
       const seqBeforePrepare = stateBefore.lastSeq;
 
       if (!stateBefore.audio) {
-        const prepared = await daemon.prepare(song.audioPath, signal);
+        const prepared = await daemon.prepare(
+          song.audioPath,
+          signal,
+          song.audioSha256 ? { audioSha256: song.audioSha256 } : undefined,
+        );
         signal?.throwIfAborted?.();
+        assertHostMatchesLiveWorkspace(
+          host,
+          effectiveGuard,
+          "Song audio or workspace changed during preparation — reopen song.",
+        );
         const stateAfterPrepare = host.controller.getState();
         const audioDescriptor = {
           songId,
@@ -824,9 +1114,19 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
           if (!stateAfterPrepare.audio) {
             await host.controller.bindAudio(audioDescriptor, signal);
           }
+          assertHostMatchesLiveWorkspace(
+            host,
+            effectiveGuard,
+            "Song audio or workspace changed during open — reopen song.",
+          );
           await host.flushTrace();
         } else {
           await host.controller.openSong(audioDescriptor, signal);
+          assertHostMatchesLiveWorkspace(
+            host,
+            effectiveGuard,
+            "Song audio or workspace changed during open — reopen song.",
+          );
           await host.flushTrace();
         }
       } else if (
@@ -834,8 +1134,17 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
         !hasUserMutations(stateBefore) &&
         host.controller.getTriggerPolicy().song_open.mode === "auto"
       ) {
-        await daemon.prepare(song.audioPath, signal);
+        await daemon.prepare(
+          song.audioPath,
+          signal,
+          song.audioSha256 ? { audioSha256: song.audioSha256 } : undefined,
+        );
         signal?.throwIfAborted?.();
+        assertHostMatchesLiveWorkspace(
+          host,
+          effectiveGuard,
+          "Song audio or workspace changed during preparation — reopen song.",
+        );
         const stateAfterPrepare = host.controller.getState();
         if (
           stateAfterPrepare.lastSeq === seqBeforePrepare &&
@@ -843,17 +1152,29 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
           !hasDraftLoaded(stateAfterPrepare)
         ) {
           await host.controller.analyze(signal, { basisSeq: seqBeforePrepare });
+          assertHostMatchesLiveWorkspace(
+            host,
+            effectiveGuard,
+            "Song audio or workspace changed during analysis — reopen song.",
+          );
           await host.flushTrace();
         }
       } else {
         // Warm PCM cache in the background without blocking cached `.jsonl` reopen!
-        void daemon.prepare(song.audioPath).catch(() => {});
+        void daemon
+          .prepare(
+            song.audioPath,
+            undefined,
+            song.audioSha256 ? { audioSha256: song.audioSha256 } : undefined,
+          )
+          .catch(() => {});
       }
     } finally {
       host.openingCount = Math.max(0, host.openingCount - 1);
     }
 
     signal?.throwIfAborted?.();
+    assertHostMatchesLiveWorkspace(host, effectiveGuard);
     return await buildSongSessionPayload(host);
   }
 
@@ -863,7 +1184,7 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
     t1: number,
     filter: AuditionFilter,
     signal?: AbortSignal,
-  ): Promise<{ wavPath: string } & AuditionRenderMeta> {
+  ): Promise<{ wavPath: string; cleanupAfterStream?: () => Promise<void> } & AuditionRenderMeta> {
     if (t0 < 0 || t1 <= t0 || t1 - t0 > MAX_AUDITION_SPAN_SEC + 1e-6) {
       throw new Error(`Choose an audition span between 0 and ${MAX_AUDITION_SPAN_SEC} seconds.`);
     }
@@ -871,6 +1192,39 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
     if (!isSupportedAudioFileName(basename(canonicalAudio))) {
       throw new DOMException("Unsupported audio file.", "NotAllowedError");
     }
+
+    // If the workspace has NOT been persisted on disk yet (cold GET), render into an OS temp dir
+    // so GET /audition never creates `.ensomi-tempo` inside an uninitialized workspace folder!
+    if (!store.currentStateDir || !existsSync(store.currentStateDir)) {
+      const tempDir = await mkdtemp(join(tmpdir(), "ensomi-audition-"));
+      const tempWav = join(tempDir, "audition.wav");
+      try {
+        const rendered = await daemon.renderAudition(
+          {
+            audioPath: song.audioPath,
+            ...(song.audioSha256 ? { audioSha256: song.audioSha256 } : {}),
+            startSec: t0,
+            endSec: t1,
+            filter,
+            outputPath: tempWav,
+          },
+          signal,
+        );
+        return {
+          wavPath: tempWav,
+          startSample: rendered.startSample,
+          endSample: rendered.endSample,
+          sampleRate: rendered.sampleRate,
+          cleanupAfterStream: async () => {
+            await rm(tempDir, { recursive: true, force: true }).catch(() => {});
+          },
+        };
+      } catch (err) {
+        await rm(tempDir, { recursive: true, force: true }).catch(() => {});
+        throw err;
+      }
+    }
+
     const fileInfo = await stat(canonicalAudio);
     const cacheKey = createHash("sha1")
       .update(
@@ -921,6 +1275,7 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
     const rendered = await daemon.renderAudition(
       {
         audioPath: song.audioPath,
+        ...(song.audioSha256 ? { audioSha256: song.audioSha256 } : {}),
         startSec: t0,
         endSec: t1,
         filter,
@@ -943,6 +1298,7 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
   async function handleUploadRequest(
     request: IncomingMessage,
     url: URL,
+    wsGuard?: CapturedWorkspaceGuard,
   ): Promise<Record<string, unknown>> {
     const { target } = await ensureWorkspaceForImport(
       url.searchParams.get("dir") ?? undefined,
@@ -952,6 +1308,15 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
 
     if (contentType.startsWith("multipart/form-data")) {
       const rawBuffer = await readBody(request);
+      if (!url.searchParams.has("dir")) {
+        reassertRequestWorkspace(wsGuard);
+        if (
+          store.currentStateDir !== target.stateDir ||
+          store.currentWorkspaceDir !== target.workspaceDir
+        ) {
+          throw makeWorkspaceConflictError();
+        }
+      }
       const webReq = new Request("http://127.0.0.1/upload", {
         method: "POST",
         headers: { "content-type": request.headers["content-type"] ?? "multipart/form-data" },
@@ -1017,7 +1382,9 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
   async function handleEditRequest(
     host: SongSessionHost,
     body: Record<string, unknown>,
+    guard?: CapturedWorkspaceGuard,
   ): Promise<Record<string, unknown>> {
+    assertHostMatchesLiveWorkspace(host, guard);
     let committedEvent = null;
 
     if (body.action === "undo") {
@@ -1110,7 +1477,9 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
       committedEvent = res.event;
     }
 
+    assertHostMatchesLiveWorkspace(host, guard);
     await host.flushTrace();
+    assertHostMatchesLiveWorkspace(host, guard);
     const payload = await buildSongSessionPayload(host);
     return {
       ...payload,
@@ -1122,7 +1491,9 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
     host: SongSessionHost,
     body: Record<string, unknown>,
     signal?: AbortSignal,
+    guard?: CapturedWorkspaceGuard,
   ): Promise<Record<string, unknown>> {
+    assertHostMatchesLiveWorkspace(host, guard);
     const format = String(body.format ?? "osu");
     const song = store.getSong(host.songId);
     const state = host.controller.getState();
@@ -1142,6 +1513,8 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
     }
 
     if (format === "jsonl") {
+      await ensureInitialWorkspace({ persist: true });
+      assertHostMatchesLiveWorkspace(host, guard);
       await host.flushTrace();
       const content = host.controller.exportNdjson();
       return {
@@ -1154,6 +1527,8 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
     }
 
     if (format === "clip") {
+      await ensureInitialWorkspace({ persist: true });
+      assertHostMatchesLiveWorkspace(host, guard);
       const filter = validateAuditionFilter(body.filter);
       const maxDur = state.durationSec > 0 ? state.durationSec : (song.durationSec ?? 30);
       const t0 = body.t0 !== undefined ? parseFiniteNumber(body.t0, "t0") : 0;
@@ -1174,6 +1549,7 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
       const rendered = await daemon.exportClip(
         {
           audioPath: canonicalClipSrc,
+          ...(song.audioSha256 ? { audioSha256: song.audioSha256 } : {}),
           startSec: t0,
           endSec: t1,
           filter,
@@ -1197,43 +1573,6 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
     }
 
     throw new Error(`Unsupported export format "${format}". Expected "osu", "jsonl", or "clip".`);
-  }
-
-  async function assertExpectedWorkspaceMatches(
-    request: IncomingMessage,
-    response: ServerResponse,
-  ): Promise<boolean> {
-    const rawExpected = request.headers["x-tempo-workspace-dir"];
-    if (typeof rawExpected !== "string" || !rawExpected.trim()) {
-      return true;
-    }
-    let decoded = rawExpected.trim();
-    try {
-      decoded = decodeURIComponent(decoded).trim();
-    } catch {
-      // Keep raw string if not URI-encoded.
-    }
-    if (!decoded) return true;
-
-    await ensureInitialWorkspace();
-    let canonicalExpected = decoded;
-    try {
-      const expanded = fullPath(decoded);
-      canonicalExpected = await realpath(expanded).catch(() => expanded);
-    } catch {}
-
-    if (
-      !store.isOpen ||
-      (store.currentWorkspaceDir !== canonicalExpected && store.currentWorkspaceDir !== decoded)
-    ) {
-      response.statusCode = 409;
-      sendJson(response, {
-        name: "ConflictError",
-        error: "Active workspace changed in another tab — reopen workspace.",
-      });
-      return false;
-    }
-    return true;
   }
 
   async function handleInternal(
@@ -1262,16 +1601,18 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
       requireLocalHeader,
     );
 
-    // Workspace endpoints
+    // Workspace endpoints (GET is strictly zero-disk-write!)
     if (parts[0] === "workspace" && parts.length === 1 && method === "GET") {
       const dirQuery = url.searchParams.get("dir");
       const stateDirQuery = url.searchParams.get("stateDir") ?? configuredStateDir;
       if (dirQuery) {
-        const opened = await openWorkspaceInternal(dirQuery, stateDirQuery);
+        const opened = await openWorkspaceInternal(dirQuery, stateDirQuery, false, {
+          persist: false,
+        });
         sendJson(response, formatWorkspaceResponse(opened));
         return;
       }
-      const current = await ensureInitialWorkspace();
+      const current = await ensureInitialWorkspace({ persist: false });
       if (!current) {
         sendJson(response, {
           schemaVersion: 1,
@@ -1297,7 +1638,7 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
         throw new Error("Provide { dir: string } to open a Tempo workspace folder.");
       }
       const stateDir = typeof body.stateDir === "string" ? body.stateDir : configuredStateDir;
-      const manifest = await openWorkspaceInternal(body.dir, stateDir);
+      const manifest = await openWorkspaceInternal(body.dir, stateDir, false, { persist: true });
       sendJson(response, formatWorkspaceResponse(manifest));
       return;
     }
@@ -1308,12 +1649,21 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
       parts.length === 2 &&
       method === "POST"
     ) {
+      const parsedHeaderBefore = await parseCanonicalExpectedWorkspaceHeader(request);
+      const preGuard: CapturedWorkspaceGuard | null = store.isOpen
+        ? {
+            expectedHeaderDir: parsedHeaderBefore?.canonical ?? null,
+            targetWorkspaceDir: store.currentWorkspaceDir,
+            targetStateDir: store.currentStateDir,
+          }
+        : null;
       const body = await readJsonBody(request);
-      if (
-        typeof body.dir !== "string" &&
-        !(await assertExpectedWorkspaceMatches(request, response))
-      ) {
-        return;
+      if (typeof body.dir !== "string") {
+        const postGuard = await captureAndVerifyRequestWorkspace(request, { persist: false });
+        if (preGuard) {
+          reassertRequestWorkspace(preGuard);
+        }
+        reassertRequestWorkspace(postGuard);
       }
       const { target } = await ensureWorkspaceForImport(
         typeof body.dir === "string" ? body.dir : undefined,
@@ -1345,13 +1695,11 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
       parts.length === 2 &&
       method === "POST"
     ) {
-      if (
-        !url.searchParams.has("dir") &&
-        !(await assertExpectedWorkspaceMatches(request, response))
-      ) {
-        return;
+      let wsGuard: CapturedWorkspaceGuard | undefined;
+      if (!url.searchParams.has("dir")) {
+        wsGuard = await captureAndVerifyRequestWorkspace(request, { persist: false });
       }
-      sendJson(response, await handleUploadRequest(request, url));
+      sendJson(response, await handleUploadRequest(request, url, wsGuard));
       return;
     }
 
@@ -1360,38 +1708,17 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
       const songId = assertValidSongId(parts[1]);
       const action = parts[2];
 
-      if (method !== "GET" && method !== "HEAD") {
-        if (!(await assertExpectedWorkspaceMatches(request, response))) {
-          return;
-        }
-      }
-
       if (action === undefined && method === "GET") {
-        const host = await getOrLoadHost(songId);
+        const host = await getOrLoadHost(songId, {
+          healOnDisk: false,
+          persistWorkspace: false,
+        });
         sendJson(response, await buildSongSessionPayload(host, { persist: false }));
         return;
       }
 
-      if (action === "open" && parts.length === 3 && method === "POST") {
-        const { signal, cleanup } = disconnectSignal(request, response);
-        try {
-          await readBody(request);
-          if (signal.aborted || response.destroyed) return;
-          const payload = await openSongSession(songId, signal);
-          if (!signal.aborted && !response.destroyed) {
-            sendJson(response, payload);
-          }
-        } catch (error) {
-          if (signal.aborted || response.destroyed) return;
-          throw error;
-        } finally {
-          cleanup();
-        }
-        return;
-      }
-
       if (action === "audio" && parts.length === 3 && (method === "GET" || method === "HEAD")) {
-        await ensureInitialWorkspace();
+        await ensureInitialWorkspace({ persist: false });
         const song = store.getSong(songId);
         const canonicalAudio = await realpath(song.audioPath);
         if (!isSupportedAudioFileName(basename(canonicalAudio))) {
@@ -1405,10 +1732,13 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
 
       if (action === "audition" && parts.length === 3 && (method === "GET" || method === "HEAD")) {
         const { signal, cleanup } = disconnectSignal(request, response);
-        let rendered: { wavPath: string } & AuditionRenderMeta;
+        let rendered: {
+          wavPath: string;
+          cleanupAfterStream?: () => Promise<void>;
+        } & AuditionRenderMeta;
         try {
           if (signal.aborted || response.destroyed) return;
-          await ensureInitialWorkspace();
+          await ensureInitialWorkspace({ persist: false });
           if (signal.aborted || response.destroyed) return;
           const song = store.getSong(songId);
           const t0 = parseFiniteNumber(
@@ -1429,13 +1759,17 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
           throw error;
         }
         cleanup();
-        if (signal.aborted || response.destroyed) return;
-        await streamFileWithRange(request, response, rendered.wavPath, "audio/wav", {
-          "X-Audition-Only": "listening view; timestamps stay on the original mix",
-          "X-Audition-Start-Sample": String(rendered.startSample),
-          "X-Audition-End-Sample": String(rendered.endSample),
-          "X-Audition-Sample-Rate": String(rendered.sampleRate),
-        });
+        try {
+          if (signal.aborted || response.destroyed) return;
+          await streamFileWithRange(request, response, rendered.wavPath, "audio/wav", {
+            "X-Audition-Only": "listening view; timestamps stay on the original mix",
+            "X-Audition-Start-Sample": String(rendered.startSample),
+            "X-Audition-End-Sample": String(rendered.endSample),
+            "X-Audition-Sample-Rate": String(rendered.sampleRate),
+          });
+        } finally {
+          await rendered.cleanupAfterStream?.();
+        }
         return;
       }
 
@@ -1445,7 +1779,7 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
         parts.length === 4 &&
         (method === "GET" || method === "HEAD")
       ) {
-        await ensureInitialWorkspace();
+        await ensureInitialWorkspace({ persist: false });
         store.getSong(songId);
         const rawClipName = parts[3];
         if (
@@ -1460,185 +1794,304 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
         return;
       }
 
-      if (action === "edit" && parts.length === 3 && method === "POST") {
-        const body = await readJsonBody(request);
-        const host = await getOrLoadHost(songId);
-        sendJson(response, await handleEditRequest(host, body));
-        return;
-      }
+      if (method !== "GET" && method !== "HEAD") {
+        const wsGuard = await captureAndVerifyRequestWorkspace(request, { persist: false });
 
-      if (action === "snaps" && parts.length === 3 && method === "POST") {
-        const { signal, cleanup } = disconnectSignal(request, response);
-        try {
+        if (action === "open" && parts.length === 3 && method === "POST") {
+          const { signal, cleanup } = disconnectSignal(request, response);
+          try {
+            await readBody(request);
+            if (signal.aborted || response.destroyed) return;
+            reassertRequestWorkspace(wsGuard);
+            const payload = await openSongSession(songId, signal, wsGuard);
+            if (!signal.aborted && !response.destroyed) {
+              sendJson(response, payload);
+            }
+          } catch (error) {
+            if (signal.aborted || response.destroyed) return;
+            throw error;
+          } finally {
+            cleanup();
+          }
+          return;
+        }
+
+        if (action === "edit" && parts.length === 3 && method === "POST") {
           const body = await readJsonBody(request);
-          if (signal.aborted || response.destroyed) return;
-          const timeSec = parseFiniteNumber(body.timeSec, "timeSec");
-          const windowSec =
-            body.windowSec !== undefined ? parseFiniteNumber(body.windowSec, "windowSec") : 0.12;
-          const immediate = body.immediate === undefined ? true : Boolean(body.immediate);
+          reassertRequestWorkspace(wsGuard);
+          await ensureInitialWorkspace({ persist: true });
+          const effectiveGuard: CapturedWorkspaceGuard = {
+            expectedHeaderDir: wsGuard.expectedHeaderDir,
+            targetWorkspaceDir: wsGuard.targetWorkspaceDir ?? store.currentWorkspaceDir,
+            targetStateDir: wsGuard.targetStateDir ?? store.currentStateDir,
+          };
+          reassertRequestWorkspace(effectiveGuard);
+          const host = await getOrLoadHost(songId, {
+            expectedStateDir: effectiveGuard.targetStateDir,
+            expectedWorkspaceDir: effectiveGuard.targetWorkspaceDir,
+            healOnDisk: true,
+            persistWorkspace: true,
+          });
+          sendJson(response, await handleEditRequest(host, body, effectiveGuard));
+          return;
+        }
 
-          const host = await getOrLoadHost(songId, signal);
-          if (signal.aborted || response.destroyed) return;
-          const song = store.getSong(songId);
+        if (action === "snaps" && parts.length === 3 && method === "POST") {
+          const { signal, cleanup } = disconnectSignal(request, response);
+          try {
+            const body = await readJsonBody(request);
+            if (signal.aborted || response.destroyed) return;
+            reassertRequestWorkspace(wsGuard);
+            const timeSec = parseFiniteNumber(body.timeSec, "timeSec");
+            const windowSec =
+              body.windowSec !== undefined ? parseFiniteNumber(body.windowSec, "windowSec") : 0.12;
+            const immediate = body.immediate === undefined ? true : Boolean(body.immediate);
 
-          if (!host.controller.getState().audio) {
-            const direct = await daemon.suggestSnaps(song.audioPath, timeSec, windowSec, signal);
+            const host = await getOrLoadHost(songId, {
+              signal,
+              expectedStateDir: wsGuard.targetStateDir,
+              expectedWorkspaceDir: wsGuard.targetWorkspaceDir,
+              healOnDisk: false,
+              persistWorkspace: false,
+            });
+            if (signal.aborted || response.destroyed) return;
+            assertHostMatchesLiveWorkspace(host, wsGuard);
+            const song = store.getSong(songId);
+
+            if (!host.controller.getState().audio) {
+              const direct = await daemon.suggestSnaps(
+                song.audioPath,
+                timeSec,
+                windowSec,
+                signal,
+                song.audioSha256 ? { audioSha256: song.audioSha256 } : undefined,
+              );
+              reassertRequestWorkspace(wsGuard);
+              if (!signal.aborted && !response.destroyed) {
+                sendJson(response, {
+                  status: "ok",
+                  songId,
+                  generation: 1,
+                  candidates: direct.candidates,
+                });
+              }
+              return;
+            }
+            const outcome = await host.controller.suggestSnaps(
+              { timeSec, windowSec, immediate },
+              signal,
+            );
+            reassertRequestWorkspace(wsGuard);
             if (!signal.aborted && !response.destroyed) {
               sendJson(response, {
-                status: "ok",
-                songId,
-                generation: 1,
-                candidates: direct.candidates,
+                status: outcome.status,
+                songId: outcome.songId,
+                generation: outcome.generation,
+                candidates: outcome.candidates,
               });
             }
-            return;
+          } catch (error) {
+            if (signal.aborted || response.destroyed) return;
+            throw error;
+          } finally {
+            cleanup();
           }
-          const outcome = await host.controller.suggestSnaps(
-            { timeSec, windowSec, immediate },
-            signal,
-          );
-          if (!signal.aborted && !response.destroyed) {
-            sendJson(response, {
-              status: outcome.status,
-              songId: outcome.songId,
-              generation: outcome.generation,
-              candidates: outcome.candidates,
-            });
-          }
-        } catch (error) {
-          if (signal.aborted || response.destroyed) return;
-          throw error;
-        } finally {
-          cleanup();
+          return;
         }
-        return;
-      }
 
-      if (action === "recompute" && parts.length === 3 && method === "POST") {
-        const { signal, cleanup } = disconnectSignal(request, response);
-        let onDisconnectAbort: (() => void) | null = null;
-        try {
-          const body = await readJsonBody(request);
-          if (signal.aborted || response.destroyed) return;
-          const rawScope = body.scope ?? "song";
-          const scope: Range | "song" =
-            rawScope === "song"
-              ? "song"
-              : {
-                  t0: parseFiniteNumber((rawScope as Record<string, unknown>).t0, "scope.t0"),
-                  t1: parseFiniteNumber((rawScope as Record<string, unknown>).t1, "scope.t1"),
-                };
-          const reason =
-            typeof body.reason === "string" && body.reason.trim().length > 0
-              ? body.reason.trim()
-              : "User requested recompute";
+        if (action === "recompute" && parts.length === 3 && method === "POST") {
+          const { signal, cleanup } = disconnectSignal(request, response);
+          let onDisconnectAbort: (() => void) | null = null;
+          try {
+            const body = await readJsonBody(request);
+            if (signal.aborted || response.destroyed) return;
+            reassertRequestWorkspace(wsGuard);
+            await ensureInitialWorkspace({ persist: true });
+            const effectiveGuard: CapturedWorkspaceGuard = {
+              expectedHeaderDir: wsGuard.expectedHeaderDir,
+              targetWorkspaceDir: wsGuard.targetWorkspaceDir ?? store.currentWorkspaceDir,
+              targetStateDir: wsGuard.targetStateDir ?? store.currentStateDir,
+            };
+            reassertRequestWorkspace(effectiveGuard);
 
-          const host = await getOrLoadHost(songId, signal);
-          if (signal.aborted || response.destroyed) return;
-          if (!host.controller.getState().audio) {
-            const song = store.getSong(songId);
-            host.openingCount += 1;
-            try {
-              const prepared = await daemon.prepare(song.audioPath, signal);
-              if (signal.aborted || response.destroyed) return;
-              if (!host.controller.getState().audio) {
-                await host.controller.bindAudio(
-                  {
-                    songId,
-                    durationSec: prepared.durationSec,
-                    sampleRate: prepared.sampleRate,
-                    clock: "source-audio-sec",
-                    decoder: "ffmpeg-f32le",
-                  },
+            const rawScope = body.scope ?? "song";
+            const scope: Range | "song" =
+              rawScope === "song"
+                ? "song"
+                : {
+                    t0: parseFiniteNumber((rawScope as Record<string, unknown>).t0, "scope.t0"),
+                    t1: parseFiniteNumber((rawScope as Record<string, unknown>).t1, "scope.t1"),
+                  };
+            const reason =
+              typeof body.reason === "string" && body.reason.trim().length > 0
+                ? body.reason.trim()
+                : "User requested recompute";
+
+            const host = await getOrLoadHost(songId, {
+              signal,
+              expectedStateDir: effectiveGuard.targetStateDir,
+              expectedWorkspaceDir: effectiveGuard.targetWorkspaceDir,
+              healOnDisk: true,
+              persistWorkspace: true,
+            });
+            if (signal.aborted || response.destroyed) return;
+            if (!host.controller.getState().audio) {
+              const song = store.getSong(songId);
+              host.openingCount += 1;
+              try {
+                const prepared = await daemon.prepare(
+                  song.audioPath,
                   signal,
+                  song.audioSha256 ? { audioSha256: song.audioSha256 } : undefined,
                 );
-                await host.flushTrace();
+                if (signal.aborted || response.destroyed) return;
+                assertHostMatchesLiveWorkspace(host, effectiveGuard);
+                if (!host.controller.getState().audio) {
+                  await host.controller.bindAudio(
+                    {
+                      songId,
+                      durationSec: prepared.durationSec,
+                      sampleRate: prepared.sampleRate,
+                      clock: "source-audio-sec",
+                      decoder: "ffmpeg-f32le",
+                    },
+                    signal,
+                  );
+                  assertHostMatchesLiveWorkspace(host, effectiveGuard);
+                  await host.flushTrace();
+                }
+              } finally {
+                host.openingCount = Math.max(0, host.openingCount - 1);
               }
-            } finally {
-              host.openingCount = Math.max(0, host.openingCount - 1);
+              if (signal.aborted || response.destroyed) return;
+            }
+
+            assertHostMatchesLiveWorkspace(host, effectiveGuard);
+            const recomputePromise = host.controller.recompute({ scope, reason });
+            const myGeneration = host.controller.getLayerState("heavy_recompute").generation;
+            void host.flushTrace().catch(() => {});
+
+            onDisconnectAbort = () => {
+              const cur = host.controller.getLayerState("heavy_recompute");
+              if (cur.inFlight && cur.generation === myGeneration) {
+                host.controller.abortLayer("heavy_recompute", "Client disconnected");
+              }
+            };
+            signal.addEventListener("abort", onDisconnectAbort, { once: true });
+            if (signal.aborted) {
+              onDisconnectAbort();
+            }
+
+            const outcome = await recomputePromise;
+            assertHostMatchesLiveWorkspace(host, effectiveGuard);
+            await host.flushTrace();
+            const sessionPayload = await buildSongSessionPayload(host);
+            if (!signal.aborted && !response.destroyed) {
+              sendJson(response, {
+                ...sessionPayload,
+                status: outcome.status,
+                generation: outcome.generation,
+                offers: outcome.offers,
+                suppressedOffers: outcome.suppressedOffers,
+              });
+            }
+          } catch (error) {
+            const liveKey = `${wsGuard.targetStateDir ?? store.currentStateDir ?? ""}::${songId}`;
+            const curHost = hosts.get(liveKey);
+            if (curHost?.isCurrent()) {
+              await curHost.flushTrace().catch(() => {});
             }
             if (signal.aborted || response.destroyed) return;
-          }
-
-          const recomputePromise = host.controller.recompute({ scope, reason });
-          const myGeneration = host.controller.getLayerState("heavy_recompute").generation;
-          void host.flushTrace().catch(() => {});
-
-          onDisconnectAbort = () => {
-            const cur = host.controller.getLayerState("heavy_recompute");
-            if (cur.inFlight && cur.generation === myGeneration) {
-              host.controller.abortLayer("heavy_recompute", "Client disconnected");
+            throw error;
+          } finally {
+            if (onDisconnectAbort) {
+              signal.removeEventListener("abort", onDisconnectAbort);
             }
+            cleanup();
+          }
+          return;
+        }
+
+        if (action === "hold-offers" && parts.length === 3 && method === "POST") {
+          const body = await readJsonBody(request);
+          reassertRequestWorkspace(wsGuard);
+          await ensureInitialWorkspace({ persist: true });
+          const effectiveGuard: CapturedWorkspaceGuard = {
+            expectedHeaderDir: wsGuard.expectedHeaderDir,
+            targetWorkspaceDir: wsGuard.targetWorkspaceDir ?? store.currentWorkspaceDir,
+            targetStateDir: wsGuard.targetStateDir ?? store.currentStateDir,
           };
-          signal.addEventListener("abort", onDisconnectAbort, { once: true });
-          if (signal.aborted) {
-            onDisconnectAbort();
-          }
-
-          const outcome = await recomputePromise;
-          await host.flushTrace();
-          const sessionPayload = await buildSongSessionPayload(host);
-          if (!signal.aborted && !response.destroyed) {
-            sendJson(response, {
-              ...sessionPayload,
-              status: outcome.status,
-              generation: outcome.generation,
-              offers: outcome.offers,
-              suppressedOffers: outcome.suppressedOffers,
-            });
-          }
-        } catch (error) {
-          await hosts
-            .get(`${store.currentStateDir ?? ""}::${songId}`)
-            ?.flushTrace()
-            .catch(() => {});
-          if (signal.aborted || response.destroyed) return;
-          throw error;
-        } finally {
-          if (onDisconnectAbort) {
-            signal.removeEventListener("abort", onDisconnectAbort);
-          }
-          cleanup();
-        }
-        return;
-      }
-
-      if (action === "hold-offers" && parts.length === 3 && method === "POST") {
-        const body = await readJsonBody(request);
-        const hold = Boolean(body.hold);
-        const host = await getOrLoadHost(songId);
-        const { flushed, offers } = host.controller.setHoldOffers(hold);
-        if (flushed) {
-          await host.flushTrace();
-        }
-        const sessionPayload = await buildSongSessionPayload(host);
-        sendJson(response, {
-          ...sessionPayload,
-          hold: host.controller.isHoldingOffers(),
-          flushed,
-          offers,
-        });
-        return;
-      }
-
-      if (
-        action === "offers" &&
-        typeof parts[3] === "string" &&
-        parts[3].length > 0 &&
-        (parts[4] === "accept" || parts[4] === "reject") &&
-        parts.length === 5 &&
-        method === "POST"
-      ) {
-        const offerId = parts[3];
-        const offerAction = parts[4];
-        const body = await readJsonBody(request);
-        const host = await getOrLoadHost(songId);
-
-        if (offerAction === "accept") {
-          const outcome = host.controller.acceptOffer(offerId);
-          if (outcome.ok) {
+          reassertRequestWorkspace(effectiveGuard);
+          const hold = Boolean(body.hold);
+          const host = await getOrLoadHost(songId, {
+            expectedStateDir: effectiveGuard.targetStateDir,
+            expectedWorkspaceDir: effectiveGuard.targetWorkspaceDir,
+            healOnDisk: true,
+            persistWorkspace: true,
+          });
+          assertHostMatchesLiveWorkspace(host, effectiveGuard);
+          const { flushed, offers } = host.controller.setHoldOffers(hold);
+          if (flushed) {
+            assertHostMatchesLiveWorkspace(host, effectiveGuard);
             await host.flushTrace();
           }
+          const sessionPayload = await buildSongSessionPayload(host);
+          sendJson(response, {
+            ...sessionPayload,
+            hold: host.controller.isHoldingOffers(),
+            flushed,
+            offers,
+          });
+          return;
+        }
+
+        if (
+          action === "offers" &&
+          typeof parts[3] === "string" &&
+          parts[3].length > 0 &&
+          (parts[4] === "accept" || parts[4] === "reject") &&
+          parts.length === 5 &&
+          method === "POST"
+        ) {
+          const offerId = parts[3];
+          const offerAction = parts[4];
+          const body = await readJsonBody(request);
+          reassertRequestWorkspace(wsGuard);
+          await ensureInitialWorkspace({ persist: true });
+          const effectiveGuard: CapturedWorkspaceGuard = {
+            expectedHeaderDir: wsGuard.expectedHeaderDir,
+            targetWorkspaceDir: wsGuard.targetWorkspaceDir ?? store.currentWorkspaceDir,
+            targetStateDir: wsGuard.targetStateDir ?? store.currentStateDir,
+          };
+          reassertRequestWorkspace(effectiveGuard);
+          const host = await getOrLoadHost(songId, {
+            expectedStateDir: effectiveGuard.targetStateDir,
+            expectedWorkspaceDir: effectiveGuard.targetWorkspaceDir,
+            healOnDisk: true,
+            persistWorkspace: true,
+          });
+          assertHostMatchesLiveWorkspace(host, effectiveGuard);
+
+          if (offerAction === "accept") {
+            const outcome = host.controller.acceptOffer(offerId);
+            if (outcome.ok) {
+              assertHostMatchesLiveWorkspace(host, effectiveGuard);
+              await host.flushTrace();
+            }
+            const sessionPayload = await buildSongSessionPayload(host);
+            sendJson(response, {
+              ...sessionPayload,
+              ...outcome,
+            });
+            return;
+          }
+
+          const outcome = host.controller.rejectOffer(
+            offerId,
+            typeof body.reason === "string" ? body.reason : undefined,
+          );
+          assertHostMatchesLiveWorkspace(host, effectiveGuard);
+          await host.flushTrace();
           const sessionPayload = await buildSongSessionPayload(host);
           sendJson(response, {
             ...sessionPayload,
@@ -1647,37 +2100,34 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
           return;
         }
 
-        const outcome = host.controller.rejectOffer(
-          offerId,
-          typeof body.reason === "string" ? body.reason : undefined,
-        );
-        await host.flushTrace();
-        const sessionPayload = await buildSongSessionPayload(host);
-        sendJson(response, {
-          ...sessionPayload,
-          ...outcome,
-        });
-        return;
-      }
-
-      if (action === "export" && parts.length === 3 && method === "POST") {
-        const { signal, cleanup } = disconnectSignal(request, response);
-        try {
-          const body = await readJsonBody(request);
-          if (signal.aborted || response.destroyed) return;
-          const host = await getOrLoadHost(songId, signal);
-          if (signal.aborted || response.destroyed) return;
-          const exported = await handleExportRequest(host, body, signal);
-          if (!signal.aborted && !response.destroyed) {
-            sendJson(response, exported);
+        if (action === "export" && parts.length === 3 && method === "POST") {
+          const { signal, cleanup } = disconnectSignal(request, response);
+          try {
+            const body = await readJsonBody(request);
+            if (signal.aborted || response.destroyed) return;
+            reassertRequestWorkspace(wsGuard);
+            const format = String(body.format ?? "osu");
+            const needsPersist = format === "jsonl" || format === "clip";
+            const host = await getOrLoadHost(songId, {
+              signal,
+              expectedStateDir: wsGuard.targetStateDir,
+              expectedWorkspaceDir: wsGuard.targetWorkspaceDir,
+              healOnDisk: needsPersist,
+              persistWorkspace: needsPersist,
+            });
+            if (signal.aborted || response.destroyed) return;
+            const exported = await handleExportRequest(host, body, signal, wsGuard);
+            if (!signal.aborted && !response.destroyed) {
+              sendJson(response, exported);
+            }
+          } catch (error) {
+            if (signal.aborted || response.destroyed) return;
+            throw error;
+          } finally {
+            cleanup();
           }
-        } catch (error) {
-          if (signal.aborted || response.destroyed) return;
-          throw error;
-        } finally {
-          cleanup();
+          return;
         }
-        return;
       }
     }
 
@@ -1694,6 +2144,18 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
     try {
       await handleInternal(request, response, url);
     } catch (error) {
+      if ((error as { name?: string } | null)?.name === "ConflictError") {
+        if (!response.headersSent) {
+          response.statusCode = 409;
+          sendJson(response, {
+            name: "ConflictError",
+            error: sanitizeTempoErrorMessage(error),
+          });
+        } else {
+          response.end();
+        }
+        return;
+      }
       throw sanitizeTempoHttpError(error);
     }
   }
@@ -1701,9 +2163,11 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
   async function close(): Promise<void> {
     const active = Array.from(hosts.values());
     hosts.clear();
-    await Promise.allSettled(active.map((h) => h.flushTrace()));
+    if (store.isPersistedToDisk) {
+      await Promise.allSettled(active.map((h) => h.flushTrace()));
+    }
     for (const host of active) {
-      host.controller.close();
+      host.dispose();
     }
     await daemon.close();
   }
@@ -1715,8 +2179,8 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
       return hosts.size;
     },
     ensureInitialWorkspace,
-    openWorkspace: async (dir: string, stateDir?: string) =>
-      formatWorkspaceResponse(await openWorkspaceInternal(dir, stateDir)),
+    openWorkspace: async (dir: string, stateDir?: string, openOpts?: { persist?: boolean }) =>
+      formatWorkspaceResponse(await openWorkspaceInternal(dir, stateDir, false, openOpts)),
     handle,
     close,
   };
@@ -1771,6 +2235,8 @@ export {
   assertContainedInStateDir,
   assertValidSongId,
   computeAudioFingerprint,
+  computeLegacySampledFingerprint,
+  deriveLegacySongId,
   isValidSongId,
   SUPPORTED_AUDIO_EXTENSIONS,
   TempoWorkspaceStore,

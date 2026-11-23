@@ -1449,4 +1449,144 @@ describe("TempoWorkspace interactive UI", () => {
     await flushUi();
     expect(song2.controller.getState().beats.get("b-s14-01")?.timeSec).toBeCloseTo(1.001, 4);
   });
+
+  it("[Stage 9 #5] centers paused-seek Audition window at [60, 120) for 90s on 180s song and isolates nudge queues by songEpoch across A -> B -> A switches", async () => {
+    // 1. Unit checks for symmetric [60, 120) centering at 90s on a 180s song:
+    expect(
+      computeAuditionWindow({
+        durationSec: 180,
+        playheadSec: 90,
+        activeRange: null,
+        looping: false,
+        loopStartSec: 0,
+        loopEndSec: 0,
+      }),
+    ).toEqual({ t0: 60, t1: 120 });
+
+    expect(
+      computeAuditionWindow({
+        durationSec: 180,
+        playheadSec: 90,
+        activeRange: { t0: 10, t1: 20 },
+        looping: false,
+        loopStartSec: 10,
+        loopEndSec: 20,
+      }),
+    ).toEqual({ t0: 60, t1: 120 });
+
+    const requestedAuditionWindows: Array<{ t0: number; t1: number }> = [];
+    let releaseEpoch1Nudge: (() => void) | null = null;
+    let stalledFirstSongANudge = false;
+
+    const baseFetch = globalThis.fetch;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const rawUrl = typeof input === "string" ? input : input.toString();
+        const url = new URL(rawUrl, "http://127.0.0.1");
+
+        if (url.pathname === "/api/tempo/songs/01-campanella-a1b2c3d4/open") {
+          const song1 = requireSong("01-campanella-a1b2c3d4");
+          if (!song1.controller.getState().audio) {
+            await song1.controller.openSong({
+              songId: "01-campanella-a1b2c3d4",
+              durationSec: 180,
+              sampleRate: 44_100,
+              clock: "source-audio-sec",
+            });
+          }
+          return new Response(JSON.stringify(buildPayload(song1)), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+
+        if (url.pathname.endsWith("/audition")) {
+          const t0 = Number(url.searchParams.get("t0") ?? "0");
+          const t1 = Number(url.searchParams.get("t1") ?? "0");
+          requestedAuditionWindows.push({ t0, t1 });
+          return new Response(new ArrayBuffer(64), {
+            status: 200,
+            headers: {
+              "Content-Type": "audio/wav",
+              "X-Audition-Start-Sample": String(Math.round(t0 * 44_100)),
+              "X-Audition-End-Sample": String(Math.round(t1 * 44_100)),
+              "X-Audition-Sample-Rate": "44100",
+            },
+          });
+        }
+
+        if (
+          url.pathname === "/api/tempo/songs/01-campanella-a1b2c3d4/edit" &&
+          typeof init?.body === "string" &&
+          init.body.includes('"b-s14-01"') &&
+          !stalledFirstSongANudge
+        ) {
+          stalledFirstSongANudge = true;
+          await new Promise<void>((r) => {
+            releaseEpoch1Nudge = r;
+          });
+        }
+
+        return await baseFetch(input, init);
+      }),
+    );
+
+    await mountWorkspace();
+    const song1 = requireSong("01-campanella-a1b2c3d4");
+
+    // 2. Interactive paused seek to 90s (90_000 ms) in Audition mode -> fetches [60, 120)!
+    const auditionBtn = Array.from(
+      container.querySelectorAll(".frame-toolbar .segmented button"),
+    ).find((b) => b.textContent?.trim() === "Audition") as HTMLButtonElement;
+    auditionBtn.click();
+    await flushUi();
+
+    const lowBtn = Array.from(container.querySelectorAll(".stage-toolbar .segmented button")).find(
+      (b) => b.textContent?.trim() === "Low",
+    ) as HTMLButtonElement;
+    lowBtn.click();
+    await flushUi();
+    expect(requestedAuditionWindows.at(-1)).toEqual({ t0: 0, t1: 60 });
+
+    stageHook.emit?.("seek", 90_000);
+    await flushUi();
+    expect(requestedAuditionWindows.at(-1)).toEqual({ t0: 60, t1: 120 });
+
+    // Switch back to Edit mode
+    const editBtn = Array.from(container.querySelectorAll(".frame-toolbar .segmented button")).find(
+      (b) => b.textContent?.trim() === "Edit",
+    ) as HTMLButtonElement;
+    editBtn.click();
+    await flushUi();
+
+    // 3. Nudge `b-s14-01` on Song A (epoch 1 -> stalled), switch A -> B -> A (epoch 3),
+    //    then nudge `b-s14-01` (+5 ms via Shift+ArrowRight) on Song A BEFORE & AS epoch 1's drain finishes!
+    stageHook.emit?.("select", { kind: "beat", id: "b-s14-01" });
+    await flushUi();
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight" }));
+    await nextTick();
+    expect(releaseEpoch1Nudge).not.toBeNull();
+
+    const songRows = container.querySelectorAll("#tempo-songs .tempo-list-row");
+    // Switch A -> B
+    (songRows[1] as HTMLButtonElement).click();
+    await flushUi();
+    // Switch B -> A while epoch 1's drain is STILL awaiting `releaseEpoch1Nudge`!
+    (songRows[0] as HTMLButtonElement).click();
+    await flushUi();
+
+    // Select `b-s14-01` in epoch 3 and queue two ArrowLeft (-1 ms - 1 ms -> 0.998 s) nudges
+    // so the second sits in queuedEntityNudges while epoch 1's (+1 ms -> 1.001 s) drain wakes up!
+    stageHook.emit?.("select", { kind: "beat", id: "b-s14-01" });
+    await flushUi();
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowLeft" }));
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowLeft" }));
+    // Release epoch 1's old stalled edit so epoch 1's drain wakes up and exits without touching epoch 3's queue!
+    (releaseEpoch1Nudge as (() => void) | null)?.();
+    await flushUi();
+    await flushUi();
+
+    expect(song1.controller.getState().beats.get("b-s14-01")?.timeSec).toBeCloseTo(0.998, 4);
+  });
 });

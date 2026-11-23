@@ -314,17 +314,13 @@ export function computeAuditionWindow(options: {
       return { t0, t1 };
     }
   }
-  const leadBackSec = options.forwardBias ? 4 : 10;
+  if (options.forwardBias) {
+    const t0 = Math.max(0, Math.min(Math.max(0, dur - maxSpan), options.playheadSec - 4));
+    const t1 = Math.min(dur, t0 + maxSpan);
+    return { t0, t1 };
+  }
   const half = maxSpan / 2;
-  let t0 = Math.max(0, options.playheadSec - leadBackSec);
-  let t1 = t0 + maxSpan;
-  if (t1 > dur) {
-    t1 = dur;
-    t0 = Math.max(0, dur - maxSpan);
-  }
-  if (options.playheadSec < t0 || options.playheadSec > t1) {
-    t0 = Math.max(0, Math.min(dur - maxSpan, options.playheadSec - half));
-    t1 = Math.min(dur, t0 + maxSpan);
-  }
+  const t0 = Math.max(0, Math.min(Math.max(0, dur - maxSpan), options.playheadSec - half));
+  const t1 = Math.min(dur, t0 + maxSpan);
   return { t0, t1 };
 }

@@ -595,6 +595,82 @@ class AstraDaemonHardeningTest(unittest.TestCase):
                 self.assertEqual(wf.getframerate(), RATE)
                 self.assertEqual(wf.getnframes(), expected_end - expected_start)
 
+    def test_track_cache_keys_on_audio_sha256_and_stat_inode_fallback(self):
+        import hashlib
+        import os
+
+        with tempfile.TemporaryDirectory() as folder:
+            wav_path = Path(folder) / "cache_key.wav"
+            sig_v1 = click_train(np.array([0.5, 1.0, 1.5, 2.0]), 3.0, rate=RATE)
+            sig_v2 = click_train(np.array([0.33, 0.99, 1.65, 2.31]), 3.0, rate=RATE)
+
+            write_wav(wav_path, sig_v1, rate=RATE)
+            raw_v1 = wav_path.read_bytes()
+            sha_v1 = hashlib.sha256(raw_v1).hexdigest()
+            st_v1 = wav_path.stat()
+
+            server = daemon.DaemonServer(engine=daemon.TempoEngine(backend="dsp"))
+            try:
+                prep1 = server.dispatch_sync(
+                    "prepare", {"audioPath": str(wav_path), "audioSha256": sha_v1}
+                )
+                self.assertEqual(prep1["sampleRate"], RATE)
+                an1 = server.dispatch_sync(
+                    "analyze", {"audioPath": str(wav_path), "audioSha256": sha_v1}
+                )
+                snaps1 = server.dispatch_sync(
+                    "suggest_snaps",
+                    {"audioPath": str(wav_path), "audioSha256": sha_v1, "timeSec": 0.5, "windowSec": 0.1},
+                )
+                self.assertTrue(len(snaps1["candidates"]) >= 1)
+
+                # Overwrite IN-PLACE with identical byte count AND restore exact (atime_ns, mtime_ns)!
+                with open(wav_path, "r+b") as fh:
+                    tmp_v2 = Path(folder) / "tmp_v2.wav"
+                    write_wav(tmp_v2, sig_v2, rate=RATE)
+                    raw_v2 = tmp_v2.read_bytes()
+                    tmp_v2.unlink()
+                    self.assertEqual(len(raw_v1), len(raw_v2))
+                    fh.seek(0)
+                    fh.write(raw_v2)
+                    fh.flush()
+                os.utime(wav_path, ns=(st_v1.st_atime_ns, st_v1.st_mtime_ns))
+                sha_v2 = hashlib.sha256(raw_v2).hexdigest()
+                self.assertNotEqual(sha_v1, sha_v2)
+
+                # With audioSha256=sha_v2, TrackCache MUST miss sha_v1 and decode v2 PCM!
+                snaps_near_v2 = server.dispatch_sync(
+                    "suggest_snaps",
+                    {"audioPath": str(wav_path), "audioSha256": sha_v2, "timeSec": 0.33, "windowSec": 0.05},
+                )
+                self.assertTrue(
+                    any(abs(c["targetSec"] - 0.33) < 0.03 for c in snaps_near_v2["candidates"]),
+                    snaps_near_v2,
+                )
+                an2 = server.dispatch_sync(
+                    "analyze", {"audioPath": str(wav_path), "audioSha256": sha_v2}
+                )
+                self.assertNotEqual(
+                    [b["timeSec"] for b in an1["beats"]],
+                    [b["timeSec"] for b in an2["beats"]],
+                )
+
+                # Also test fallback key (when audioSha256 is omitted) includes st_ctime_ns & st_ino:
+                plain_path = Path(folder) / "plain_stat.wav"
+                write_wav(plain_path, sig_v1, rate=RATE)
+                st_plain = plain_path.stat()
+                entry_a = server.engine.cache.get_or_load(plain_path)
+
+                repl_tmp = Path(folder) / "plain_repl.wav"
+                write_wav(repl_tmp, sig_v2, rate=RATE)
+                os.utime(repl_tmp, ns=(st_plain.st_atime_ns, st_plain.st_mtime_ns))
+                os.replace(repl_tmp, plain_path)
+                entry_b = server.engine.cache.get_or_load(plain_path)
+                self.assertIsNot(entry_a, entry_b)
+                self.assertFalse(np.array_equal(entry_a.pcm, entry_b.pcm))
+            finally:
+                server.close()
+
 
 if __name__ == "__main__":
     unittest.main()
