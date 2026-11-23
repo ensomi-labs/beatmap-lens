@@ -20,9 +20,11 @@ Concurrency architecture:
 from __future__ import annotations
 
 import argparse
+import base64
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+import io
 import json
 import math
 import os
@@ -2181,17 +2183,24 @@ def audition_view(pcm: np.ndarray, sample_rate: int, view: str) -> np.ndarray:
     raise ValueError(f"Unknown audition filter '{view}'; expected one of {AUDITION_FILTERS}")
 
 
+def encode_wav_bytes(samples: np.ndarray, sample_rate: int) -> bytes:
+    pcm16 = (np.clip(samples, -1.0, 1.0) * 32767.0).round().astype("<i2")
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as handle:
+        handle.setnchannels(samples.shape[1])
+        handle.setsampwidth(2)
+        handle.setframerate(sample_rate)
+        handle.writeframes(pcm16.tobytes())
+    return buf.getvalue()
+
+
 def write_wav_atomic(path: str | Path, samples: np.ndarray, sample_rate: int) -> str:
     target = Path(path).resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp = target.parent / f".{target.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp.wav"
-    pcm16 = (np.clip(samples, -1.0, 1.0) * 32767.0).round().astype("<i2")
+    wav_bytes = encode_wav_bytes(samples, sample_rate)
     try:
-        with wave.open(str(tmp), "wb") as handle:
-            handle.setnchannels(samples.shape[1])
-            handle.setsampwidth(2)
-            handle.setframerate(sample_rate)
-            handle.writeframes(pcm16.tobytes())
+        tmp.write_bytes(wav_bytes)
         os.replace(tmp, target)
     except Exception:
         if tmp.exists():
@@ -2594,7 +2603,7 @@ class TempoEngine:
         start_s: float,
         end_s: float,
         filter_name: str,
-        output_path: str | Path,
+        output_path: str | Path | None = None,
         cancel_event: threading.Event | None = None,
         audio_sha256: str | None = None,
     ) -> dict:
@@ -2628,9 +2637,7 @@ class TempoEngine:
         rendered = audition_view(sub_pcm, sr, filter_name)
         _check_cancel(cancel_event)
         trimmed = rendered[actual_lead_samples : actual_lead_samples + exact_count]
-        written = write_wav_atomic(output_path, trimmed, sr)
-        return {
-            "outputPath": written,
+        base_meta = {
             "filter": filter_name,
             "startSec": round(start_sample / float(sr), 9),
             "endSec": round(end_sample / float(sr), 9),
@@ -2639,6 +2646,17 @@ class TempoEngine:
             "sampleRate": sr,
             "channels": ch,
             "elapsedSec": round(time.perf_counter() - started, 4),
+        }
+        if output_path is None or (isinstance(output_path, str) and not output_path.strip()):
+            wav_bytes = encode_wav_bytes(trimmed, sr)
+            return {
+                "wavBase64": base64.b64encode(wav_bytes).decode("ascii"),
+                **base_meta,
+            }
+        written = write_wav_atomic(output_path, trimmed, sr)
+        return {
+            "outputPath": written,
+            **base_meta,
         }
 
 
@@ -2698,7 +2716,18 @@ class DaemonServer:
             )
         if method == "recompute":
             return self.engine.recompute(params, cancel_event=cancel_event)
-        if method in ("render_audition", "export_clip"):
+        if method == "render_audition":
+            raw_out = params.get("outputPath")
+            return self.engine.render_span_wav(
+                params["audioPath"],
+                start_s=float(params["startSec"]),
+                end_s=float(params["endSec"]),
+                filter_name=str(params.get("filter", "mix")),
+                output_path=str(raw_out) if raw_out else None,
+                cancel_event=cancel_event,
+                audio_sha256=audio_sha,
+            )
+        if method == "export_clip":
             return self.engine.render_span_wav(
                 params["audioPath"],
                 start_s=float(params["startSec"]),

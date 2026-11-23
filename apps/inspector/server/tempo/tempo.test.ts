@@ -30,6 +30,8 @@ import {
   computeLegacySampledFingerprint,
   createTempoMiddleware,
   deriveLegacySongId,
+  deriveSongId,
+  MAX_AUDITION_CACHE_ENTRIES,
   SongSessionHost,
   sanitizeTempoErrorMessage,
   TempoDaemonClient,
@@ -904,8 +906,7 @@ describe("Tempo backend (.ensomi-tempo/ workspace, warm daemon, SessionControlle
     expect(audRes.headers.get("x-audition-sample-rate")).toBe("22050");
     await audRes.arrayBuffer();
 
-    const cacheEntries = await readdir(join(customStateDir, ".cache", "audition"));
-    expect(cacheEntries.some((f) => f.endsWith(".wav.meta.json"))).toBe(true);
+    expect(existsSync(join(customStateDir, ".cache"))).toBe(false);
 
     // Symlink inside `clips/` escaping `stateDir` MUST be rejected with 403!
     const secretWav = join(root, "outside-secret.wav");
@@ -1802,5 +1803,579 @@ describe("Tempo backend (.ensomi-tempo/ workspace, warm daemon, SessionControlle
     expect(recoveredWs.songs[0]?.songId).toBe(legacySongId);
     expect(recoveredWs.songs[0]?.ready).toBe(true);
     expect(recoveredWs.songs[0]?.analyzed).toBe(true);
+  });
+
+  it("[Stage 11 #2] serializes trace rotation inside TraceWriter mutex and aborts queued flushes via assertValid before appendFile", {
+    timeout: 20_000,
+  }, async () => {
+    const { wsDir, service, apiJson } = await createTestHarness();
+    const audioPath = join(wsDir, "mutex-rot.wav");
+    const wavV1 = buildSyntheticWav({ durationSec: 4, clickTimesSec: [1.0, 2.0, 3.0] });
+    const wavV2 = buildSyntheticWav({ durationSec: 8, clickTimesSec: [0.5, 1.5, 2.5, 3.5] });
+    await writeFile(audioPath, wavV1);
+
+    const ws = await apiJson<{ songs: TempoSongSummary[] }>("/api/tempo/workspace/open", {
+      method: "POST",
+      body: JSON.stringify({ dir: wsDir }),
+    });
+    const song = ws.songs[0] as TempoSongSummary;
+    const songId = song.songId;
+    const stateDir = service.store.currentStateDir as string;
+    const tracePath = service.store.tracePathFor(songId);
+
+    // Create a host bound to wavV1 and flush initial seq:0 edit.
+    const ctrl = new SessionController({
+      provider: new ScriptedMockProvider(),
+      durationSec: 4,
+    });
+    cleanups.push(async () => ctrl.close());
+    const hostV1 = new SongSessionHost({
+      songId,
+      boundStateDir: stateDir,
+      boundWorkspaceDir: wsDir,
+      tracePath,
+      boundAudioSha256: song.audioSha256,
+      boundTraceEpoch: service.store.traceEpochFor(songId),
+      store: service.store,
+      controller: ctrl,
+      persistedCount: 0,
+      traceWriter: service.store.traceWriter,
+    });
+    ctrl.applyEdit({ op: "upsert_beat", beat: { id: "b_v1_ok", timeSec: 1.0, source: "user" } });
+    await hostV1.flushTrace();
+    expect(existsSync(tracePath)).toBe(true);
+
+    // Hold TraceWriter's per-tracePath mutex busy with a blocker op, queue a stale hostV1 flush,
+    // AND rotate the trace via verifySongAudioFreshness while queued!
+    let releaseMutex = () => {};
+    const mutexGate = new Promise<void>((r) => {
+      releaseMutex = r;
+    });
+    const blockingCtrl = new SessionController({
+      provider: new ScriptedMockProvider(),
+      initialEvents: ctrl.getState().events,
+    });
+    cleanups.push(async () => blockingCtrl.close());
+    blockingCtrl.applyEdit({
+      op: "upsert_beat",
+      beat: { id: "b_v1_inflight", timeSec: 2.0, source: "user" },
+    });
+    const blockingDelta = blockingCtrl.getState().events.slice(1);
+
+    let enteredBlocker = () => {};
+    const blockerEntered = new Promise<void>((r) => {
+      enteredBlocker = r;
+    });
+    const tailsMap = (
+      service.store.traceWriter as unknown as { tails: Map<string, Promise<unknown>> }
+    ).tails;
+    const lockKey = tracePath;
+    const gatePromise = Promise.resolve().then(async () => {
+      enteredBlocker();
+      await mutexGate;
+    });
+    tailsMap.set(lockKey, gatePromise);
+
+    await blockerEntered;
+
+    // Queue a valid pre-rotation append, then rotate, then a stale hostV1 flush!
+    const preRotAppend = service.store.traceWriter.append(tracePath, blockingDelta, {
+      expectedStateDir: stateDir,
+    });
+
+    // Stage stale event on hostV1 and start flushTrace() BEFORE rotation bumps traceEpoch,
+    // so flushTrace() enters traceWriter.append and waits on the per-file mutex!
+    ctrl.applyEdit({
+      op: "upsert_beat",
+      beat: { id: "b_v1_stale_after_rot", timeSec: 3.0, source: "user" },
+    });
+    const queuedStaleFlush = hostV1.flushTrace();
+
+    // Now overwrite audio with wavV2 and trigger rotation (bumps epoch + queues traceWriter.rotate)!
+    await writeFile(audioPath, wavV2);
+    const rotPromise = service.store.verifySongAudioFreshness(songId);
+
+    // Wait a tick so verifySongAudioFreshness bumps epoch and queues rotate behind queuedStaleFlush (or vice versa),
+    // AND also queue a post-rotation append with hostV1's assertValid AFTER rotate in the mutex!
+    await new Promise((r) => setTimeout(r, 20));
+    const postRotAppend = service.store.traceWriter.append(tracePath, blockingDelta, {
+      expectedStateDir: stateDir,
+      assertValid: () => hostV1.assertValidBeforeWrite(),
+    });
+
+    releaseMutex();
+
+    await preRotAppend;
+    await expect(queuedStaleFlush).rejects.toMatchObject({ name: "ConflictError" });
+    const rotResult = await rotPromise;
+    expect(rotResult.rotated).toBe(true);
+    expect(rotResult.backupPath).toBeDefined();
+    await expect(postRotAppend).rejects.toMatchObject({ name: "ConflictError" });
+
+    // Critical invariant: `<songId>.jsonl` MUST NOT exist after rotation, and backup has zero stale post-rotation events!
+    expect(existsSync(tracePath)).toBe(false);
+    const backupEvents = parseTraceNdjson(await readFile(rotResult.backupPath as string, "utf8"));
+    expect(backupEvents.map((e) => e.seq)).toEqual([0, 1]);
+    expect(foldTrace(backupEvents).beats.has("b_v1_stale_after_rot")).toBe(false);
+  });
+
+  it("[Stage 11 #3] defers traceEpoch on persist:false scans, ignores stale .jsonl on GET /songs/:songId without caching a host, and advances epoch + rotates on first mutating POST", {
+    timeout: 20_000,
+  }, async () => {
+    const { root, origin, service, apiJson } = await createTestHarness();
+    const deferredDir = join(root, "deferred-rot-ws");
+    await mkdir(deferredDir, { recursive: true });
+    const audioPath = join(deferredDir, "deferred.wav");
+    const wavV1 = buildSyntheticWav({ durationSec: 4, clickTimesSec: [1.0, 2.0, 3.0] });
+    const wavV2 = buildSyntheticWav({ durationSec: 9, clickTimesSec: [0.5, 1.5, 2.5, 3.5] });
+    await writeFile(audioPath, wavV1);
+
+    const openedV1 = await apiJson<{ songs: TempoSongSummary[] }>("/api/tempo/workspace/open", {
+      method: "POST",
+      body: JSON.stringify({ dir: deferredDir }),
+    });
+    const songId = openedV1.songs[0]?.songId ?? "";
+    await apiJson(`/api/tempo/songs/${songId}/open`, { method: "POST", body: "{}" });
+    await apiJson(`/api/tempo/songs/${songId}/edit`, {
+      method: "POST",
+      body: JSON.stringify({
+        op: "upsert_beat",
+        beat: { id: "beat_stale_v1", timeSec: 1.5, source: "user" },
+      }),
+    });
+    await apiJson(`/api/tempo/songs/${songId}/edit`, {
+      method: "POST",
+      body: JSON.stringify({ action: "ready", ready: true }),
+    });
+
+    expect(service.store.traceEpochFor(songId)).toBe(0);
+    expect(service.activeHostCount).toBe(1);
+    const tracesDir = join(deferredDir, ".ensomi-tempo", "traces");
+
+    // Overwrite audio with wavV2 on disk, then run read-only `GET /api/tempo/workspace?dir=...` (`persist: false`)!
+    await writeFile(audioPath, wavV2);
+    const getWs = await apiJson<{ songs: TempoSongSummary[] }>(
+      `/api/tempo/workspace?dir=${encodeURIComponent(deferredDir)}`,
+    );
+    expect(service.store.traceEpochFor(songId)).toBe(0);
+    expect(getWs.songs[0]?.pendingTraceRotation).toBe(true);
+    expect(getWs.songs[0]?.ready).toBe(false);
+    expect(getWs.songs[0]?.analyzed).toBe(false);
+    expect(await readdir(tracesDir)).toEqual([`${songId}.jsonl`]);
+
+    // Also verify on a cold read-only service that GET /songs/:songId ignores stale .jsonl AND caches ZERO hosts!
+    const coldReadHarness = await createTestHarness(deferredDir);
+    const coldWsRes = await fetch(`${coldReadHarness.origin}/api/tempo/workspace`);
+    expect(coldWsRes.status).toBe(200);
+    const coldWsBody = (await coldWsRes.json()) as { songs: TempoSongSummary[] };
+    expect(coldWsBody.songs[0]?.pendingTraceRotation).toBe(true);
+    expect(coldReadHarness.service.store.traceEpochFor(songId)).toBe(0);
+
+    const coldSongRes = await fetch(`${coldReadHarness.origin}/api/tempo/songs/${songId}`);
+    expect(coldSongRes.status).toBe(200);
+    const coldSongBody = (await coldSongRes.json()) as {
+      song: TempoSongSummary;
+      state: ReturnType<typeof serializeState>;
+    };
+    expect(coldSongBody.state.beats).toEqual([]);
+    expect(coldSongBody.state.ready).toBe(false);
+    expect(coldSongBody.song.ready).toBe(false);
+    expect(coldReadHarness.service.activeHostCount).toBe(0);
+    expect(coldReadHarness.service.store.traceEpochFor(songId)).toBe(0);
+    expect(await readdir(tracesDir)).toEqual([`${songId}.jsonl`]);
+
+    // Also verify GET /songs/:songId on `service` (which STILL has the prior v1 host in `hosts`!) ignores stale v1!
+    const liveGetSongRes = await fetch(`${origin}/api/tempo/songs/${songId}`);
+    expect(liveGetSongRes.status).toBe(200);
+    const liveGetSongBody = (await liveGetSongRes.json()) as {
+      state: ReturnType<typeof serializeState>;
+    };
+    expect(liveGetSongBody.state.beats).toEqual([]);
+    expect(liveGetSongBody.state.ready).toBe(false);
+    expect(service.store.traceEpochFor(songId)).toBe(0);
+    expect(await readdir(tracesDir)).toEqual([`${songId}.jsonl`]);
+
+    // Now execute the first mutating POST (`/edit`): MUST advance traceEpoch to 1, invalidate prior host,
+    // rotate stale `<songId>.jsonl` -> `.superseded-*.bak`, and write ONLY the fresh v2 edit!
+    const postMut = await apiJson<{
+      song: TempoSongSummary;
+      state: ReturnType<typeof serializeState>;
+    }>(`/api/tempo/songs/${songId}/edit`, {
+      method: "POST",
+      body: JSON.stringify({
+        op: "upsert_beat",
+        beat: { id: "beat_fresh_v2", timeSec: 2.25, source: "user" },
+      }),
+    });
+    expect(service.store.traceEpochFor(songId)).toBe(1);
+    expect(service.store.getSong(songId).pendingTraceRotation).toBeUndefined();
+    expect(postMut.state.beats.map((b) => b.id)).toEqual(["beat_fresh_v2"]);
+    expect(postMut.state.ready).toBe(false);
+
+    const filesAfterPost = await readdir(tracesDir);
+    expect(filesAfterPost.some((f) => f === `${songId}.jsonl`)).toBe(true);
+    expect(
+      filesAfterPost.some((f) => f.startsWith(`${songId}.jsonl.superseded-`) && f.endsWith(".bak")),
+    ).toBe(true);
+    const freshEvents = await service.store.traceWriter.read(join(tracesDir, `${songId}.jsonl`));
+    expect(freshEvents.length).toBe(1);
+    expect(foldTrace(freshEvents).beats.has("beat_stale_v1")).toBe(false);
+    expect(foldTrace(freshEvents).beats.has("beat_fresh_v2")).toBe(true);
+  });
+
+  it("[Stage 11 #4] re-checks expectedStateDir & expectedWorkspaceDir inside store lock for importUploadedStream, importUploadedBuffer, importPaths, and updateSongFromState", {
+    timeout: 20_000,
+  }, async () => {
+    const { root, origin, service, apiJson } = await createTestHarness();
+    const { request: httpRequest } = await import("node:http");
+
+    const wsA = join(root, "guard-ws-a");
+    const wsB = join(root, "guard-ws-b");
+    const extDir = join(root, "guard-external");
+    await mkdir(wsA, { recursive: true });
+    await mkdir(wsB, { recursive: true });
+    await mkdir(extDir, { recursive: true });
+
+    const wavBytes = buildSyntheticWav({ durationSec: 3, clickTimesSec: [0.5, 1.5, 2.5] });
+    await writeFile(join(wsA, "seed-a.wav"), wavBytes);
+    await writeFile(join(wsB, "seed-b.wav"), wavBytes);
+    const extWav = join(extDir, "copied-ext.wav");
+    await writeFile(extWav, wavBytes);
+
+    await apiJson("/api/tempo/workspace/open", {
+      method: "POST",
+      body: JSON.stringify({ dir: wsA }),
+    });
+    const targetA = service.store.captureTarget();
+
+    // 1. Mid-stream workspace switch during binary `POST /api/tempo/workspace/upload?name=midstream.wav`:
+    //    must unlink temp file, NOT publish `midstream.wav` into wsA or wsB, and return 409 Conflict!
+    const midStreamUpload = await new Promise<{
+      statusCode: number;
+      body: Record<string, unknown>;
+    }>((resolveReq, rejectReq) => {
+      const parsedOrigin = new URL(origin);
+      const req = httpRequest(
+        {
+          hostname: parsedOrigin.hostname,
+          port: Number(parsedOrigin.port),
+          path: "/api/tempo/workspace/upload?name=midstream.wav",
+          method: "POST",
+          headers: {
+            "Content-Type": "audio/wav",
+            "X-Beatmap-Lens-Local": "1",
+          },
+        },
+        (res) => {
+          const chunks: Buffer[] = [];
+          res.on("data", (c: Buffer) => chunks.push(c));
+          res.on("end", () => {
+            resolveReq({
+              statusCode: res.statusCode ?? 0,
+              body: JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>,
+            });
+          });
+        },
+      );
+      req.on("error", rejectReq);
+      const half = Math.floor(wavBytes.length / 2);
+      req.write(wavBytes.subarray(0, half), () => {
+        void (async () => {
+          await new Promise((r) => setTimeout(r, 25));
+          await apiJson("/api/tempo/workspace/open", {
+            method: "POST",
+            body: JSON.stringify({ dir: wsB }),
+          });
+          req.end(wavBytes.subarray(half));
+        })().catch(rejectReq);
+      });
+    });
+    expect(midStreamUpload.statusCode).toBe(409);
+    expect(midStreamUpload.body.name).toBe("ConflictError");
+    expect((await readdir(wsA)).filter((f) => f !== ".ensomi-tempo")).toEqual(["seed-a.wav"]);
+    expect((await readdir(wsB)).filter((f) => f !== ".ensomi-tempo")).toEqual(["seed-b.wav"]);
+
+    // 2. `importUploadedBuffer` rejected with ConflictError & unlinks temp file if workspace mismatches inside lock!
+    await expect(
+      service.store.importUploadedBuffer("buffer-race.wav", wavBytes, {
+        target: targetA,
+        expectedStateDir: targetA.stateDir,
+        expectedWorkspaceDir: targetA.workspaceDir,
+      }),
+    ).rejects.toMatchObject({ name: "ConflictError" });
+    expect((await readdir(wsA)).filter((f) => f !== ".ensomi-tempo")).toEqual(["seed-a.wav"]);
+
+    // 3. `importPaths` with `copyIntoWorkspace: true` rejected with ConflictError & zero copied files when workspace switched!
+    await expect(
+      service.store.importPaths({
+        paths: [extWav],
+        copyIntoWorkspace: true,
+        target: targetA,
+        expectedStateDir: targetA.stateDir,
+        expectedWorkspaceDir: targetA.workspaceDir,
+      }),
+    ).rejects.toMatchObject({ name: "ConflictError" });
+    expect((await readdir(wsA)).filter((f) => f !== ".ensomi-tempo")).toEqual(["seed-a.wav"]);
+
+    // 4. `updateSongFromState` with shared songId across workspaces rejects with ConflictError instead of mutating wsB!
+    const fpB = await computeAudioFingerprint(join(wsB, "seed-b.wav"));
+    const canonicalWsB = await realpath(wsB);
+    await writeFile(
+      join(wsB, ".ensomi-tempo", "workspace.json"),
+      JSON.stringify({
+        schemaVersion: 1,
+        workspaceDir: canonicalWsB,
+        activeSongId: "shared-guard-song",
+        songs: [
+          {
+            songId: "shared-guard-song",
+            title: "seed-b",
+            fileName: "seed-b.wav",
+            audioPath: await realpath(join(wsB, "seed-b.wav")),
+            audioSizeBytes: fpB.audioSizeBytes,
+            audioSha256: fpB.audioSha256,
+            audioSha256Sample: fpB.audioSha256Sample,
+            durationSec: 3,
+            analyzed: false,
+            segmentCount: 0,
+            keptSegmentCount: 0,
+            inboxCount: 0,
+            highestPriority: null,
+            ready: false,
+            updatedAtMs: 1000,
+          },
+        ],
+      }),
+    );
+    await apiJson("/api/tempo/workspace/open", {
+      method: "POST",
+      body: JSON.stringify({ dir: wsB }),
+    });
+    const fakeCtrlA = new SessionController({
+      provider: new ScriptedMockProvider(),
+      durationSec: 3,
+    });
+    fakeCtrlA.markReady("ready in A");
+    cleanups.push(async () => fakeCtrlA.close());
+
+    await expect(
+      service.store.updateSongFromState("shared-guard-song", fakeCtrlA.getState(), undefined, {
+        expectedStateDir: targetA.stateDir,
+        expectedWorkspaceDir: targetA.workspaceDir,
+      }),
+    ).rejects.toMatchObject({ name: "ConflictError" });
+    expect(service.store.getSong("shared-guard-song").ready).toBe(false);
+  });
+
+  it("[Stage 11 #5] renders GET /audition strictly in memory with 12-entry LRU cache (zero disk writes) while POST /export clip writes to clips/", {
+    timeout: 25_000,
+  }, async () => {
+    expect(MAX_AUDITION_CACHE_ENTRIES).toBe(12);
+    const { root, wsDir: coldDir, origin, service, apiJson } = await createTestHarness();
+    const wavBytes = buildSyntheticWav({
+      durationSec: 16,
+      clickTimesSec: regularClicks(0.5, 15.5, 1.0),
+      channels: 2,
+    });
+    await writeFile(join(coldDir, "audition-mem.wav"), wavBytes);
+
+    const tmpBefore = new Set(
+      (await readdir(tmpdir())).filter((n) => n.startsWith("ensomi-audition-")),
+    );
+
+    // 1. Cold workspace GET /audition + Range 206 + HEAD -> ZERO disk files/dirs created!
+    const coldWs = (await (await fetch(`${origin}/api/tempo/workspace`)).json()) as {
+      songs: TempoSongSummary[];
+    };
+    const songId = coldWs.songs[0]?.songId ?? "";
+
+    const origRender = service.daemon.renderAudition.bind(service.daemon);
+    let renderCalls = 0;
+    const seenOutputPaths: Array<string | undefined> = [];
+    (service.daemon as { renderAudition: unknown }).renderAudition = (
+      params: { outputPath?: string | undefined },
+      sig?: AbortSignal,
+    ) => {
+      renderCalls += 1;
+      seenOutputPaths.push(params.outputPath);
+      return origRender(params as never, sig);
+    };
+
+    const fullAud = await fetch(
+      `${origin}/api/tempo/songs/${songId}/audition?t0=0.5&t1=1.5&filter=mix`,
+    );
+    expect(fullAud.status).toBe(200);
+    const fullWav = Buffer.from(await fullAud.arrayBuffer());
+    expect(fullWav.subarray(0, 4).toString("ascii")).toBe("RIFF");
+    expect(renderCalls).toBe(1);
+    expect(seenOutputPaths).toEqual([undefined]);
+
+    // Repeat GET + Range 206 + HEAD hit in-memory LRU cache with zero daemon calls!
+    const rangeAud = await fetch(
+      `${origin}/api/tempo/songs/${songId}/audition?t0=0.5&t1=1.5&filter=mix`,
+      { headers: { Range: "bytes=0-43" } },
+    );
+    expect(rangeAud.status).toBe(206);
+    expect(Buffer.from(await rangeAud.arrayBuffer()).byteLength).toBe(44);
+
+    const headAud = await fetch(
+      `${origin}/api/tempo/songs/${songId}/audition?t0=0.5&t1=1.5&filter=mix`,
+      { method: "HEAD" },
+    );
+    expect(headAud.status).toBe(200);
+    expect(headAud.headers.get("content-length")).toBe(String(fullWav.byteLength));
+    expect(renderCalls).toBe(1);
+
+    expect(existsSync(join(coldDir, ".ensomi-tempo"))).toBe(false);
+    expect(await readdir(coldDir)).toEqual(["audition-mem.wav"]);
+    const tmpAfterCold = (await readdir(tmpdir())).filter(
+      (n) => n.startsWith("ensomi-audition-") && !tmpBefore.has(n),
+    );
+    expect(tmpAfterCold).toEqual([]);
+
+    // 2. Open workspace (`persist: true`) and exercise 13 distinct slices to verify LRU cap = 12 & zero `.cache` dir!
+    await apiJson("/api/tempo/workspace/open", {
+      method: "POST",
+      body: JSON.stringify({ dir: coldDir }),
+    });
+    const stateDir = service.store.currentStateDir as string;
+
+    // Slice 0 (`[0.5, 1.5)`) is already cached (#1). Render slices 1..11 (11 more -> total 12 entries).
+    for (let i = 1; i <= 11; i += 1) {
+      const r = await fetch(
+        `${origin}/api/tempo/songs/${songId}/audition?t0=${i}&t1=${i + 0.5}&filter=mix`,
+      );
+      expect(r.status).toBe(200);
+      await r.arrayBuffer();
+    }
+    expect(renderCalls).toBe(12);
+
+    // Touch slice 0 (`[0.5, 1.5)`) so slice 1 (`[1, 1.5)`) becomes least-recently-used, then render slice 12!
+    await (
+      await fetch(`${origin}/api/tempo/songs/${songId}/audition?t0=0.5&t1=1.5&filter=mix`)
+    ).arrayBuffer();
+    expect(renderCalls).toBe(12);
+
+    await (
+      await fetch(`${origin}/api/tempo/songs/${songId}/audition?t0=12&t1=12.5&filter=mix`)
+    ).arrayBuffer();
+    expect(renderCalls).toBe(13);
+
+    // Slice 0 is STILL cached (no new render), whereas evicted slice 1 re-renders!
+    await (
+      await fetch(`${origin}/api/tempo/songs/${songId}/audition?t0=0.5&t1=1.5&filter=mix`)
+    ).arrayBuffer();
+    expect(renderCalls).toBe(13);
+
+    await (
+      await fetch(`${origin}/api/tempo/songs/${songId}/audition?t0=1&t1=1.5&filter=mix`)
+    ).arrayBuffer();
+    expect(renderCalls).toBe(14);
+
+    // Zero `.cache`, `.wav`, or `.meta.json` created inside `.ensomi-tempo` by GET /audition!
+    expect(existsSync(join(stateDir, ".cache"))).toBe(false);
+    expect(await readdir(join(stateDir, "clips"))).toEqual([]);
+
+    // 3. POST /export with `format: "clip"` continues writing `.wav` to `.ensomi-tempo/clips/`!
+    const clipExport = await apiJson<{ clipPath: string; fileName: string }>(
+      `/api/tempo/songs/${songId}/export`,
+      {
+        method: "POST",
+        body: JSON.stringify({ format: "clip", t0: 0.5, t1: 1.5, filter: "mix" }),
+      },
+    );
+    expect(existsSync(clipExport.clipPath)).toBe(true);
+    expect(await readdir(join(stateDir, "clips"))).toEqual([clipExport.fileName]);
+    void root;
+  });
+
+  it("[Stage 11 #6] checks exact <newSongId>.jsonl and <legacyRealpathSongId>.jsonl before alias stem filtering in manifest-missing recovery", {
+    timeout: 20_000,
+  }, async () => {
+    const { root, apiJson } = await createTestHarness();
+    const sharedSourceDir = join(root, "canonical-sources");
+    await mkdir(sharedSourceDir, { recursive: true });
+    const originalWav = join(sharedSourceDir, "original.wav");
+    await writeFile(
+      originalWav,
+      buildSyntheticWav({ durationSec: 6, clickTimesSec: [1.0, 2.0, 3.0, 4.0, 5.0] }),
+    );
+    const canonicalOriginal = await realpath(originalWav);
+
+    // 1. Symlink `alias.wav -> original.wav` with `<legacyRealpathSongId>.jsonl` (`original-<sha256_8>.jsonl`)
+    //    PLUS an unrelated `alias-00000000.jsonl` distraction in `traces/`, and NO `workspace.json`!
+    const wsLegacySym = join(root, "ws-symlink-legacy-id");
+    await mkdir(join(wsLegacySym, ".ensomi-tempo", "traces"), { recursive: true });
+    await symlink(canonicalOriginal, join(wsLegacySym, "alias.wav"));
+    const canonicalWsLegacy = await realpath(wsLegacySym);
+    const legacyRealpathId = deriveLegacySongId(canonicalWsLegacy, canonicalOriginal);
+    expect(legacyRealpathId.startsWith("original-")).toBe(true);
+
+    const realpathCtrl = new SessionController({ provider: new ScriptedMockProvider() });
+    await realpathCtrl.bindAudio({ songId: legacyRealpathId, durationSec: 6, sampleRate: 22050 });
+    realpathCtrl.loadDraft({
+      beats: [{ id: "b_from_realpath_legacy", timeSec: 1.0, source: "user" }],
+    });
+    realpathCtrl.markReady("verified via realpath legacy id");
+    await writeFile(
+      join(wsLegacySym, ".ensomi-tempo", "traces", `${legacyRealpathId}.jsonl`),
+      realpathCtrl.exportNdjson(),
+      "utf8",
+    );
+
+    const distractionCtrl = new SessionController({ provider: new ScriptedMockProvider() });
+    await distractionCtrl.bindAudio({
+      songId: "alias-00000000",
+      durationSec: 6,
+      sampleRate: 22050,
+    });
+    await writeFile(
+      join(wsLegacySym, ".ensomi-tempo", "traces", "alias-00000000.jsonl"),
+      distractionCtrl.exportNdjson(),
+      "utf8",
+    );
+
+    const recoveredLegacy = await apiJson<{ songs: TempoSongSummary[] }>(
+      "/api/tempo/workspace/open",
+      {
+        method: "POST",
+        body: JSON.stringify({ dir: wsLegacySym }),
+      },
+    );
+    expect(recoveredLegacy.songs.length).toBe(1);
+    expect(recoveredLegacy.songs[0]?.songId).toBe(legacyRealpathId);
+    expect(recoveredLegacy.songs[0]?.ready).toBe(true);
+    expect(recoveredLegacy.songs[0]?.analyzed).toBe(true);
+
+    // 2. Symlink `alias.wav -> original.wav` with `<newSongId>.jsonl` (`original-<sha1_8>.jsonl`)
+    //    PLUS `alias-11111111.jsonl` in `traces/`, and NO `workspace.json`!
+    const wsNewSym = join(root, "ws-symlink-new-id");
+    await mkdir(join(wsNewSym, ".ensomi-tempo", "traces"), { recursive: true });
+    await symlink(canonicalOriginal, join(wsNewSym, "alias.wav"));
+    const canonicalWsNew = await realpath(wsNewSym);
+    const newRealpathId = deriveSongId(canonicalWsNew, canonicalOriginal);
+    expect(newRealpathId.startsWith("original-")).toBe(true);
+
+    const newIdCtrl = new SessionController({ provider: new ScriptedMockProvider() });
+    await newIdCtrl.bindAudio({ songId: newRealpathId, durationSec: 6, sampleRate: 22050 });
+    newIdCtrl.markReady("verified via new realpath id");
+    await writeFile(
+      join(wsNewSym, ".ensomi-tempo", "traces", `${newRealpathId}.jsonl`),
+      newIdCtrl.exportNdjson(),
+      "utf8",
+    );
+    await writeFile(
+      join(wsNewSym, ".ensomi-tempo", "traces", "alias-11111111.jsonl"),
+      distractionCtrl.exportNdjson(),
+      "utf8",
+    );
+
+    const recoveredNew = await apiJson<{ songs: TempoSongSummary[] }>("/api/tempo/workspace/open", {
+      method: "POST",
+      body: JSON.stringify({ dir: wsNewSym }),
+    });
+    expect(recoveredNew.songs.length).toBe(1);
+    expect(recoveredNew.songs[0]?.songId).toBe(newRealpathId);
+    expect(recoveredNew.songs[0]?.ready).toBe(true);
   });
 });

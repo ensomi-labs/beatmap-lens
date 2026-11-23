@@ -1,8 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
-import { createReadStream, existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, realpath, rm, stat } from "node:fs/promises";
+import { createReadStream } from "node:fs";
+import { mkdir, realpath, stat } from "node:fs/promises";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { tmpdir } from "node:os";
 import { basename, extname, join } from "node:path";
 import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
@@ -37,17 +36,19 @@ import {
 } from "./daemon-client.ts";
 import {
   assertValidSongId,
-  atomicWriteJson,
+  type ExpectedWorkspaceGuard,
   isSupportedAudioFileName,
   slugifySongStem,
   type TempoSongSummary,
   type TempoWorkspaceManifest,
   TempoWorkspaceStore,
+  type TraceAppendOptions,
   type WorkspaceTarget,
 } from "./workspace-store.ts";
 
 export const TEMPO_API_PREFIX = "/api/tempo";
 export const MAX_AUDITION_SPAN_SEC = 60;
+export const MAX_AUDITION_CACHE_ENTRIES = 12;
 export const DEFAULT_MAX_ACTIVE_HOSTS = 8;
 
 const repoRoot = fileURLToPath(new URL("../../../..", import.meta.url));
@@ -209,6 +210,7 @@ export class SongSessionHost {
   readonly songId: string;
   readonly stateDir: string;
   readonly boundStateDir: string;
+  readonly boundWorkspaceDir: string;
   readonly tracePath: string;
   readonly boundFingerprint: string;
   readonly boundAudioSha256: string;
@@ -227,6 +229,7 @@ export class SongSessionHost {
     songId: string;
     stateDir?: string;
     boundStateDir?: string;
+    boundWorkspaceDir?: string;
     tracePath: string;
     boundFingerprint?: string;
     boundAudioSha256?: string;
@@ -244,6 +247,7 @@ export class SongSessionHost {
     this.songId = options.songId;
     this.stateDir = resolvedStateDir;
     this.boundStateDir = resolvedStateDir;
+    this.boundWorkspaceDir = options.boundWorkspaceDir ?? "";
     this.tracePath = options.tracePath;
     this.boundFingerprint = resolvedSha;
     this.boundAudioSha256 = resolvedSha;
@@ -265,11 +269,12 @@ export class SongSessionHost {
     if (this.disposed || this.controller.isClosed()) return false;
     if (!this.store) return true;
     if (this.store.currentStateDir !== this.boundStateDir) return false;
-    if (this.store.traceEpochFor(this.songId, this.boundStateDir) !== this.boundTraceEpoch) {
+    if (this.store.traceEpochFor(this.songId) !== this.boundTraceEpoch) {
       return false;
     }
     try {
       const liveSong = this.store.getSong(this.songId);
+      if (liveSong.pendingTraceRotation && this.healedOnDisk) return false;
       if (this.boundAudioSha256.length > 0 && liveSong.audioSha256 !== this.boundAudioSha256) {
         return false;
       }
@@ -279,28 +284,52 @@ export class SongSessionHost {
     return true;
   }
 
+  assertValidBeforeWrite(): void {
+    if (this.disposed || this.controller.isClosed()) {
+      throw makeWorkspaceConflictError("Song session was closed before trace write.");
+    }
+    if (!this.store) return;
+    if (
+      this.store.currentStateDir !== this.boundStateDir ||
+      this.store.traceEpochFor(this.songId) !== this.boundTraceEpoch
+    ) {
+      throw makeWorkspaceConflictError("Song audio or active workspace changed — reopen song.");
+    }
+    let liveSong: TempoSongSummary;
+    try {
+      liveSong = this.store.getSong(this.songId);
+    } catch {
+      throw makeWorkspaceConflictError("Song audio or active workspace changed — reopen song.");
+    }
+    if (
+      liveSong.pendingTraceRotation ||
+      (this.boundAudioSha256.length > 0 && liveSong.audioSha256 !== this.boundAudioSha256)
+    ) {
+      throw makeWorkspaceConflictError("Song audio or active workspace changed — reopen song.");
+    }
+  }
+
   /**
    * Serializes `.jsonl` persistence across concurrent edits via `this.flushChain`.
    * Advances `this.persistedCount` ONLY after `traceWriter.append` resolves, keeping
    * `this.flushChain` alive on failure so subsequent flushes retry the full unsaved suffix.
-   * Aborts without writing a single byte if this host was disposed or its trace rotated!
+   * Validates `assertValid` inside `TraceWriter`'s per-file mutex immediately before `appendFile`!
    */
   flushTrace(): Promise<void> {
     if (!this.isCurrent()) {
       return Promise.resolve();
     }
     const task = this.flushChain.then(async () => {
-      if (!this.isCurrent()) return;
       const allEvents = this.controller.getState().events;
       if (allEvents.length <= this.persistedCount) return;
       const delta = allEvents.slice(this.persistedCount);
       if (delta.length === 0) return;
-      if (!this.isCurrent()) return;
-      await this.traceWriter.append(
-        this.tracePath,
-        delta,
-        this.boundStateDir.length > 0 ? this.boundStateDir : undefined,
-      );
+      this.assertValidBeforeWrite();
+      const appendOptions: TraceAppendOptions = {
+        ...(this.boundStateDir.length > 0 ? { expectedStateDir: this.boundStateDir } : {}),
+        assertValid: () => this.assertValidBeforeWrite(),
+      };
+      await this.traceWriter.append(this.tracePath, delta, appendOptions);
       this.persistedCount = allEvents.length;
       this.healedOnDisk = true;
     });
@@ -518,6 +547,54 @@ async function streamFileWithRange(
   }
 }
 
+function sendBufferWithRange(
+  request: IncomingMessage,
+  response: ServerResponse,
+  buffer: Buffer,
+  contentType: string,
+  extraHeaders?: Record<string, string>,
+): void {
+  const totalSize = buffer.byteLength;
+  response.setHeader("Accept-Ranges", "bytes");
+  response.setHeader("Content-Type", contentType);
+  if (extraHeaders) {
+    for (const [key, val] of Object.entries(extraHeaders)) {
+      response.setHeader(key, val);
+    }
+  }
+
+  const rangeHeader = request.headers.range;
+  if (typeof rangeHeader === "string" && rangeHeader.length > 0) {
+    const parsed = parseHttpByteRange(rangeHeader, totalSize);
+    if (parsed === "unsatisfiable") {
+      response.statusCode = 416;
+      response.setHeader("Content-Range", `bytes */${totalSize}`);
+      response.end();
+      return;
+    }
+    if (parsed !== null) {
+      const chunkLen = parsed.end - parsed.start + 1;
+      response.statusCode = 206;
+      response.setHeader("Content-Range", `bytes ${parsed.start}-${parsed.end}/${totalSize}`);
+      response.setHeader("Content-Length", String(chunkLen));
+      if (request.method === "HEAD") {
+        response.end();
+        return;
+      }
+      response.end(buffer.subarray(parsed.start, parsed.end + 1));
+      return;
+    }
+  }
+
+  response.statusCode = 200;
+  response.setHeader("Content-Length", String(totalSize));
+  if (request.method === "HEAD") {
+    response.end();
+    return;
+  }
+  response.end(buffer);
+}
+
 function parseFiniteNumber(value: unknown, label: string): number {
   const num = typeof value === "string" && value.trim() !== "" ? Number(value) : value;
   if (typeof num !== "number" || !Number.isFinite(num)) {
@@ -588,8 +665,13 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
     initialKind: env.TEMPO_ANALYZER_BACKEND === "dsp" ? "rule" : "model",
   });
 
+  interface CachedAuditionEntry extends AuditionRenderMeta {
+    wavBytes: Buffer;
+  }
+
   const hosts = new Map<string, SongSessionHost>();
   const hostInitLocks = new Map<string, Promise<SongSessionHost>>();
+  const auditionCache = new Map<string, CachedAuditionEntry>();
 
   store.setOnTraceRotated((stateDir, songId) => {
     const key = `${stateDir}::${songId}`;
@@ -663,8 +745,12 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
     for (const [key, host] of hosts) {
       if (hosts.size <= maxActiveHosts) break;
       if (key === protectKey || !host.isIdle()) continue;
-      if (allowDiskFlush && store.isPersistedToDisk) {
-        await host.flushTrace();
+      if (allowDiskFlush && store.isPersistedToDisk && host.isCurrent()) {
+        await host.flushTrace().catch((err) => {
+          if ((err as { name?: string } | null)?.name !== "ConflictError") {
+            throw err;
+          }
+        });
       }
       if (
         hosts.size > maxActiveHosts &&
@@ -733,6 +819,9 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
       const expanded = fullPath(explicitDir);
       const canonicalExplicit = await realpath(expanded).catch(() => expanded);
       if (store.isOpen && store.currentWorkspaceDir === canonicalExplicit && !explicitStateDir) {
+        if (!store.isPersistedToDisk) {
+          await store.persistCurrentWorkspace();
+        }
         return {
           manifest: store.getSnapshot() as TempoWorkspaceManifest,
           target: store.captureTarget(),
@@ -907,6 +996,26 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
     };
 
     const song = store.getSong(songId);
+    if (song.pendingTraceRotation) {
+      const tempController = new SessionController({
+        provider,
+        ...(options.triggerPolicy ? { triggerPolicy: options.triggerPolicy } : {}),
+      });
+      return new SongSessionHost({
+        songId,
+        boundStateDir: stateDir,
+        boundWorkspaceDir: workspaceDir,
+        tracePath: await store.resolveContainedStatePath("traces", `${songId}.jsonl`),
+        boundAudioSha256: song.audioSha256,
+        boundTraceEpoch: store.traceEpochFor(songId, stateDir),
+        healedOnDisk: false,
+        store,
+        controller: tempController,
+        persistedCount: 0,
+        traceWriter: store.traceWriter,
+      });
+    }
+
     const expectedEpoch = store.traceEpochFor(songId, stateDir);
     const key = `${stateDir}::${songId}`;
     const existing = hosts.get(key);
@@ -963,14 +1072,17 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
         const liveSong = store.getSong(songId);
         const liveEpoch = store.traceEpochFor(songId, stateDir);
         const tracePath = await store.resolveContainedStatePath("traces", `${songId}.jsonl`);
-        const initialEvents = await store.traceWriter.read(tracePath, {
-          expectedStateDir: stateDir,
-          healOnDisk,
-        });
+        const initialEvents = liveSong.pendingTraceRotation
+          ? []
+          : await store.traceWriter.read(tracePath, {
+              expectedStateDir: stateDir,
+              healOnDisk,
+            });
         reassertRequestWorkspace(activeGuard);
+        const refreshedSong = store.getSong(songId);
         if (
           store.traceEpochFor(songId, stateDir) !== liveEpoch ||
-          store.getSong(songId).audioSha256 !== liveSong.audioSha256
+          refreshedSong.audioSha256 !== liveSong.audioSha256
         ) {
           throw makeWorkspaceConflictError("Song audio or workspace changed while loading trace.");
         }
@@ -982,6 +1094,7 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
         const host = new SongSessionHost({
           songId,
           boundStateDir: stateDir,
+          boundWorkspaceDir: workspaceDir,
           tracePath,
           boundAudioSha256: liveSong.audioSha256,
           boundTraceEpoch: liveEpoch,
@@ -991,8 +1104,10 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
           persistedCount: initialEvents.length,
           traceWriter: store.traceWriter,
         });
-        hosts.set(key, host);
-        await evictIdleHostsIfNeeded(key, persistWorkspace);
+        if (!refreshedSong.pendingTraceRotation) {
+          hosts.set(key, host);
+          await evictIdleHostsIfNeeded(key, persistWorkspace);
+        }
         return host;
       } finally {
         hostInitLocks.delete(key);
@@ -1008,7 +1123,7 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
 
   async function buildSongSessionPayload(
     host: SongSessionHost,
-    payloadOptions?: { persist?: boolean },
+    payloadOptions?: { persist?: boolean } & ExpectedWorkspaceGuard,
   ): Promise<TempoSongSessionPayload> {
     const liveState = host.controller.getState();
     const serialized = serializeState(liveState);
@@ -1018,8 +1133,15 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
       spans: liveState.spans,
     });
     const persist = payloadOptions?.persist !== false;
+    const expectedStateDir =
+      payloadOptions?.expectedStateDir ?? (host.boundStateDir || store.currentStateDir);
+    const expectedWorkspaceDir =
+      payloadOptions?.expectedWorkspaceDir ?? (host.boundWorkspaceDir || store.currentWorkspaceDir);
     const songSummary = persist
-      ? await store.updateSongFromState(host.songId, liveState, inboxSpans)
+      ? await store.updateSongFromState(host.songId, liveState, inboxSpans, {
+          expectedStateDir,
+          expectedWorkspaceDir,
+        })
       : store.projectSongSummary(host.songId, liveState, inboxSpans);
     return {
       song: songSummary,
@@ -1184,45 +1306,13 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
     t1: number,
     filter: AuditionFilter,
     signal?: AbortSignal,
-  ): Promise<{ wavPath: string; cleanupAfterStream?: () => Promise<void> } & AuditionRenderMeta> {
+  ): Promise<CachedAuditionEntry> {
     if (t0 < 0 || t1 <= t0 || t1 - t0 > MAX_AUDITION_SPAN_SEC + 1e-6) {
       throw new Error(`Choose an audition span between 0 and ${MAX_AUDITION_SPAN_SEC} seconds.`);
     }
     const canonicalAudio = await realpath(song.audioPath);
     if (!isSupportedAudioFileName(basename(canonicalAudio))) {
       throw new DOMException("Unsupported audio file.", "NotAllowedError");
-    }
-
-    // If the workspace has NOT been persisted on disk yet (cold GET), render into an OS temp dir
-    // so GET /audition never creates `.ensomi-tempo` inside an uninitialized workspace folder!
-    if (!store.currentStateDir || !existsSync(store.currentStateDir)) {
-      const tempDir = await mkdtemp(join(tmpdir(), "ensomi-audition-"));
-      const tempWav = join(tempDir, "audition.wav");
-      try {
-        const rendered = await daemon.renderAudition(
-          {
-            audioPath: song.audioPath,
-            ...(song.audioSha256 ? { audioSha256: song.audioSha256 } : {}),
-            startSec: t0,
-            endSec: t1,
-            filter,
-            outputPath: tempWav,
-          },
-          signal,
-        );
-        return {
-          wavPath: tempWav,
-          startSample: rendered.startSample,
-          endSample: rendered.endSample,
-          sampleRate: rendered.sampleRate,
-          cleanupAfterStream: async () => {
-            await rm(tempDir, { recursive: true, force: true }).catch(() => {});
-          },
-        };
-      } catch (err) {
-        await rm(tempDir, { recursive: true, force: true }).catch(() => {});
-        throw err;
-      }
     }
 
     const fileInfo = await stat(canonicalAudio);
@@ -1232,6 +1322,8 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
           canonicalAudio,
           song.audioSha256 || song.audioSha256Sample,
           String(fileInfo.mtimeMs),
+          String(fileInfo.ctimeMs),
+          String(fileInfo.ino),
           String(fileInfo.size),
           String(t0),
           String(t1),
@@ -1240,59 +1332,37 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
       )
       .digest("hex");
 
-    const cacheDir = await store.resolveContainedStatePath(".cache", "audition");
-    await mkdir(cacheDir, { recursive: true });
-    const outPath = await store.resolveContainedStatePath(".cache", "audition", `${cacheKey}.wav`);
-    const metaPath = await store.resolveContainedStatePath(
-      ".cache",
-      "audition",
-      `${cacheKey}.wav.meta.json`,
-    );
-
-    if (existsSync(outPath) && existsSync(metaPath)) {
-      try {
-        const rawMeta = JSON.parse(await readFile(metaPath, "utf8")) as Partial<AuditionRenderMeta>;
-        if (
-          typeof rawMeta.startSample === "number" &&
-          Number.isInteger(rawMeta.startSample) &&
-          typeof rawMeta.endSample === "number" &&
-          Number.isInteger(rawMeta.endSample) &&
-          typeof rawMeta.sampleRate === "number" &&
-          rawMeta.sampleRate > 0
-        ) {
-          return {
-            wavPath: outPath,
-            startSample: rawMeta.startSample,
-            endSample: rawMeta.endSample,
-            sampleRate: rawMeta.sampleRate,
-          };
-        }
-      } catch {
-        // Fall through to re-render when sidecar metadata is unreadable.
-      }
+    const cached = auditionCache.get(cacheKey);
+    if (cached) {
+      auditionCache.delete(cacheKey);
+      auditionCache.set(cacheKey, cached);
+      return cached;
     }
 
     const rendered = await daemon.renderAudition(
       {
-        audioPath: song.audioPath,
+        audioPath: canonicalAudio,
         ...(song.audioSha256 ? { audioSha256: song.audioSha256 } : {}),
         startSec: t0,
         endSec: t1,
         filter,
-        outputPath: outPath,
       },
       signal,
     );
-    const meta: AuditionRenderMeta = {
+    const entry: CachedAuditionEntry = {
+      wavBytes: Buffer.from(rendered.wavBase64, "base64"),
       startSample: rendered.startSample,
       endSample: rendered.endSample,
       sampleRate: rendered.sampleRate,
     };
-    await atomicWriteJson(metaPath, meta);
-    return {
-      wavPath: outPath,
-      ...meta,
-    };
+    auditionCache.delete(cacheKey);
+    auditionCache.set(cacheKey, entry);
+    while (auditionCache.size > MAX_AUDITION_CACHE_ENTRIES) {
+      const oldestKey = auditionCache.keys().next().value;
+      if (oldestKey === undefined) break;
+      auditionCache.delete(oldestKey);
+    }
+    return entry;
   }
 
   async function handleUploadRequest(
@@ -1304,6 +1374,23 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
       url.searchParams.get("dir") ?? undefined,
       url.searchParams.get("stateDir") ?? undefined,
     );
+    const expectedStateDir =
+      !url.searchParams.has("dir") && wsGuard?.targetStateDir
+        ? wsGuard.targetStateDir
+        : target.stateDir;
+    const expectedWorkspaceDir =
+      !url.searchParams.has("dir") && wsGuard?.targetWorkspaceDir
+        ? wsGuard.targetWorkspaceDir
+        : target.workspaceDir;
+    if (!url.searchParams.has("dir")) {
+      reassertRequestWorkspace(wsGuard);
+      if (
+        store.currentStateDir !== expectedStateDir ||
+        store.currentWorkspaceDir !== expectedWorkspaceDir
+      ) {
+        throw makeWorkspaceConflictError();
+      }
+    }
     const contentType = (request.headers["content-type"] ?? "").toLowerCase();
 
     if (contentType.startsWith("multipart/form-data")) {
@@ -1311,8 +1398,8 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
       if (!url.searchParams.has("dir")) {
         reassertRequestWorkspace(wsGuard);
         if (
-          store.currentStateDir !== target.stateDir ||
-          store.currentWorkspaceDir !== target.workspaceDir
+          store.currentStateDir !== expectedStateDir ||
+          store.currentWorkspaceDir !== expectedWorkspaceDir
         ) {
           throw makeWorkspaceConflictError();
         }
@@ -1332,7 +1419,11 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
           const fileObj = value as File;
           if (!fileObj.name) continue;
           const bytes = new Uint8Array(await fileObj.arrayBuffer());
-          const uploaded = await store.importUploadedBuffer(fileObj.name, bytes, target);
+          const uploaded = await store.importUploadedBuffer(fileObj.name, bytes, {
+            target,
+            expectedStateDir,
+            expectedWorkspaceDir,
+          });
           importedSongIds.push(uploaded.song.songId);
           lastSong = uploaded.song;
           latestWorkspace = uploaded.workspace;
@@ -1345,7 +1436,10 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
 
       const firstSongId = importedSongIds[0] ?? lastSong.songId;
       let refreshed = latestWorkspace;
-      if (store.currentStateDir === target.stateDir) {
+      if (
+        store.currentStateDir === expectedStateDir &&
+        store.currentWorkspaceDir === expectedWorkspaceDir
+      ) {
         await store.setActiveSong(firstSongId);
         refreshed = (store.getSnapshot() as TempoWorkspaceManifest) ?? latestWorkspace;
       }
@@ -1368,7 +1462,11 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
       throw new Error("Provide ?name=<filename> or multipart/form-data for audio upload.");
     }
 
-    const { workspace, song } = await store.importUploadedStream(nameParam, request, target);
+    const { workspace, song } = await store.importUploadedStream(nameParam, request, {
+      target,
+      expectedStateDir,
+      expectedWorkspaceDir,
+    });
     const formatted = formatWorkspaceResponse(workspace);
     return {
       ...formatted,
@@ -1672,9 +1770,19 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
       if (!Array.isArray(body.paths)) {
         throw new Error("Provide { paths: string[] } to import local audio files or folders.");
       }
+      const expectedStateDir =
+        typeof body.dir !== "string" && preGuard?.targetStateDir
+          ? preGuard.targetStateDir
+          : target.stateDir;
+      const expectedWorkspaceDir =
+        typeof body.dir !== "string" && preGuard?.targetWorkspaceDir
+          ? preGuard.targetWorkspaceDir
+          : target.workspaceDir;
       const { workspace, importedSongIds } = await store.importPaths({
         paths: body.paths as string[],
         target,
+        expectedStateDir,
+        expectedWorkspaceDir,
         ...(typeof body.copyIntoWorkspace === "boolean"
           ? { copyIntoWorkspace: body.copyIntoWorkspace }
           : {}),
@@ -1709,6 +1817,20 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
       const action = parts[2];
 
       if (action === undefined && method === "GET") {
+        await ensureInitialWorkspace({ persist: false });
+        const song = store.getSong(songId);
+        if (song.pendingTraceRotation) {
+          const tempHost = await getOrLoadHost(songId, {
+            healOnDisk: false,
+            persistWorkspace: false,
+          });
+          try {
+            sendJson(response, await buildSongSessionPayload(tempHost, { persist: false }));
+          } finally {
+            tempHost.dispose();
+          }
+          return;
+        }
         const host = await getOrLoadHost(songId, {
           healOnDisk: false,
           persistWorkspace: false,
@@ -1732,10 +1854,7 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
 
       if (action === "audition" && parts.length === 3 && (method === "GET" || method === "HEAD")) {
         const { signal, cleanup } = disconnectSignal(request, response);
-        let rendered: {
-          wavPath: string;
-          cleanupAfterStream?: () => Promise<void>;
-        } & AuditionRenderMeta;
+        let rendered: CachedAuditionEntry;
         try {
           if (signal.aborted || response.destroyed) return;
           await ensureInitialWorkspace({ persist: false });
@@ -1759,17 +1878,13 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
           throw error;
         }
         cleanup();
-        try {
-          if (signal.aborted || response.destroyed) return;
-          await streamFileWithRange(request, response, rendered.wavPath, "audio/wav", {
-            "X-Audition-Only": "listening view; timestamps stay on the original mix",
-            "X-Audition-Start-Sample": String(rendered.startSample),
-            "X-Audition-End-Sample": String(rendered.endSample),
-            "X-Audition-Sample-Rate": String(rendered.sampleRate),
-          });
-        } finally {
-          await rendered.cleanupAfterStream?.();
-        }
+        if (signal.aborted || response.destroyed) return;
+        sendBufferWithRange(request, response, rendered.wavBytes, "audio/wav", {
+          "X-Audition-Only": "listening view; timestamps stay on the original mix",
+          "X-Audition-Start-Sample": String(rendered.startSample),
+          "X-Audition-End-Sample": String(rendered.endSample),
+          "X-Audition-Sample-Rate": String(rendered.sampleRate),
+        });
         return;
       }
 
@@ -2163,6 +2278,7 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
   async function close(): Promise<void> {
     const active = Array.from(hosts.values());
     hosts.clear();
+    auditionCache.clear();
     if (store.isPersistedToDisk) {
       await Promise.allSettled(active.map((h) => h.flushTrace()));
     }
@@ -2227,8 +2343,10 @@ export type { AuditionFilter } from "./daemon-client.ts";
 export { AUDITION_FILTERS, resolvePythonCommand, TempoDaemonClient } from "./daemon-client.ts";
 export type {
   AudioSourceFingerprint,
+  ExpectedWorkspaceGuard,
   TempoSongSummary,
   TempoWorkspaceManifest,
+  TraceAppendOptions,
   WorkspaceTarget,
 } from "./workspace-store.ts";
 export {
@@ -2237,6 +2355,7 @@ export {
   computeAudioFingerprint,
   computeLegacySampledFingerprint,
   deriveLegacySongId,
+  deriveSongId,
   isValidSongId,
   SUPPORTED_AUDIO_EXTENSIONS,
   TempoWorkspaceStore,

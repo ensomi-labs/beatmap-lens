@@ -671,6 +671,53 @@ class AstraDaemonHardeningTest(unittest.TestCase):
             finally:
                 server.close()
 
+    def test_render_audition_in_memory_without_output_path_writes_zero_files(self):
+        import base64
+        import io
+
+        with tempfile.TemporaryDirectory() as folder:
+            wav_path = Path(folder) / "in_mem.wav"
+            t = np.arange(RATE * 3) / RATE
+            stereo = np.column_stack(
+                [
+                    0.2 * np.sin(2.0 * np.pi * 440.0 * t) + click_train([0.5, 1.0, 1.5], 3.0),
+                    0.2 * np.sin(2.0 * np.pi * 660.0 * t) + click_train([0.75, 1.25], 3.0),
+                ]
+            )
+            write_wav(wav_path, stereo, rate=RATE)
+            before_files = sorted(p.name for p in Path(folder).iterdir())
+
+            server = daemon.DaemonServer(engine=daemon.TempoEngine(backend="dsp"))
+            try:
+                res = server.dispatch_sync(
+                    "render_audition",
+                    {
+                        "audioPath": str(wav_path),
+                        "startSec": 0.25,
+                        "endSec": 1.25,
+                        "filter": "percussive",
+                    },
+                )
+                self.assertNotIn("outputPath", res)
+                self.assertIn("wavBase64", res)
+                expected_start = int(round(0.25 * RATE))
+                expected_end = int(round(1.25 * RATE))
+                self.assertEqual(res["startSample"], expected_start)
+                self.assertEqual(res["endSample"], expected_end)
+                self.assertEqual(res["sampleRate"], RATE)
+                self.assertEqual(res["channels"], 2)
+
+                wav_bytes = base64.b64decode(res["wavBase64"])
+                with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+                    self.assertEqual(wf.getframerate(), RATE)
+                    self.assertEqual(wf.getnchannels(), 2)
+                    self.assertEqual(wf.getnframes(), expected_end - expected_start)
+
+                after_files = sorted(p.name for p in Path(folder).iterdir())
+                self.assertEqual(after_files, before_files)
+            finally:
+                server.close()
+
 
 if __name__ == "__main__":
     unittest.main()

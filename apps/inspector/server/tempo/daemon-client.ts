@@ -117,6 +117,18 @@ export interface DaemonRenderSpanResponse {
   elapsedSec: number;
 }
 
+export interface DaemonRenderAuditionBufferResponse {
+  wavBase64: string;
+  filter: AuditionFilter;
+  startSec: number;
+  endSec: number;
+  startSample: number;
+  endSample: number;
+  sampleRate: number;
+  channels: number;
+  elapsedSec: number;
+}
+
 interface PendingRpc {
   child: ChildProcessWithoutNullStreams;
   resolve: (value: unknown) => void;
@@ -428,11 +440,37 @@ export class TempoDaemonClient {
       startSec: number;
       endSec: number;
       filter: AuditionFilter;
+      outputPath?: undefined;
+    },
+    signal?: AbortSignal,
+  ): Promise<DaemonRenderAuditionBufferResponse>;
+  renderAudition(
+    params: {
+      audioPath: string;
+      audioSha256?: string;
+      startSec: number;
+      endSec: number;
+      filter: AuditionFilter;
       outputPath: string;
     },
     signal?: AbortSignal,
-  ): Promise<DaemonRenderSpanResponse> {
-    return this.request<DaemonRenderSpanResponse>("render_audition", { ...params }, signal);
+  ): Promise<DaemonRenderSpanResponse>;
+  renderAudition(
+    params: {
+      audioPath: string;
+      audioSha256?: string | undefined;
+      startSec: number;
+      endSec: number;
+      filter: AuditionFilter;
+      outputPath?: string | undefined;
+    },
+    signal?: AbortSignal,
+  ): Promise<DaemonRenderAuditionBufferResponse | DaemonRenderSpanResponse> {
+    return this.request<DaemonRenderAuditionBufferResponse | DaemonRenderSpanResponse>(
+      "render_audition",
+      { ...params },
+      signal,
+    );
   }
 
   exportClip(

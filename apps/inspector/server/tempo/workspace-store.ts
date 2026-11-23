@@ -220,6 +220,7 @@ export interface TempoSongSummary {
   highestPriority: SpanPriority | null;
   ready: boolean;
   updatedAtMs: number;
+  pendingTraceRotation?: boolean;
 }
 
 export interface TempoWorkspaceManifest {
@@ -234,9 +235,27 @@ export interface WorkspaceTarget {
   stateDir: string;
 }
 
+export interface ExpectedWorkspaceGuard {
+  expectedStateDir?: string | null | undefined;
+  expectedWorkspaceDir?: string | null | undefined;
+}
+
+export interface TraceAppendOptions {
+  expectedStateDir?: string | null | undefined;
+  assertValid?: (() => void) | undefined;
+}
+
 export interface TraceAppendResult {
   appended: number;
   skipped: number;
+}
+
+function createStoreWorkspaceConflictError(
+  message = "Active workspace changed in another tab — reopen workspace.",
+): Error {
+  const err = new Error(message);
+  err.name = "ConflictError";
+  return err;
 }
 
 interface InspectedTrace {
@@ -362,8 +381,15 @@ export class TraceWriter {
   append(
     path: string,
     events: readonly TraceEvent[],
-    expectedStateDir?: string | null,
+    optionsOrStateDir?: TraceAppendOptions | string | null,
   ): Promise<TraceAppendResult> {
+    const opts: TraceAppendOptions =
+      typeof optionsOrStateDir === "string" || optionsOrStateDir === null
+        ? { expectedStateDir: optionsOrStateDir }
+        : (optionsOrStateDir ?? {});
+    const expectedStateDir = opts.expectedStateDir;
+    const assertValid = opts.assertValid;
+
     let incoming: TraceEvent[];
     try {
       assertNotTimingFile(path);
@@ -378,6 +404,7 @@ export class TraceWriter {
     const next = previous
       .catch(() => {})
       .then(async (): Promise<TraceAppendResult> => {
+        assertValid?.();
         const safePath = await this.verifyPath(path, expectedStateDir);
         let raw = "";
         try {
@@ -424,16 +451,60 @@ export class TraceWriter {
         }
 
         if (inspected.truncateBytes !== undefined && existsSync(safePath)) {
+          assertValid?.();
           await truncate(safePath, inspected.truncateBytes);
         }
         if (toAppend.length === 0) return { appended: 0, skipped };
 
+        assertValid?.();
         await mkdir(dirname(safePath), { recursive: true });
         await this.verifyPath(safePath, expectedStateDir);
         const serialized = serializeTraceNdjson(toAppend);
         const payload = inspected.needsLeadingNewline ? `\n${serialized}` : serialized;
+        assertValid?.();
         await appendFile(safePath, payload, "utf8");
         return { appended: toAppend.length, skipped };
+      });
+
+    this.tails.set(key, next);
+    next.then(
+      () => {
+        if (this.tails.get(key) === next) this.tails.delete(key);
+      },
+      () => {
+        if (this.tails.get(key) === next) this.tails.delete(key);
+      },
+    );
+    return next;
+  }
+
+  rotate(
+    tracePath: string,
+    backupPath: string,
+    expectedStateDir?: string | null,
+  ): Promise<string | undefined> {
+    try {
+      assertNotTimingFile(tracePath);
+      assertNotTimingFile(backupPath);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+
+    const key = resolve(tracePath);
+    const previous = this.tails.get(key) ?? Promise.resolve();
+    const next = previous
+      .catch(() => {})
+      .then(async (): Promise<string | undefined> => {
+        const safeTracePath = await this.verifyPath(tracePath, expectedStateDir);
+        const safeBackupPath = await this.verifyPath(backupPath, expectedStateDir);
+        if (!existsSync(safeTracePath)) return undefined;
+        try {
+          await rename(safeTracePath, safeBackupPath);
+          return safeBackupPath;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+          throw error;
+        }
       });
 
     this.tails.set(key, next);
@@ -472,8 +543,11 @@ export class TraceWriter {
     const healOnDisk = opts.healOnDisk === true && opts.readOnly !== true;
 
     const key = resolve(path);
-    const pending = this.tails.get(key);
-    if (pending) await pending.catch(() => {});
+    while (this.tails.has(key)) {
+      const pending = this.tails.get(key);
+      if (!pending) break;
+      await pending.catch(() => {});
+    }
     const safePath = await this.verifyPath(path, expectedStateDir);
     let raw = "";
     try {
@@ -799,12 +873,26 @@ export class TempoWorkspaceStore {
     return canonical;
   }
 
+  private assertExpectedWorkspaceInLock(guard?: ExpectedWorkspaceGuard): void {
+    if (!guard) return;
+    if (
+      (guard.expectedStateDir !== undefined &&
+        guard.expectedStateDir !== null &&
+        this.currentStateDir !== guard.expectedStateDir) ||
+      (guard.expectedWorkspaceDir !== undefined &&
+        guard.expectedWorkspaceDir !== null &&
+        this.workspaceDir !== guard.expectedWorkspaceDir)
+    ) {
+      throw createStoreWorkspaceConflictError();
+    }
+  }
+
   private enqueueSave(manifest: TempoWorkspaceManifest, stateDir: string): Promise<void> {
     const snapshot: TempoWorkspaceManifest = {
       schemaVersion: 1,
       workspaceDir: manifest.workspaceDir,
       activeSongId: manifest.activeSongId,
-      songs: manifest.songs.map((s) => ({ ...s })),
+      songs: manifest.songs.map(({ pendingTraceRotation: _pending, ...s }) => ({ ...s })),
     };
     const next = this.writeChain
       .catch(() => {})
@@ -824,24 +912,46 @@ export class TempoWorkspaceStore {
     return next;
   }
 
+  private async flushDeferredRotationsInLock(
+    canonicalStateDir: string,
+    prevStateDir?: string | null,
+  ): Promise<void> {
+    for (const deferredKey of Array.from(this.pendingDeferredRotations)) {
+      const sepIdx = deferredKey.indexOf("::");
+      if (sepIdx <= 0) continue;
+      const rotStateDir = deferredKey.slice(0, sepIdx);
+      const rotSongId = deferredKey.slice(sepIdx + 2);
+      if (rotStateDir === canonicalStateDir || (prevStateDir && rotStateDir === prevStateDir)) {
+        this.pendingDeferredRotations.delete(deferredKey);
+        this.pendingDeferredRotations.delete(`${canonicalStateDir}::${rotSongId}`);
+        if (prevStateDir && prevStateDir !== canonicalStateDir) {
+          const prevEpoch = this.traceEpochs.get(`${prevStateDir}::${rotSongId}`) ?? 0;
+          if (prevEpoch > (this.traceEpochs.get(`${canonicalStateDir}::${rotSongId}`) ?? 0)) {
+            this.traceEpochs.set(`${canonicalStateDir}::${rotSongId}`, prevEpoch);
+          }
+        }
+        await this.rotateSupersededTrace(canonicalStateDir, rotSongId);
+        if (this.manifest) {
+          const idx = this.manifest.songs.findIndex((s) => s.songId === rotSongId);
+          const existingSong = idx >= 0 ? this.manifest.songs[idx] : undefined;
+          if (existingSong?.pendingTraceRotation) {
+            const { pendingTraceRotation: _cleared, ...cleaned } = existingSong;
+            this.manifest.songs[idx] = cleaned;
+          }
+        }
+      }
+    }
+  }
+
   persistCurrentWorkspace(): Promise<TempoWorkspaceManifest | null> {
     return this.withStoreLock(async () => {
       if (!this.manifest || !this.stateDir) {
         return null;
       }
+      const prevStateDir = this.stateDir;
       const canonicalStateDir = await this.ensureStateDirStructure(this.stateDir);
       this.stateDir = canonicalStateDir;
-      for (const deferredKey of Array.from(this.pendingDeferredRotations)) {
-        const sepIdx = deferredKey.indexOf("::");
-        if (sepIdx > 0) {
-          const rotStateDir = deferredKey.slice(0, sepIdx);
-          const rotSongId = deferredKey.slice(sepIdx + 2);
-          if (rotStateDir === canonicalStateDir) {
-            this.pendingDeferredRotations.delete(deferredKey);
-            await this.rotateTraceFileOnly(canonicalStateDir, rotSongId);
-          }
-        }
-      }
+      await this.flushDeferredRotationsInLock(canonicalStateDir, prevStateDir);
       await this.enqueueSave(this.manifest, canonicalStateDir);
       return this.getSnapshot();
     });
@@ -887,16 +997,27 @@ export class TempoWorkspaceStore {
   private async commitTargetManifest(
     target: WorkspaceTarget,
     nextManifest: TempoWorkspaceManifest,
+    guard?: ExpectedWorkspaceGuard,
   ): Promise<TempoWorkspaceManifest> {
-    if (this.stateDir === target.stateDir) {
-      this.manifest = nextManifest;
-    }
-    await this.enqueueSave(nextManifest, target.stateDir);
-    return {
+    this.assertExpectedWorkspaceInLock(guard);
+    const cleanedSongs = nextManifest.songs.map(({ pendingTraceRotation: _pending, ...s }) => ({
+      ...s,
+    }));
+    const cleanedManifest: TempoWorkspaceManifest = {
       schemaVersion: 1,
       workspaceDir: nextManifest.workspaceDir,
       activeSongId: nextManifest.activeSongId,
-      songs: nextManifest.songs.map((s) => ({ ...s })),
+      songs: cleanedSongs,
+    };
+    if (this.stateDir === target.stateDir) {
+      this.manifest = cleanedManifest;
+    }
+    await this.enqueueSave(cleanedManifest, target.stateDir);
+    return {
+      schemaVersion: 1,
+      workspaceDir: cleanedManifest.workspaceDir,
+      activeSongId: cleanedManifest.activeSongId,
+      songs: cleanedManifest.songs.map((s) => ({ ...s })),
     };
   }
 
@@ -923,13 +1044,11 @@ export class TempoWorkspaceStore {
       stateDir,
       join(stateDir, "traces", `${songId}.jsonl`),
     );
-    if (!existsSync(tracePath)) return undefined;
     const backupPath = await assertContainedInStateDir(
       stateDir,
       `${tracePath}.superseded-${Date.now()}-${randomUUID().slice(0, 6)}.bak`,
     );
-    await rename(tracePath, backupPath);
-    return backupPath;
+    return await this.traceWriter.rotate(tracePath, backupPath, stateDir);
   }
 
   private async rotateSupersededTrace(
@@ -981,6 +1100,48 @@ export class TempoWorkspaceStore {
     return true;
   }
 
+  private extractLastAudioBoundMetadata(events: readonly TraceEvent[]): {
+    recordedPath: string | null;
+    recordedSongId: string | null;
+  } {
+    let lastAudioPayload: Record<string, unknown> | null = null;
+    const retractedIds = new Set<string>();
+    for (let i = events.length - 1; i >= 0; i -= 1) {
+      const ev = events[i];
+      if (!ev) continue;
+      if (ev.type === "retract" && !retractedIds.has(ev.id)) {
+        const p = ev.payload as { targetEventId?: string; targetSeq?: number } | undefined;
+        if (typeof p?.targetEventId === "string") {
+          retractedIds.add(p.targetEventId);
+        } else if (typeof p?.targetSeq === "number") {
+          const targetEv = events.find((e) => e.seq === p.targetSeq);
+          if (targetEv) retractedIds.add(targetEv.id);
+        }
+      }
+    }
+    for (const ev of events) {
+      if (ev.type === "audio_bound" && !retractedIds.has(ev.id)) {
+        const rawP = ev.payload as Record<string, unknown> | undefined;
+        const inner =
+          rawP?.audio && typeof rawP.audio === "object"
+            ? (rawP.audio as Record<string, unknown>)
+            : rawP;
+        if (inner && typeof inner === "object") {
+          lastAudioPayload = inner;
+        }
+      }
+    }
+    const recordedPath =
+      typeof lastAudioPayload?.audioPath === "string" && lastAudioPayload.audioPath.trim()
+        ? lastAudioPayload.audioPath.trim()
+        : null;
+    const recordedSongId =
+      typeof lastAudioPayload?.songId === "string" && lastAudioPayload.songId.trim()
+        ? lastAudioPayload.songId.trim()
+        : null;
+    return { recordedPath, recordedSongId };
+  }
+
   private async findUniqueLegacyTrace(options: {
     workspaceDir: string;
     stateDir: string;
@@ -994,6 +1155,43 @@ export class TempoWorkspaceStore {
     if (!existsSync(tracesDir)) return null;
     await assertContainedInStateDir(options.stateDir, tracesDir);
 
+    const canonicalWs = await realpath(options.workspaceDir).catch(() =>
+      resolve(options.workspaceDir),
+    );
+    const canonicalAudio = await realpath(options.audioPath).catch(() =>
+      resolve(options.audioPath),
+    );
+    const newSongId = deriveSongId(canonicalWs, canonicalAudio);
+    const legacyRealpathSongId = deriveLegacySongId(canonicalWs, canonicalAudio);
+
+    // Direct existence check for exact `<newSongId>.jsonl` and `<legacyRealpathSongId>.jsonl`
+    // BEFORE filtering `traces/` by `options.fileName` stem (e.g. symlink `alias.wav -> original.wav`).
+    const exactIdCandidates =
+      newSongId === legacyRealpathSongId ? [newSongId] : [newSongId, legacyRealpathSongId];
+    for (const exactSongId of exactIdCandidates) {
+      if (!isValidSongId(exactSongId) || options.excludedSongIds.has(exactSongId)) continue;
+      const exactTraceCandidate = join(tracesDir, `${exactSongId}.jsonl`);
+      if (!existsSync(exactTraceCandidate)) continue;
+      try {
+        const safeExactPath = await assertContainedInStateDir(
+          options.stateDir,
+          exactTraceCandidate,
+        );
+        const events = await this.traceWriter.read(safeExactPath, {
+          expectedStateDir: options.stateDir,
+          healOnDisk: options.persist,
+        });
+        if (events.length === 0) continue;
+        const { recordedPath, recordedSongId } = this.extractLastAudioBoundMetadata(events);
+        if (recordedSongId && recordedSongId !== exactSongId) continue;
+        if (recordedPath) {
+          const canonicalRecorded = await realpath(recordedPath).catch(() => recordedPath);
+          if (canonicalRecorded !== canonicalAudio) continue;
+        }
+        return { songId: exactSongId, events };
+      } catch {}
+    }
+
     let traceEntries: string[];
     try {
       traceEntries = await readdir(tracesDir);
@@ -1003,7 +1201,10 @@ export class TempoWorkspaceStore {
 
     const slug = slugifySongStem(options.fileName);
     const prefix = `${slug}-`;
-    const legacyExpectedId = deriveLegacySongId(options.workspaceDir, options.audioPath);
+    const legacyAliasExpectedId = deriveLegacySongId(
+      canonicalWs,
+      join(canonicalWs, options.fileName),
+    );
 
     type MatchRank = 4 | 3 | 2 | 1;
     const candidates: Array<{ songId: string; events: TraceEvent[]; rank: MatchRank }> = [];
@@ -1033,51 +1234,14 @@ export class TempoWorkspaceStore {
       }
       if (events.length === 0) continue;
 
-      // Inspect last non-retracted audio_bound event if present
-      let lastAudioPayload: Record<string, unknown> | null = null;
-      const retractedIds = new Set<string>();
-      for (let i = events.length - 1; i >= 0; i -= 1) {
-        const ev = events[i];
-        if (!ev) continue;
-        if (ev.type === "retract" && !retractedIds.has(ev.id)) {
-          const p = ev.payload as { targetEventId?: string; targetSeq?: number } | undefined;
-          if (typeof p?.targetEventId === "string") {
-            retractedIds.add(p.targetEventId);
-          } else if (typeof p?.targetSeq === "number") {
-            const targetEv = events.find((e) => e.seq === p.targetSeq);
-            if (targetEv) retractedIds.add(targetEv.id);
-          }
-        }
-      }
-      for (const ev of events) {
-        if (ev.type === "audio_bound" && !retractedIds.has(ev.id)) {
-          const rawP = ev.payload as Record<string, unknown> | undefined;
-          const inner =
-            rawP?.audio && typeof rawP.audio === "object"
-              ? (rawP.audio as Record<string, unknown>)
-              : rawP;
-          if (inner && typeof inner === "object") {
-            lastAudioPayload = inner;
-          }
-        }
-      }
-
-      const recordedPath =
-        typeof lastAudioPayload?.audioPath === "string" && lastAudioPayload.audioPath.trim()
-          ? lastAudioPayload.audioPath.trim()
-          : null;
-      const recordedSongId =
-        typeof lastAudioPayload?.songId === "string" && lastAudioPayload.songId.trim()
-          ? lastAudioPayload.songId.trim()
-          : null;
-
+      const { recordedPath, recordedSongId } = this.extractLastAudioBoundMetadata(events);
       if (recordedSongId && recordedSongId !== candSongId) {
         continue;
       }
 
       if (recordedPath) {
         const canonicalRecorded = await realpath(recordedPath).catch(() => recordedPath);
-        if (canonicalRecorded === options.audioPath) {
+        if (canonicalRecorded === canonicalAudio) {
           candidates.push({ songId: candSongId, events, rank: 4 });
         } else if (
           basename(recordedPath) === options.fileName &&
@@ -1088,7 +1252,7 @@ export class TempoWorkspaceStore {
         continue;
       }
 
-      if (candSongId === legacyExpectedId) {
+      if (candSongId === legacyRealpathSongId || candSongId === legacyAliasExpectedId) {
         candidates.push({ songId: candSongId, events, rank: 3 });
       } else if (options.slugCountInWorkspace === 1) {
         candidates.push({ songId: candSongId, events, rank: 1 });
@@ -1248,6 +1412,7 @@ export class TempoWorkspaceStore {
         const slug = slugifySongStem(item.fileName);
         slugCounts.set(slug, (slugCounts.get(slug) ?? 0) + 1);
         reservedIds.add(deriveSongId(workspaceDir, item.canonicalAudioPath));
+        reservedIds.add(deriveLegacySongId(workspaceDir, item.canonicalAudioPath));
       }
 
       const usedSongIds = new Set<string>();
@@ -1257,8 +1422,10 @@ export class TempoWorkspaceStore {
       for (const item of discoveredFiles) {
         const usablePrev = item.prev && !usedSongIds.has(item.prev.songId) ? item.prev : undefined;
         const defaultDerivedId = deriveSongId(workspaceDir, item.canonicalAudioPath);
+        const legacyRealpathId = deriveLegacySongId(workspaceDir, item.canonicalAudioPath);
         const excludedForLegacy = new Set<string>([...usedSongIds, ...reservedIds]);
         excludedForLegacy.delete(defaultDerivedId);
+        excludedForLegacy.delete(legacyRealpathId);
 
         const slug = slugifySongStem(item.fileName);
         const { summary, deferredRotation } = await this.buildOrReconcileSongSummary(
@@ -1329,17 +1496,18 @@ export class TempoWorkspaceStore {
     const songId = assertValidSongId(candidateId);
     const title = existing?.title ?? basename(fileName, extname(fileName));
 
+    const deferredKey = `${stateDir}::${songId}`;
     const fingerprintMismatch =
-      existing !== undefined &&
-      !(await this.doesRecordedFingerprintMatch(existing, audioPath, fingerprint));
+      this.pendingDeferredRotations.has(deferredKey) ||
+      (existing !== undefined &&
+        !(await this.doesRecordedFingerprintMatch(existing, audioPath, fingerprint)));
 
     let deferredRotation = false;
     if (fingerprintMismatch) {
       if (persist) {
         await this.rotateSupersededTrace(stateDir, songId);
       } else {
-        this.bumpTraceEpoch(stateDir, songId);
-        this.pendingDeferredRotations.add(`${stateDir}::${songId}`);
+        this.pendingDeferredRotations.add(deferredKey);
         deferredRotation = true;
       }
     }
@@ -1362,6 +1530,7 @@ export class TempoWorkspaceStore {
       highestPriority: validExisting?.highestPriority ?? null,
       ready: validExisting?.ready ?? false,
       updatedAtMs: validExisting?.updatedAtMs ?? Math.round(fallbackUpdatedMs),
+      ...(deferredRotation ? { pendingTraceRotation: true } : {}),
     };
 
     const tracePath = await assertContainedInStateDir(
@@ -1471,8 +1640,9 @@ export class TempoWorkspaceStore {
       }
 
       const backupPath = await this.rotateSupersededTrace(stateDir, songId);
+      const { pendingTraceRotation: _cleared, ...restCurrent } = current;
       const resetSong: TempoSongSummary = {
-        ...current,
+        ...restCurrent,
         audioPath: canonicalAudio,
         audioSizeBytes: liveFp.audioSizeBytes,
         audioSha256: liveFp.audioSha256,
@@ -1500,10 +1670,18 @@ export class TempoWorkspaceStore {
     paths: readonly string[];
     copyIntoWorkspace?: boolean;
     target?: WorkspaceTarget;
+    expectedStateDir?: string | null;
+    expectedWorkspaceDir?: string | null;
   }): Promise<{ workspace: TempoWorkspaceManifest; importedSongIds: string[] }> {
     return this.withStoreLock(async () => {
       const target = options.target ?? this.captureTarget();
       const { workspaceDir, stateDir } = target;
+      const expectedGuard: ExpectedWorkspaceGuard = {
+        expectedStateDir: options.expectedStateDir ?? stateDir,
+        expectedWorkspaceDir: options.expectedWorkspaceDir ?? workspaceDir,
+      };
+      this.assertExpectedWorkspaceInLock(expectedGuard);
+
       if (!Array.isArray(options.paths) || options.paths.length === 0) {
         throw new Error("Provide at least one audio file or directory path to import.");
       }
@@ -1562,71 +1740,96 @@ export class TempoWorkspaceStore {
         throw new Error("No supported audio files found in the specified path(s).");
       }
 
+      this.assertExpectedWorkspaceInLock(expectedGuard);
       const targetManifest = await this.loadOrCloneTargetManifest(target);
       const importedSongIds: string[] = [];
+      const copiedPaths: string[] = [];
       const byAudioPath = new Map(targetManifest.songs.map((s) => [s.audioPath, s]));
 
-      for (const srcPath of candidateFiles) {
-        const isAlreadyInside =
-          srcPath.startsWith(`${workspaceDir}${sep}`) && dirname(srcPath) === workspaceDir;
-        if (!copyIntoWorkspace || isAlreadyInside) {
-          const alreadyRegistered = byAudioPath.get(srcPath);
-          if (alreadyRegistered) {
-            importedSongIds.push(alreadyRegistered.songId);
+      try {
+        for (const srcPath of candidateFiles) {
+          const isAlreadyInside =
+            srcPath.startsWith(`${workspaceDir}${sep}`) && dirname(srcPath) === workspaceDir;
+          if (!copyIntoWorkspace || isAlreadyInside) {
+            const alreadyRegistered = byAudioPath.get(srcPath);
+            if (alreadyRegistered) {
+              importedSongIds.push(alreadyRegistered.songId);
+              continue;
+            }
+          }
+
+          let finalAudioPath = srcPath;
+          if (copyIntoWorkspace && !isAlreadyInside) {
+            this.assertExpectedWorkspaceInLock(expectedGuard);
+            const sanitized = sanitizeAudioUploadName(basename(srcPath));
+            const dest = await copyFileExclusiveWithRetry(srcPath, workspaceDir, sanitized);
+            copiedPaths.push(dest);
+            finalAudioPath = await realpath(dest);
+          }
+
+          const existingAfterCopy = byAudioPath.get(finalAudioPath);
+          if (existingAfterCopy) {
+            importedSongIds.push(existingAfterCopy.songId);
             continue;
           }
+
+          const fileStat = await stat(finalAudioPath);
+          const fileName = basename(finalAudioPath);
+          const { summary } = await this.buildOrReconcileSongSummary(
+            workspaceDir,
+            stateDir,
+            finalAudioPath,
+            fileName,
+            undefined,
+            fileStat.mtimeMs,
+            { persist: true },
+          );
+          byAudioPath.set(finalAudioPath, summary);
+          importedSongIds.push(summary.songId);
         }
 
-        let finalAudioPath = srcPath;
-        if (copyIntoWorkspace && !isAlreadyInside) {
-          const sanitized = sanitizeAudioUploadName(basename(srcPath));
-          const dest = await copyFileExclusiveWithRetry(srcPath, workspaceDir, sanitized);
-          finalAudioPath = await realpath(dest);
+        targetManifest.songs = sortSongsDeterministically(Array.from(byAudioPath.values()));
+        if (importedSongIds[0]) {
+          targetManifest.activeSongId = importedSongIds[0];
+        } else if (!targetManifest.activeSongId && targetManifest.songs[0]) {
+          targetManifest.activeSongId = targetManifest.songs[0].songId;
         }
 
-        const existingAfterCopy = byAudioPath.get(finalAudioPath);
-        if (existingAfterCopy) {
-          importedSongIds.push(existingAfterCopy.songId);
-          continue;
+        const saved = await this.commitTargetManifest(target, targetManifest, expectedGuard);
+        return {
+          workspace: saved,
+          importedSongIds,
+        };
+      } catch (error) {
+        if ((error as { name?: string } | null)?.name === "ConflictError") {
+          for (const copied of copiedPaths) {
+            await unlink(copied).catch(() => {});
+          }
         }
-
-        const fileStat = await stat(finalAudioPath);
-        const fileName = basename(finalAudioPath);
-        const { summary } = await this.buildOrReconcileSongSummary(
-          workspaceDir,
-          stateDir,
-          finalAudioPath,
-          fileName,
-          undefined,
-          fileStat.mtimeMs,
-          { persist: true },
-        );
-        byAudioPath.set(finalAudioPath, summary);
-        importedSongIds.push(summary.songId);
+        throw error;
       }
-
-      targetManifest.songs = sortSongsDeterministically(Array.from(byAudioPath.values()));
-      if (importedSongIds[0]) {
-        targetManifest.activeSongId = importedSongIds[0];
-      } else if (!targetManifest.activeSongId && targetManifest.songs[0]) {
-        targetManifest.activeSongId = targetManifest.songs[0].songId;
-      }
-
-      const saved = await this.commitTargetManifest(target, targetManifest);
-      return {
-        workspace: saved,
-        importedSongIds,
-      };
     });
   }
 
   async importUploadedStream(
     rawFileName: string,
     stream: Readable,
-    explicitTarget?: WorkspaceTarget,
+    optionsOrTarget?:
+      | (WorkspaceTarget & ExpectedWorkspaceGuard)
+      | ({ target?: WorkspaceTarget } & ExpectedWorkspaceGuard),
   ): Promise<{ workspace: TempoWorkspaceManifest; song: TempoSongSummary }> {
-    const target = explicitTarget ?? this.captureTarget();
+    const hasDirectTarget =
+      optionsOrTarget !== undefined &&
+      "workspaceDir" in optionsOrTarget &&
+      "stateDir" in optionsOrTarget;
+    const target = hasDirectTarget
+      ? optionsOrTarget
+      : (optionsOrTarget?.target ?? this.captureTarget());
     const { workspaceDir, stateDir } = target;
+    const expectedGuard: ExpectedWorkspaceGuard = {
+      expectedStateDir: optionsOrTarget?.expectedStateDir ?? stateDir,
+      expectedWorkspaceDir: optionsOrTarget?.expectedWorkspaceDir ?? workspaceDir,
+    };
     const sanitized = sanitizeAudioUploadName(rawFileName);
     const tempPath = join(workspaceDir, `.upload.${process.pid}.${randomUUID().slice(0, 8)}.tmp`);
 
@@ -1646,43 +1849,68 @@ export class TempoWorkspaceStore {
     }
 
     return await this.withStoreLock(async () => {
+      try {
+        this.assertExpectedWorkspaceInLock(expectedGuard);
+      } catch (error) {
+        await unlink(tempPath).catch(() => {});
+        throw error;
+      }
       const destPath = await publishTempFileExclusiveWithRetry(tempPath, workspaceDir, sanitized);
-      const canonicalDest = await realpath(destPath);
-      const fileName = basename(canonicalDest);
-      const { summary: song } = await this.buildOrReconcileSongSummary(
-        workspaceDir,
-        stateDir,
-        canonicalDest,
-        fileName,
-        undefined,
-        Date.now(),
-        { persist: true },
-      );
+      try {
+        const canonicalDest = await realpath(destPath);
+        const fileName = basename(canonicalDest);
+        const { summary: song } = await this.buildOrReconcileSongSummary(
+          workspaceDir,
+          stateDir,
+          canonicalDest,
+          fileName,
+          undefined,
+          Date.now(),
+          { persist: true },
+        );
 
-      const targetManifest = await this.loadOrCloneTargetManifest(target);
-      const filtered = targetManifest.songs.filter((s) => s.songId !== song.songId);
-      filtered.push(song);
-      targetManifest.songs = sortSongsDeterministically(filtered);
-      targetManifest.activeSongId = song.songId;
-      const saved = await this.commitTargetManifest(target, targetManifest);
+        const targetManifest = await this.loadOrCloneTargetManifest(target);
+        const filtered = targetManifest.songs.filter((s) => s.songId !== song.songId);
+        filtered.push(song);
+        targetManifest.songs = sortSongsDeterministically(filtered);
+        targetManifest.activeSongId = song.songId;
+        const saved = await this.commitTargetManifest(target, targetManifest, expectedGuard);
 
-      return {
-        workspace: saved,
-        song: { ...song },
-      };
+        return {
+          workspace: saved,
+          song: { ...song },
+        };
+      } catch (error) {
+        if ((error as { name?: string } | null)?.name === "ConflictError") {
+          await unlink(destPath).catch(() => {});
+        }
+        throw error;
+      }
     });
   }
 
   async importUploadedBuffer(
     rawFileName: string,
     bytes: Uint8Array,
-    explicitTarget?: WorkspaceTarget,
+    optionsOrTarget?:
+      | (WorkspaceTarget & ExpectedWorkspaceGuard)
+      | ({ target?: WorkspaceTarget } & ExpectedWorkspaceGuard),
   ): Promise<{ workspace: TempoWorkspaceManifest; song: TempoSongSummary }> {
-    const target = explicitTarget ?? this.captureTarget();
+    const hasDirectTarget =
+      optionsOrTarget !== undefined &&
+      "workspaceDir" in optionsOrTarget &&
+      "stateDir" in optionsOrTarget;
+    const target = hasDirectTarget
+      ? optionsOrTarget
+      : (optionsOrTarget?.target ?? this.captureTarget());
     if (bytes.byteLength === 0) {
       throw new Error("Uploaded audio file is empty.");
     }
     const { workspaceDir, stateDir } = target;
+    const expectedGuard: ExpectedWorkspaceGuard = {
+      expectedStateDir: optionsOrTarget?.expectedStateDir ?? stateDir,
+      expectedWorkspaceDir: optionsOrTarget?.expectedWorkspaceDir ?? workspaceDir,
+    };
     const sanitized = sanitizeAudioUploadName(rawFileName);
     const tempPath = join(workspaceDir, `.upload.${process.pid}.${randomUUID().slice(0, 8)}.tmp`);
 
@@ -1694,30 +1922,43 @@ export class TempoWorkspaceStore {
     }
 
     return await this.withStoreLock(async () => {
+      try {
+        this.assertExpectedWorkspaceInLock(expectedGuard);
+      } catch (error) {
+        await unlink(tempPath).catch(() => {});
+        throw error;
+      }
       const destPath = await publishTempFileExclusiveWithRetry(tempPath, workspaceDir, sanitized);
-      const canonicalDest = await realpath(destPath);
-      const fileName = basename(canonicalDest);
-      const { summary: song } = await this.buildOrReconcileSongSummary(
-        workspaceDir,
-        stateDir,
-        canonicalDest,
-        fileName,
-        undefined,
-        Date.now(),
-        { persist: true },
-      );
+      try {
+        const canonicalDest = await realpath(destPath);
+        const fileName = basename(canonicalDest);
+        const { summary: song } = await this.buildOrReconcileSongSummary(
+          workspaceDir,
+          stateDir,
+          canonicalDest,
+          fileName,
+          undefined,
+          Date.now(),
+          { persist: true },
+        );
 
-      const targetManifest = await this.loadOrCloneTargetManifest(target);
-      const filtered = targetManifest.songs.filter((s) => s.songId !== song.songId);
-      filtered.push(song);
-      targetManifest.songs = sortSongsDeterministically(filtered);
-      targetManifest.activeSongId = song.songId;
-      const saved = await this.commitTargetManifest(target, targetManifest);
+        const targetManifest = await this.loadOrCloneTargetManifest(target);
+        const filtered = targetManifest.songs.filter((s) => s.songId !== song.songId);
+        filtered.push(song);
+        targetManifest.songs = sortSongsDeterministically(filtered);
+        targetManifest.activeSongId = song.songId;
+        const saved = await this.commitTargetManifest(target, targetManifest, expectedGuard);
 
-      return {
-        workspace: saved,
-        song: { ...song },
-      };
+        return {
+          workspace: saved,
+          song: { ...song },
+        };
+      } catch (error) {
+        if ((error as { name?: string } | null)?.name === "ConflictError") {
+          await unlink(destPath).catch(() => {});
+        }
+        throw error;
+      }
     });
   }
 
@@ -1726,6 +1967,12 @@ export class TempoWorkspaceStore {
     return this.withStoreLock(async () => {
       if (!this.manifest || !this.stateDir) {
         throw new Error("Open a Tempo workspace folder first.");
+      }
+      if (!this.persistedToDisk && this.pendingDeferredRotations.size > 0) {
+        const prevStateDir = this.stateDir;
+        const canonicalStateDir = await this.ensureStateDirStructure(this.stateDir);
+        this.stateDir = canonicalStateDir;
+        await this.flushDeferredRotationsInLock(canonicalStateDir, prevStateDir);
       }
       const song = this.getSong(songId);
       if (this.manifest.activeSongId !== songId || !this.persistedToDisk) {
@@ -1753,12 +2000,14 @@ export class TempoWorkspaceStore {
     songId: string,
     state: SessionState,
     inboxSpans?: readonly Span[],
+    guard?: ExpectedWorkspaceGuard,
   ): Promise<TempoSongSummary> {
     assertValidSongId(songId);
     return this.withStoreLock(async () => {
       if (!this.manifest || !this.stateDir) {
         throw new Error("Open a Tempo workspace folder first.");
       }
+      this.assertExpectedWorkspaceInLock(guard);
       const idx = this.manifest.songs.findIndex((s) => s.songId === songId);
       const current = idx >= 0 ? this.manifest.songs[idx] : undefined;
       if (!current) {
@@ -1767,6 +2016,7 @@ export class TempoWorkspaceStore {
         throw err;
       }
       const updated = summarizeSongFromState(current, state, inboxSpans);
+      this.assertExpectedWorkspaceInLock(guard);
       this.manifest.songs[idx] = updated;
       await this.enqueueSave(this.manifest, this.stateDir);
       return { ...updated };
