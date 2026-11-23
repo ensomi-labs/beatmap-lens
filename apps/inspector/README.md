@@ -43,8 +43,12 @@ toolbar hide and show the side panes. The browser remembers widths, hidden panes
 collapsed inspector sections per workspace. At 920 px and narrower, **Source**,
 **Preview** and **Details** switch between the regions instead.
 
-`/compare` and `/timing` open Compare and Timing directly. The connected Review inbox at `/review` is served
-by `pnpm review:workspace` instead; see [agent–human review](../../docs/annotation/agent-workflow.md).
+`/compare` and `/timing` open Compare and Timing directly. `/tempo` opens the standalone
+multi-song Tempo workspace (`node apps/inspector/server/tempo/tempo-server.ts --dir <folder>`);
+see [Tempo interface](../../docs/tempo/interface.md), [Tempo workflow](../../docs/tempo/workflow.md),
+and [Tempo system and provider contracts](../../docs/tempo/system-and-models.md). The connected
+Review inbox at `/review` is served by `pnpm review:workspace` instead; see
+[agent–human review](../../docs/annotation/agent-workflow.md).
 
 ## Compare
 
@@ -202,12 +206,14 @@ conversion, the playhead offset and the marks file.
 | `src/annotation/` | Annotation contracts, dataset storage, playback clocks, scene buffering |
 | `src/compare/` | Comparison contracts, excerpt proposals, audio envelope |
 | `src/timing/` | Blind timing session formats, wire contracts, marks, proposal palette and playback setup |
+| `src/tempo/` | Standalone interactive `/tempo` workspace, whole-song segment strip, pulse/sounds stage, and `/api/tempo/*` client |
 | `benchmarks/timing/` | The Timing engine latency harness (lab experiments, app scenarios, analysis) |
 | `server/local-service.ts` | Localhost-only request guard and helpers shared by both services |
 | `server/local-files.ts` | Full-path dataset, catalog and corpus access for Annotate |
 | `server/comparisons.ts` | Blind comparison sessions and verdict files for Compare |
 | `server/timing.ts` | Blind timing sessions, PCM serving, marks files and guarded reveal |
 | `server/timing-server.ts` | The plain-Node server for a timing bundle |
+| `server/tempo/` | Multi-song `.ensomi-tempo/` workspace store, warm DSP/model daemon client, `/api/tempo/*` service, and `tempo-server.ts` |
 | `scripts/ui-shots/` | Synthetic inputs, screenshots and browser checks of every mode (Playwright supplied by the caller) |
 | `server/review-workspace.mjs` | The connected Review service behind `/review` |
 

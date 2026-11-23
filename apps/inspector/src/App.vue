@@ -6,15 +6,19 @@ import InspectWorkspace from "./InspectWorkspace.vue";
 import ReviewInbox from "./ReviewInbox.vue";
 import ReviewWorkspace from "./ReviewWorkspace.vue";
 import TimingWorkspace from "./TimingWorkspace.vue";
+import TempoWorkspace from "./tempo/TempoWorkspace.vue";
 import type { WorkspaceMode } from "./workspace-mode";
 
 const directModes: Record<string, WorkspaceMode> = { "/compare": "compare", "/timing": "timing" };
 const mode = ref<WorkspaceMode>(directModes[window.location.pathname] ?? "annotate");
 const connectedReview = window.location.pathname === "/review";
+const tempoRoute =
+  window.location.pathname === "/tempo" || window.location.pathname.startsWith("/tempo/");
 </script>
 
 <template>
-  <ReviewInbox v-if="connectedReview" />
+  <TempoWorkspace v-if="tempoRoute" />
+  <ReviewInbox v-else-if="connectedReview" />
   <CompareWorkspace v-else-if="mode === 'compare'" @change-mode="mode = $event" />
   <TimingWorkspace v-else-if="mode === 'timing'" @change-mode="mode = $event" />
   <InspectWorkspace v-else-if="mode === 'inspect'" @change-mode="mode = $event" />

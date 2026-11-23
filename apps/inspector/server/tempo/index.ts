@@ -898,7 +898,7 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
     // Workspace endpoints
     if (parts[0] === "workspace" && parts.length === 1 && method === "GET") {
       const dirQuery = url.searchParams.get("dir");
-      const stateDirQuery = url.searchParams.get("stateDir") ?? undefined;
+      const stateDirQuery = url.searchParams.get("stateDir") ?? configuredStateDir;
       if (dirQuery) {
         const opened = await openWorkspaceInternal(dirQuery, stateDirQuery);
         sendJson(response, formatWorkspaceResponse(opened));
@@ -929,7 +929,7 @@ export function createTempoService(options: TempoServiceOptions = {}): TempoServ
       if (typeof body.dir !== "string" || !body.dir.trim()) {
         throw new Error("Provide { dir: string } to open a Tempo workspace folder.");
       }
-      const stateDir = typeof body.stateDir === "string" ? body.stateDir : undefined;
+      const stateDir = typeof body.stateDir === "string" ? body.stateDir : configuredStateDir;
       const manifest = await openWorkspaceInternal(body.dir, stateDir);
       sendJson(response, formatWorkspaceResponse(manifest));
       return;

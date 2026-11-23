@@ -15,6 +15,17 @@ and design choices.
 - [Timing sessions](inspector/timing-sessions.md): the session, identity key and marks
   format for blind beat-timing labels, on the `osu` clock.
 
+## Tempo Workspace
+
+- [Tempo interface](tempo/interface.md): standalone `/tempo` layout, visual grammar,
+  standing UI principles, and keyboard/pointer shortcuts.
+- [Tempo workflow](tempo/workflow.md): `Segment` / `Range` / `Span` time model,
+  forgiving cues (`Beat`, `Unbeat`, `Sound`, `Free`, `Keep`), and `.ensomi-tempo/`
+  mapping loop.
+- [Tempo system and provider contracts](tempo/system-and-models.md): four-way module
+  boundaries, `ensomi` `0.2` seam, canonical mix clock, `TriggerPolicy` lifecycles,
+  and `TimingProvider` I/O contracts.
+
 ## Annotation
 
 - [Discovery and section annotation](annotation/corpus-annotation.md): the main
