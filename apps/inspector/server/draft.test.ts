@@ -16,7 +16,7 @@ import {
   demoSounds,
   encodeWav,
 } from "../src/draft/synthetic";
-import { createDraftMiddleware, RecomputeQueue, readTrace, TraceWriter } from "./draft";
+import { createDraftMiddleware, RecomputeQueue, readTrace, runProcess, TraceWriter } from "./draft";
 import { startDraftServer } from "./draft-server";
 
 const cleanups: (() => Promise<unknown>)[] = [];
@@ -77,7 +77,7 @@ describe("TraceWriter", () => {
     const root = await folder();
     const path = join(root, "session.jsonl");
     const writer = new TraceWriter();
-    const pending: Promise<void>[] = [];
+    const pending: Promise<unknown>[] = [];
     const session = new DraftSession((ev) => {
       pending.push(writer.append(path, [ev]));
     });
@@ -97,12 +97,58 @@ describe("TraceWriter", () => {
     expect(sortedEntities(folded.beats)).toEqual(sortedEntities(session.state.beats));
     expect((await readTrace(path)).map((ev) => ev.id)).toEqual(parsed.map((ev) => ev.id));
   });
+
+  it("handles missing trailing newline, torn final line, idempotent retries, and conflicting writers", async () => {
+    const root = await folder();
+    const writer = new TraceWriter();
+
+    // 1. Existing valid trace missing a trailing newline
+    const noNl = join(root, "no-nl.jsonl");
+    await writeFile(noNl, JSON.stringify(event(0)));
+    await writer.append(noNl, [event(1)]);
+    const parsedNoNl = parseTraceNdjson(await readFile(noNl, "utf8"));
+    expect(parsedNoNl.map((ev) => ev.seq)).toEqual([0, 1]);
+
+    // 2. Idempotent retry of already-persisted prefix does not duplicate lines
+    const retry = await writer.append(noNl, [event(0), event(1), event(2)]);
+    expect(retry).toEqual({ appended: 1, skipped: 2 });
+    const pureRetry = await writer.append(noNl, [event(0), event(1)]);
+    expect(pureRetry).toEqual({ appended: 0, skipped: 2 });
+    expect(parseTraceNdjson(await readFile(noNl, "utf8")).map((ev) => ev.seq)).toEqual([0, 1, 2]);
+
+    // 3. Conflicting writer (same seq with different id or different payload) is rejected
+    await expect(writer.append(noNl, [{ ...event(2), id: "other_2" }])).rejects.toThrow(
+      /Conflicting/,
+    );
+    await expect(
+      writer.append(noNl, [{ ...event(2), payload: { op: "remove_beat", id: "other" } }]),
+    ).rejects.toThrow(/Conflicting/);
+
+    // 4. Torn partial JSON line at EOF without newline is truncated cleanly before appending
+    const torn = join(root, "torn.jsonl");
+    await writeFile(torn, `${JSON.stringify(event(0))}\n{"schemaVersion":"0.1","seq":1`);
+    await writer.append(torn, [event(1)]);
+    expect(parseTraceNdjson(await readFile(torn, "utf8")).map((ev) => ev.seq)).toEqual([0, 1]);
+
+    // 5. Rejects Timing marks .jsonl files (both by content and by suffix)
+    const timingContent = join(root, "looks-like-trace.jsonl");
+    await writeFile(
+      timingContent,
+      `${JSON.stringify({ kind: "mark", passage_id: "p", ms: 500 })}\n`,
+    );
+    await expect(readTrace(timingContent)).rejects.toThrow(/Not a valid Draft trace/);
+    await expect(writer.append(timingContent, [event(0)])).rejects.toThrow(
+      /Not a valid Draft trace/,
+    );
+    const timingNamed = join(root, "s.timing.marks.jsonl");
+    await expect(writer.append(timingNamed, [event(0)])).rejects.toThrow(/Timing/);
+  });
 });
 
 describe("RecomputeQueue", () => {
   const request = (generation: number) => ({ generation }) as RecomputeRequest;
 
-  it("supersedes an older generation, refuses a stale one and cancels a dropped request", async () => {
+  it("supersedes an older generation, remembers completed high-water mark, and cancels dropped requests", async () => {
     const releases: (() => void)[] = [];
     const queue = new RecomputeQueue(
       (_request, signal) =>
@@ -119,6 +165,8 @@ describe("RecomputeQueue", () => {
     expect(await queue.run("page", request(1))).toEqual({ status: "stale", generation: 1 });
     releases[1]?.();
     expect(await second).toMatchObject({ status: "ok", providerKind: "rule", offers: [] });
+    // After generation 2 completes, a delayed generation 1 must STILL be stale!
+    expect(await queue.run("page", request(1))).toEqual({ status: "stale", generation: 1 });
     const dropped = new AbortController();
     const third = queue.run("page", request(3), dropped.signal);
     dropped.abort();
@@ -160,6 +208,33 @@ describe("Draft service", () => {
     const foreign = await fetch(`${origin}/api/draft/trace?path=${encodeURIComponent(tracePath)}`);
     expect(foreign.status).toBe(403);
     expect((await post("nothing", {})).status).toBe(400);
+
+    // Rejects invalid event envelopes on trace/append
+    expect(
+      (await post("trace/append", { tracePath, events: [{ kind: "mark", ms: 100 }] })).status,
+    ).toBe(400);
+
+    // Two demo sessions created back-to-back reserve distinct trace files
+    const [demo1, demo2] = await Promise.all([
+      post("demo", {}).then((r) => r.json()),
+      post("demo", {}).then((r) => r.json()),
+    ]);
+    expect(demo1.tracePath).not.toBe(demo2.tracePath);
+    expect((await stat(demo1.tracePath)).isFile()).toBe(true);
+    expect((await stat(demo2.tracePath)).isFile()).toBe(true);
+  });
+
+  it("terminates spawned subprocesses promptly when aborted", async () => {
+    const controller = new AbortController();
+    const started = Date.now();
+    const running = runProcess(
+      process.execPath,
+      ["-e", "setTimeout(() => {}, 10000)"],
+      controller.signal,
+    );
+    setTimeout(() => controller.abort(), 50);
+    await expect(running).rejects.toMatchObject({ name: "AbortError" });
+    expect(Date.now() - started).toBeLessThan(2000);
   });
 
   it("renders listening views of a synthetic WAV, cached, and an export clip by path", async () => {

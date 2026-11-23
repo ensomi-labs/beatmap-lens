@@ -45,7 +45,7 @@ export async function startTimingServer(options: {
   });
   const summary = options.session ? await checkSession(fullPath(options.session)) : undefined;
   const timing = createTimingMiddleware();
-  const draft = createDraftMiddleware();
+  const draft = options.session ? null : createDraftMiddleware();
   const page = options.session
     ? `/timing?session=${encodeURIComponent(fullPath(options.session))}`
     : (options.home ?? "/timing");
@@ -56,17 +56,19 @@ export async function startTimingServer(options: {
       if (!response.headersSent) response.writeHead(status);
       response.end();
     };
+    const serve = () => {
+      serveStatic(request.url ?? "/", request.method ?? "GET").then(
+        ({ status, headers, body }) => {
+          response.writeHead(status, { "Cache-Control": "no-cache", ...headers });
+          response.end(request.method === "HEAD" ? undefined : body);
+        },
+        (error) => fail(500, error),
+      );
+    };
     try {
       timing(request, response, () => {
-        draft(request, response, () => {
-          serveStatic(request.url ?? "/", request.method ?? "GET").then(
-            ({ status, headers, body }) => {
-              response.writeHead(status, { "Cache-Control": "no-cache", ...headers });
-              response.end(request.method === "HEAD" ? undefined : body);
-            },
-            (error) => fail(500, error),
-          );
-        });
+        if (draft) draft(request, response, serve);
+        else serve();
       });
     } catch (error) {
       fail(400, error);
@@ -83,7 +85,7 @@ export async function startTimingServer(options: {
       return { status: 400, headers: {}, body: "Malformed address." };
     }
     if (path === "/") return { status: 302, headers: { Location: page }, body: "" };
-    if (path === "/timing" || path === "/compare" || path === "/draft")
+    if (path === "/timing" || path === "/compare" || (!options.session && path === "/draft"))
       return { status: 200, headers: { "Content-Type": mime[".html"] }, body: index };
     const filename = resolve(staticRoot, path.replace(/^\/+/, ""));
     if (!filename.startsWith(`${staticRoot}${sep}`))

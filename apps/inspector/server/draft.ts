@@ -14,17 +14,29 @@
  * - `trace/append` and `GET trace`: the append-only `.jsonl` trace, one serialized writer per file.
  */
 import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { createReadStream, existsSync } from "node:fs";
-import { appendFile, mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
+import {
+  appendFile,
+  mkdir,
+  open,
+  readFile,
+  rename,
+  rm,
+  stat,
+  truncate,
+  writeFile,
+} from "node:fs/promises";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, extname, join } from "node:path";
+import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
 import {
+  assertTraceEventEnvelope,
   type Beat,
+  canonicalJson,
   type ProviderInfo,
-  parseTraceNdjson,
   type SoundAnchor,
   serializeTraceNdjson,
   type TraceEvent,
@@ -97,17 +109,56 @@ export function runProcess(
   args: string[],
   signal?: AbortSignal,
 ): Promise<{ stdout: Buffer; stderr: string }> {
+  if (signal?.aborted) {
+    return Promise.reject(new DOMException("The operation was aborted.", "AbortError"));
+  }
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
       stdio: ["ignore", "pipe", "pipe"],
-      ...(signal ? { signal } : {}),
     });
     const out: Buffer[] = [];
     const err: Buffer[] = [];
+    let settled = false;
+    let killTimer: ReturnType<typeof setTimeout> | undefined;
+
+    const cleanup = () => {
+      if (killTimer !== undefined) {
+        clearTimeout(killTimer);
+        killTimer = undefined;
+      }
+      signal?.removeEventListener("abort", onAbort);
+    };
+
+    const onAbort = () => {
+      try {
+        child.kill("SIGTERM");
+      } catch {}
+      killTimer = setTimeout(() => {
+        try {
+          child.kill("SIGKILL");
+        } catch {}
+      }, 2000);
+      killTimer.unref?.();
+      if (!settled) {
+        settled = true;
+        cleanup();
+        reject(new DOMException("The operation was aborted.", "AbortError"));
+      }
+    };
+
+    signal?.addEventListener("abort", onAbort, { once: true });
     child.stdout.on("data", (chunk: Buffer) => out.push(chunk));
     child.stderr.on("data", (chunk: Buffer) => err.push(chunk));
-    child.on("error", reject);
+    child.on("error", (error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(error);
+    });
     child.on("close", (code) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
       const stderr = Buffer.concat(err).toString("utf8");
       if (code === 0) resolve({ stdout: Buffer.concat(out), stderr });
       else
@@ -120,19 +171,186 @@ export function runProcess(
   });
 }
 
-/** Appends to `.jsonl` files one write at a time per file, in call order. */
-export class TraceWriter {
-  private readonly tails = new Map<string, Promise<void>>();
+function assertNotTimingFile(path: string) {
+  const lower = basename(path).toLowerCase();
+  if (lower.endsWith(".timing.marks.jsonl") || lower.endsWith(".timing.notes.jsonl")) {
+    throw new Error("Refusing to open or write a Timing marks/notes file as a Draft trace.");
+  }
+}
 
-  append(path: string, events: readonly TraceEvent[]): Promise<void> {
-    const text = serializeTraceNdjson([...events]);
-    if (!text) return Promise.resolve();
+interface InspectedTrace {
+  events: TraceEvent[];
+  needsLeadingNewline: boolean;
+  truncateBytes?: number;
+}
+
+/**
+ * Validates existing NDJSON content strictly as `ensomi` v0 Draft trace events.
+ * Complete JSON records that do not match the Draft envelope (e.g. Timing marks) are ALWAYS
+ * rejected; an unterminated, syntactically incomplete final line may be recovered/truncated.
+ */
+function inspectTraceContent(raw: string, allowTruncatedTail: boolean): InspectedTrace {
+  if (raw.length === 0) return { events: [], needsLeadingNewline: false };
+  const hasTrailingNewline = raw.endsWith("\n");
+  const lines = raw.split(/\r?\n/);
+  if (hasTrailingNewline) lines.pop();
+  if (lines.length === 0) return { events: [], needsLeadingNewline: false };
+
+  const events: TraceEvent[] = [];
+  const seenIds = new Set<string>();
+  let prevSeq = -1;
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i] as string;
+    const isLast = i === lines.length - 1;
+    const lineNum = i + 1;
+    if (line.trim().length === 0) {
+      throw new Error(`Invalid Draft trace file: empty line at line ${lineNum}.`);
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(line);
+    } catch (error) {
+      if (isLast && !hasTrailingNewline && allowTruncatedTail) {
+        const lastNewline = raw.lastIndexOf("\n");
+        const truncateBytes =
+          lastNewline >= 0 ? Buffer.byteLength(raw.slice(0, lastNewline + 1), "utf8") : 0;
+        return { events, needsLeadingNewline: false, truncateBytes };
+      }
+      throw new Error(
+        `Invalid Draft trace file at line ${lineNum}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    let event: TraceEvent;
+    try {
+      event = assertTraceEventEnvelope(parsed);
+    } catch (error) {
+      throw new Error(
+        `Not a valid Draft trace (.jsonl) file at line ${lineNum}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    if (prevSeq >= 0 && event.seq <= prevSeq) {
+      throw new Error(
+        `Invalid Draft trace file at line ${lineNum}: non-monotonic seq ${event.seq} after ${prevSeq}.`,
+      );
+    }
+    if (seenIds.has(event.id)) {
+      throw new Error(
+        `Invalid Draft trace file at line ${lineNum}: duplicate event id "${event.id}".`,
+      );
+    }
+    seenIds.add(event.id);
+    prevSeq = event.seq;
+    events.push(event);
+  }
+
+  return { events, needsLeadingNewline: events.length > 0 && !hasTrailingNewline };
+}
+
+function validateIncomingBatch(events: readonly unknown[]): TraceEvent[] {
+  const validated: TraceEvent[] = [];
+  const seenIds = new Set<string>();
+  let prevSeq = -1;
+  for (const raw of events) {
+    const event = assertTraceEventEnvelope(raw);
+    if (prevSeq >= 0 && event.seq <= prevSeq) {
+      throw new Error(
+        `Incoming trace events must have strictly increasing seq (got ${event.seq} after ${prevSeq}).`,
+      );
+    }
+    if (seenIds.has(event.id)) {
+      throw new Error(`Incoming trace events contain duplicate id "${event.id}".`);
+    }
+    seenIds.add(event.id);
+    prevSeq = event.seq;
+    validated.push(event);
+  }
+  return validated;
+}
+
+export interface TraceAppendResult {
+  appended: number;
+  skipped: number;
+}
+
+/**
+ * Appends to `.jsonl` Draft trace files one write at a time per file, in call order.
+ * Validates existing and incoming records as `ensomi` v0 Draft envelopes, preserves newline
+ * framing (including torn-tail recovery), rejects conflicting writers, and treats identical
+ * `(seq, id)` retries as idempotent no-ops.
+ */
+export class TraceWriter {
+  private readonly tails = new Map<string, Promise<unknown>>();
+
+  append(path: string, events: readonly TraceEvent[]): Promise<TraceAppendResult> {
+    let incoming: TraceEvent[];
+    try {
+      assertNotTimingFile(path);
+      incoming = validateIncomingBatch(events);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    if (!incoming.length) return Promise.resolve({ appended: 0, skipped: 0 });
     const previous = this.tails.get(path) ?? Promise.resolve();
     const next = previous
       .catch(() => {})
-      .then(async () => {
+      .then(async (): Promise<TraceAppendResult> => {
+        let raw = "";
+        try {
+          raw = await readFile(path, "utf8");
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        }
+        const inspected = inspectTraceContent(raw, true);
+        const bySeq = new Map<number, TraceEvent>();
+        const byId = new Map<string, TraceEvent>();
+        let lastSeq = -1;
+        for (const ev of inspected.events) {
+          bySeq.set(ev.seq, ev);
+          byId.set(ev.id, ev);
+          lastSeq = ev.seq;
+        }
+
+        const toAppend: TraceEvent[] = [];
+        let skipped = 0;
+        for (const ev of incoming) {
+          const existingBySeq = bySeq.get(ev.seq);
+          const existingById = byId.get(ev.id);
+          if (existingBySeq && existingBySeq.id === ev.id) {
+            if (canonicalJson(existingBySeq) !== canonicalJson(ev)) {
+              throw new Error(
+                `Conflicting trace event for seq ${ev.seq} / id "${ev.id}" with different content.`,
+              );
+            }
+            skipped += 1;
+            continue;
+          }
+          if (existingBySeq || existingById) {
+            throw new Error(
+              `Conflicting trace writer: seq ${ev.seq} / id "${ev.id}" conflicts with existing trace.`,
+            );
+          }
+          if (ev.seq <= lastSeq) {
+            throw new Error(
+              `Conflicting trace writer: seq ${ev.seq} is not greater than persisted lastSeq ${lastSeq}.`,
+            );
+          }
+          bySeq.set(ev.seq, ev);
+          byId.set(ev.id, ev);
+          lastSeq = ev.seq;
+          toAppend.push(ev);
+        }
+
+        if (inspected.truncateBytes !== undefined) {
+          await truncate(path, inspected.truncateBytes);
+        }
+        if (!toAppend.length) return { appended: 0, skipped };
+
         await mkdir(dirname(path), { recursive: true });
-        await appendFile(path, text);
+        const serialized = serializeTraceNdjson(toAppend);
+        const payload = inspected.needsLeadingNewline ? `\n${serialized}` : serialized;
+        await appendFile(path, payload);
+        return { appended: toAppend.length, skipped };
       });
     this.tails.set(path, next);
     next.then(
@@ -144,23 +362,40 @@ export class TraceWriter {
 }
 
 export async function readTrace(path: string): Promise<TraceEvent[]> {
+  assertNotTimingFile(path);
   const text = await readFile(path, "utf8");
-  return parseTraceNdjson(text, { discardTruncatedTail: true });
+  return inspectTraceContent(text, true).events;
 }
 
 /**
  * One recompute in flight per page: a newer generation aborts the older one, whose answer is
- * then `superseded`; an older generation arriving late is `stale` and never runs.
+ * then `superseded`; an older generation arriving late is `stale` and never runs, even after
+ * the newer generation has completed (via a bounded per-client high-water mark).
  */
 export class RecomputeQueue {
   private readonly inflight = new Map<
     string,
     { generation: number; controller: AbortController }
   >();
+  private readonly highWater = new Map<string, number>();
+  private readonly maxClients: number;
   private readonly compute: typeof ruleMockRecompute;
 
-  constructor(compute = ruleMockRecompute) {
+  constructor(compute = ruleMockRecompute, maxClients = 128) {
     this.compute = compute;
+    this.maxClients = maxClients;
+  }
+
+  private recordHighWater(client: string, generation: number) {
+    const existing = this.highWater.get(client);
+    if (existing !== undefined && existing >= generation) return;
+    this.highWater.delete(client);
+    this.highWater.set(client, generation);
+    while (this.highWater.size > this.maxClients) {
+      const oldest = this.highWater.keys().next().value;
+      if (oldest === undefined) break;
+      this.highWater.delete(oldest);
+    }
   }
 
   async run(
@@ -169,12 +404,21 @@ export class RecomputeQueue {
     dropped?: AbortSignal,
   ): Promise<RecomputeOutcome> {
     const generation = request.generation;
+    const highest = this.highWater.get(client);
     const previous = this.inflight.get(client);
-    if (previous && previous.generation >= generation) return { status: "stale", generation };
+    if (
+      (highest !== undefined && generation < highest) ||
+      (previous && previous.generation >= generation)
+    ) {
+      return { status: "stale", generation };
+    }
+    this.recordHighWater(client, generation);
     previous?.controller.abort();
     const entry = { generation, controller: new AbortController() };
     this.inflight.set(client, entry);
-    dropped?.addEventListener("abort", () => entry.controller.abort(), { once: true });
+    const onDropped = () => entry.controller.abort();
+    if (dropped?.aborted) entry.controller.abort();
+    else dropped?.addEventListener("abort", onDropped, { once: true });
     try {
       const offers = await this.compute(request, entry.controller.signal);
       if (this.inflight.get(client) !== entry) return { status: "superseded", generation };
@@ -186,6 +430,7 @@ export class RecomputeQueue {
         generation,
       };
     } finally {
+      dropped?.removeEventListener("abort", onDropped);
       if (this.inflight.get(client) === entry) this.inflight.delete(client);
     }
   }
@@ -206,12 +451,44 @@ function seconds(value: unknown, name: string): number {
   return value;
 }
 
-const stamp = () =>
-  new Date()
-    .toISOString()
-    .replace(/[-:]/g, "")
-    .replace(/\.\d+Z$/, "Z");
+const stampMs = () => new Date().toISOString().replace(/[-:.]/g, "");
 const stemOf = (path: string) => basename(path, extname(path)).replace(/[^\w.-]+/g, "_");
+
+async function reserveTraceFile(localDir: string, stem: string): Promise<string> {
+  const folder = join(localDir, "draft-traces");
+  await mkdir(folder, { recursive: true });
+  for (let attempt = 0; attempt < 16; attempt += 1) {
+    const candidate = join(folder, `${stem}-${stampMs()}-${randomUUID().slice(0, 8)}.jsonl`);
+    try {
+      const handle = await open(candidate, "wx");
+      await handle.close();
+      return candidate;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") continue;
+      throw error;
+    }
+  }
+  throw new Error("Could not reserve a unique Draft trace filename.");
+}
+
+function disconnectController(
+  request: IncomingMessage,
+  response: ServerResponse,
+): { controller: AbortController; cleanup: () => void } {
+  const controller = new AbortController();
+  const onDisconnect = () => {
+    if (!response.writableFinished) controller.abort();
+  };
+  request.on("aborted", onDisconnect);
+  response.on("close", onDisconnect);
+  return {
+    controller,
+    cleanup: () => {
+      request.off("aborted", onDisconnect);
+      response.off("close", onDisconnect);
+    },
+  };
+}
 
 interface Analysis {
   audio: { path: string; durationS: number; sampleRate: number; channels: number; codec: string };
@@ -229,12 +506,14 @@ export function draftHandler(options: DraftServiceOptions = {}) {
   const cacheDir = options.cacheDir ?? join(tmpdir(), "beatmap-lens-draft-audition");
   const writer = new TraceWriter();
   const recomputes = new RecomputeQueue();
+  const registeredTraces = new Set<string>();
   const runPython = (args: string[], signal?: AbortSignal) =>
     runProcess(python.command, [...python.args, ...args], signal);
 
-  async function analyze(body: { audioPath?: unknown }) {
+  async function analyze(body: { audioPath?: unknown }, signal?: AbortSignal) {
     const path = await audioFile(body.audioPath);
-    const { stdout } = await runPython([helper, "analyze", path]);
+    const { stdout } = await runPython([helper, "analyze", path], signal);
+    if (signal?.aborted) throw new DOMException("The operation was aborted.", "AbortError");
     const result = JSON.parse(stdout.toString("utf8")) as Analysis;
     const beatSource = result.beats.provider.kind === "model" ? "model" : "rule";
     const beats: Beat[] = result.beats.items.map((item, index) => ({
@@ -254,19 +533,24 @@ export function draftHandler(options: DraftServiceOptions = {}) {
       version: 1,
       experimental: true,
     }));
+    const reserved = await reserveTraceFile(localDir, stemOf(path));
+    registeredTraces.add(reserved);
     return {
       audio: { ...result.audio, title: basename(path) },
       beats,
       sounds,
       boundaries: [],
       providers: { beats: result.beats.provider, sounds: result.sounds.provider },
-      tracePath: join(localDir, "draft-traces", `${stemOf(path)}-${stamp()}.jsonl`),
+      tracePath: reserved,
       runtime: python.label,
       seconds: result.seconds,
     };
   }
 
-  async function auditionView(body: Record<string, unknown>): Promise<string> {
+  async function auditionView(
+    body: Record<string, unknown>,
+    signal?: AbortSignal,
+  ): Promise<string> {
     const path = await audioFile(body.audioPath);
     const view = body.view as AuditionView;
     if (!auditionViews.includes(view))
@@ -282,26 +566,34 @@ export function draftHandler(options: DraftServiceOptions = {}) {
     const out = join(cacheDir, `${key}.wav`);
     if (!existsSync(out)) {
       await mkdir(cacheDir, { recursive: true });
-      const partial = `${out}.${process.pid}.${Date.now()}.part.wav`;
-      await runPython([
-        helper,
-        "audition",
-        path,
-        "--start",
-        String(start),
-        "--end",
-        String(end),
-        "--view",
-        view,
-        "--out",
-        partial,
-      ]);
-      await rename(partial, out);
+      const partial = `${out}.${process.pid}.${randomUUID().slice(0, 8)}.part.wav`;
+      try {
+        await runPython(
+          [
+            helper,
+            "audition",
+            path,
+            "--start",
+            String(start),
+            "--end",
+            String(end),
+            "--view",
+            view,
+            "--out",
+            partial,
+          ],
+          signal,
+        );
+        await rename(partial, out);
+      } catch (error) {
+        await rm(partial, { force: true }).catch(() => {});
+        throw error;
+      }
     }
     return out;
   }
 
-  async function exportClip(body: Record<string, unknown>) {
+  async function exportClip(body: Record<string, unknown>, signal?: AbortSignal) {
     const path = await audioFile(body.audioPath);
     const start = seconds(body.startSec, "startSec");
     const end = seconds(body.endSec, "endSec");
@@ -312,27 +604,36 @@ export function draftHandler(options: DraftServiceOptions = {}) {
     const format = body.format === "mp3" ? "mp3" : "wav";
     const folder = join(localDir, "draft-clips");
     await mkdir(folder, { recursive: true });
-    const name = `${stemOf(path)}-${start.toFixed(3)}-${end.toFixed(3)}-${stamp()}`;
+    const name = `${stemOf(path)}-${start.toFixed(3)}-${end.toFixed(3)}-${stampMs()}-${randomUUID().slice(0, 8)}`;
     const timingPath = join(folder, `${name}.beats.json`);
     const outputPath = join(folder, `${name}.${format}`);
     // Beats only: no downbeats are given, so the harness infers no bar.
     await writeFile(timingPath, JSON.stringify({ beats }));
-    const { stdout } = await runPython([
-      harness,
-      "audition",
-      path,
-      "--timing",
-      timingPath,
-      "--format",
-      "json",
-      "--out",
-      outputPath,
-      "--start",
-      String(start),
-      "--end",
-      String(end),
-    ]);
-    return { ...JSON.parse(stdout.toString("utf8")), outputPath, timingPath };
+    try {
+      const { stdout } = await runPython(
+        [
+          harness,
+          "audition",
+          path,
+          "--timing",
+          timingPath,
+          "--format",
+          "json",
+          "--out",
+          outputPath,
+          "--start",
+          String(start),
+          "--end",
+          String(end),
+        ],
+        signal,
+      );
+      return { ...JSON.parse(stdout.toString("utf8")), outputPath, timingPath };
+    } catch (error) {
+      await rm(outputPath, { force: true }).catch(() => {});
+      await rm(timingPath, { force: true }).catch(() => {});
+      throw error;
+    }
   }
 
   async function writeDemo() {
@@ -341,9 +642,11 @@ export function draftHandler(options: DraftServiceOptions = {}) {
       await mkdir(dirname(audioPath), { recursive: true });
       await writeFile(audioPath, encodeWav([demoPcm()], demoSampleRate));
     }
+    const reserved = await reserveTraceFile(localDir, "synthetic-demo");
+    registeredTraces.add(reserved);
     return {
       audioPath,
-      tracePath: join(localDir, "draft-traces", `synthetic-demo-${stamp()}.jsonl`),
+      tracePath: reserved,
     };
   }
 
@@ -351,6 +654,7 @@ export function draftHandler(options: DraftServiceOptions = {}) {
     if (typeof input !== "string") throw new Error("Give the trace's full path.");
     const path = fullPath(input);
     if (extname(path) !== ".jsonl") throw new Error("A trace is a .jsonl file.");
+    assertNotTimingFile(path);
     return path;
   }
 
@@ -358,58 +662,76 @@ export function draftHandler(options: DraftServiceOptions = {}) {
     assertLocalRequest(request, url);
     const operation = url.pathname.slice(prefix.length + 1);
     if (request.method === "GET" && operation === "trace") {
-      sendJson(response, { events: await readTrace(tracePath(url.searchParams.get("path"))) });
+      const path = tracePath(url.searchParams.get("path"));
+      const events = await readTrace(path);
+      registeredTraces.add(path);
+      sendJson(response, { events });
       return;
     }
     if (request.method !== "POST") throw new Error("Use POST for draft operations.");
     const body = JSON.parse((await readBody(request)).toString("utf8") || "{}");
-    if (operation === "analyze") sendJson(response, await analyze(body));
-    else if (operation === "demo") sendJson(response, await writeDemo());
-    else if (operation === "pcm") {
-      const path = await audioFile(body.audioPath);
-      const { stdout } = await runProcess("ffmpeg", [
-        "-v",
-        "error",
-        "-nostdin",
-        "-i",
-        path,
-        "-map",
-        "0:a:0",
-        "-f",
-        "f32le",
-        "-acodec",
-        "pcm_f32le",
-        "-",
-      ]);
-      response.setHeader("Content-Type", "application/octet-stream");
-      response.end(stdout);
-    } else if (operation === "recompute") {
-      const dropped = new AbortController();
-      response.on("close", () => {
-        if (!response.writableFinished) dropped.abort();
-      });
-      sendJson(
-        response,
-        await recomputes.run(
+    const { controller: disconnected, cleanup } = disconnectController(request, response);
+    try {
+      if (operation === "analyze") {
+        const result = await analyze(body, disconnected.signal);
+        if (!disconnected.signal.aborted && !response.destroyed) sendJson(response, result);
+      } else if (operation === "demo") sendJson(response, await writeDemo());
+      else if (operation === "pcm") {
+        const path = await audioFile(body.audioPath);
+        const { stdout } = await runProcess(
+          "ffmpeg",
+          [
+            "-v",
+            "error",
+            "-nostdin",
+            "-i",
+            path,
+            "-map",
+            "0:a:0",
+            "-f",
+            "f32le",
+            "-acodec",
+            "pcm_f32le",
+            "-",
+          ],
+          disconnected.signal,
+        );
+        if (!disconnected.signal.aborted && !response.destroyed) {
+          response.setHeader("Content-Type", "application/octet-stream");
+          response.end(stdout);
+        }
+      } else if (operation === "recompute") {
+        const result = await recomputes.run(
           String(body.client ?? "page"),
           body.request as RecomputeRequest,
-          dropped.signal,
-        ),
-      );
-    } else if (operation === "audition-view") {
-      const out = await auditionView(body);
-      response.setHeader("Content-Type", "audio/wav");
-      response.setHeader("X-Audition-Only", "listening view; timestamps stay on the original mix");
-      await new Promise<void>((resolve, reject) => {
-        createReadStream(out).on("error", reject).pipe(response).on("finish", resolve);
-      });
-    } else if (operation === "export-clip") sendJson(response, await exportClip(body));
-    else if (operation === "trace/append") {
-      const path = tracePath(body.tracePath);
-      if (!Array.isArray(body.events)) throw new Error("Give the events to append.");
-      await writer.append(path, body.events);
-      sendJson(response, { tracePath: path, appended: body.events.length });
-    } else throw new Error("Unknown draft operation.");
+          disconnected.signal,
+        );
+        if (!disconnected.signal.aborted && !response.destroyed) sendJson(response, result);
+      } else if (operation === "audition-view") {
+        const out = await auditionView(body, disconnected.signal);
+        if (disconnected.signal.aborted || response.destroyed) return;
+        response.setHeader("Content-Type", "audio/wav");
+        response.setHeader(
+          "X-Audition-Only",
+          "listening view; timestamps stay on the original mix",
+        );
+        await pipeline(createReadStream(out), response, { signal: disconnected.signal });
+      } else if (operation === "export-clip") {
+        const result = await exportClip(body, disconnected.signal);
+        if (!disconnected.signal.aborted && !response.destroyed) sendJson(response, result);
+      } else if (operation === "trace/append") {
+        const path = tracePath(body.tracePath);
+        if (!Array.isArray(body.events)) throw new Error("Give the events to append.");
+        const result = await writer.append(path, body.events);
+        registeredTraces.add(path);
+        sendJson(response, { tracePath: path, ...result });
+      } else throw new Error("Unknown draft operation.");
+    } catch (error) {
+      if (disconnected.signal.aborted || response.destroyed) return;
+      throw error;
+    } finally {
+      cleanup();
+    }
   };
 }
 

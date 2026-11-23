@@ -7,6 +7,7 @@ import {
   serializeTraceNdjson as ensomiSerializeTraceNdjson,
 } from "ensomi";
 import { describe, expect, it } from "vitest";
+import { TraceAppendQueue, type TraceQueueSnapshot } from "./client";
 import {
   type Beat,
   computeConsequences,
@@ -15,8 +16,10 @@ import {
   createInitialState,
   DRAFT_GRID_FIT_OPTIONS,
   extractDraftMeta,
+  flamLoopBounds,
   foldTrace,
   getRangeEntityIds,
+  nearestGridSlot,
   type PatchOffer,
   parseTraceNdjson,
   projectRedLines,
@@ -24,6 +27,7 @@ import {
   resolveActiveRetractions,
   type SoundAnchor,
   serializeTraceNdjson,
+  signedGridResidualMs,
   sortedEntities,
   TRACE_SCHEMA_VERSION,
   type TraceEvent,
@@ -544,10 +548,192 @@ describe("RuleMockRecompute", () => {
     controller.abort();
     await expect(running).rejects.toMatchObject({ name: "AbortError" });
   });
+
+  it("namespaces durable IDs across reloads so newly generated beats and offers never collide", async () => {
+    const first = await ruleMockRecompute(
+      request({
+        generation: 1,
+        basisSeq: 1,
+        span: { t0: 0, t1: 4 },
+        durationS: 8,
+        beats: grid(6),
+      }),
+    );
+    const firstExtend = first.find((o) => o.role === "extend");
+    expect(firstExtend).toBeDefined();
+    const acceptedBeats = [
+      ...grid(6),
+      ...(firstExtend?.ops.upsertBeats ?? []).map((b) => ({
+        ...b,
+        version: b.version ?? 1,
+      })),
+    ];
+    // Simulate a page reload where generation restarts at 1 with higher basisSeq and existing beats/offers.
+    const second = await ruleMockRecompute(
+      request({
+        generation: 1,
+        basisSeq: 4,
+        span: { t0: 4, t1: 8 },
+        durationS: 12,
+        beats: acceptedBeats,
+        existingOfferIds: first.map((o) => o.id),
+      }),
+    );
+    const secondExtend = second.find((o) => o.role === "extend");
+    expect(secondExtend).toBeDefined();
+    const existingBeatIds = new Set(acceptedBeats.map((b) => b.id));
+    for (const beat of secondExtend?.ops.upsertBeats ?? []) {
+      expect(existingBeatIds.has(beat.id)).toBe(false);
+    }
+    const firstOfferIds = new Set(first.map((o) => o.id));
+    for (const offer of second) {
+      expect(firstOfferIds.has(offer.id)).toBe(false);
+    }
+  });
+
+  it("gives independent proposals distinct batchIds while keeping alternative siblings shared", async () => {
+    // Beat b2 at 1.0 has a strong sound 12 ms away -> quick_fix; steady run ends at 3.5 -> extend.
+    const session = new DraftSession();
+    session.initDraft(
+      demoAudio(),
+      { beats: grid(8), sounds: [sound("s_snap", 1.012, 1.0)] },
+      demoProviders,
+    );
+    const offers = await ruleMockRecompute({
+      generation: 1,
+      basisSeq: session.state.lastSeq,
+      span: { t0: 0, t1: 6 },
+      durationS: 10,
+      beats: sortedEntities(session.state.beats),
+      boundaries: [],
+      sounds: sortedEntities(session.state.sounds),
+      statements: [],
+      suppressions: [],
+    });
+    const fix = offers.find((o) => o.role === "quick_fix");
+    const ext = offers.find((o) => o.role === "extend");
+    expect(fix).toBeDefined();
+    expect(ext).toBeDefined();
+    expect(fix?.batchId).not.toBe(ext?.batchId);
+
+    session.recordOfferBatch(offers);
+    const acceptFix = session.acceptOffer(fix?.id ?? "");
+    expect(acceptFix.ok).toBe(true);
+    // Disjoint extend offer must remain pending, NOT superseded by quick_fix!
+    expect(session.state.offers.get(ext?.id ?? "")?.status).toBe("pending");
+    const acceptExt = session.acceptOffer(ext?.id ?? "");
+    expect(acceptExt.ok).toBe(true);
+  });
+
+  it("bounds local phase reset to the earliest boundary or selection end", async () => {
+    // Selection [0, 6] has an interior boundary at 3.2; phase reset at 2.19 must stop at 3.2.
+    const withInterior = await ruleMockRecompute(
+      request({
+        span: { t0: 0, t1: 6 },
+        durationS: 12,
+        beats: grid(16),
+        boundaries: [
+          { id: "b_in", t: 3.2, kind: "reset", source: "user", version: 1 },
+          { id: "b_far", t: 10, kind: "reset", source: "user", version: 1 },
+        ],
+        sounds: [sound("a", 2.19), sound("b", 2.69)],
+      }),
+    );
+    const resetInterior = withInterior.find((o) => o.role === "alternative" && o.optionIndex === 0);
+    expect(resetInterior).toBeDefined();
+    expect(resetInterior?.writeScope.t1).toBeLessThanOrEqual(3.2);
+    for (const upserted of resetInterior?.ops.upsertBeats ?? []) {
+      expect(upserted.t).toBeLessThan(3.2);
+    }
+
+    // Selection [0, 4] with only a distant boundary at 10 must stop at selection end (4).
+    const withDistant = await ruleMockRecompute(
+      request({
+        span: { t0: 0, t1: 4 },
+        durationS: 12,
+        beats: grid(16),
+        boundaries: [{ id: "b_far", t: 10, kind: "reset", source: "user", version: 1 }],
+        sounds: [sound("a", 2.19), sound("b", 2.69)],
+      }),
+    );
+    const resetDistant = withDistant.find((o) => o.role === "alternative" && o.optionIndex === 0);
+    expect(resetDistant).toBeDefined();
+    expect(resetDistant?.writeScope.t1).toBeLessThanOrEqual(4);
+    for (const upserted of resetDistant?.ops.upsertBeats ?? []) {
+      expect(upserted.t).toBeLessThan(4);
+    }
+  });
+});
+
+describe("flam loop bounds and signed residual", () => {
+  it("computes exact signed residual (negative early, positive late) and handles 0 beats", () => {
+    expect(nearestGridSlot(1.0, [])).toBeNull();
+    expect(signedGridResidualMs(1.0, [])).toBe(0);
+    // Beat grid at 0.5 s -> quarter-beat slots every 0.125 s (0.5, 0.625, 0.75, 0.875, 1.0)
+    const early = nearestGridSlot(0.985, [0.5, 1.0, 1.5]);
+    expect(early?.slotTime).toBeCloseTo(1.0, 6);
+    expect(early?.residualMs).toBeCloseTo(-15, 4);
+    const late = nearestGridSlot(1.015, [0.5, 1.0, 1.5]);
+    expect(late?.slotTime).toBeCloseTo(1.0, 6);
+    expect(late?.residualMs).toBeCloseTo(15, 4);
+    // Sound at 4 s, nearest beat at 2 s -> residual is +2000 ms, flam loop contains BOTH 2 s and 4 s
+    const far = nearestGridSlot(4.0, [1.5, 2.0]);
+    expect(far?.slotTime).toBe(2.0);
+    expect(far?.residualMs).toBeCloseTo(2000, 4);
+    const bounds = flamLoopBounds(4.0, 2.0, 10.0, 0.4);
+    expect(bounds.t0).toBeCloseTo(1.6, 6);
+    expect(bounds.t1).toBeCloseTo(4.4, 6);
+    expect(flamLoopBounds(0.1, 0.2, 0.35, 0.4)).toEqual({ t0: 0, t1: 0.35 });
+  });
+});
+
+describe("TraceAppendQueue", () => {
+  it("keeps a failed prefix queued and retries it in order before reporting saved", async () => {
+    const sent: number[][] = [];
+    const statuses: TraceQueueSnapshot[] = [];
+    let failNext = false;
+    const queue = new TraceAppendQueue(
+      async (_path, events) => {
+        sent.push(events.map((ev) => ev.seq));
+        if (failNext) {
+          failNext = false;
+          throw new Error("disk full");
+        }
+      },
+      (snap) => statuses.push(snap),
+    );
+    const ev = (seq: number): TraceEvent => ({
+      schemaVersion: "0.1",
+      seq,
+      id: `edit_${seq}`,
+      type: "edit",
+      author: { kind: "user" },
+      payload: { op: "remove_beat", id: `b${seq}` },
+    });
+
+    queue.attach("/tmp/t.jsonl", [ev(0), ev(1)]);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(queue.snapshot()).toMatchObject({ status: "saved", pendingCount: 0 });
+
+    failNext = true;
+    queue.enqueue([ev(2)]);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(queue.snapshot()).toMatchObject({
+      status: "error",
+      pendingCount: 1,
+      lastError: "disk full",
+    });
+
+    // Next edit retries the missing prefix [2, 3] together in order!
+    queue.enqueue([ev(3)]);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(sent).toEqual([[0, 1], [2], [2, 3]]);
+    expect(queue.snapshot()).toMatchObject({ status: "saved", pendingCount: 0 });
+  });
 });
 
 describe("stage helpers", () => {
-  it("bands runs as steady with a BPM, free, or gap", () => {
+  it("bands runs as steady with a BPM, free, or gap, including trailing gaps after the final beat", () => {
     const beats = [...grid(5), beat("f1", 2.4), beat("f2", 3.1), beat("f3", 3.4)];
     const bands = runBands(beats, [
       { id: "f", t: 2.4, kind: "free_start", source: "user", version: 1 },
@@ -556,6 +742,21 @@ describe("stage helpers", () => {
     ]);
     expect(bands.map((band) => band.kind)).toEqual(["steady", "free", "gap"]);
     expect(bands[0]?.bpm).toBeCloseTo(120, 6);
+
+    // Gap whose closing boundary is AFTER the final beat
+    const trailingClosed = runBands(grid(4), [
+      { id: "g1", t: 2.0, kind: "gap_start", source: "user", version: 1 },
+      { id: "g2", t: 3.5, kind: "gap_end", source: "user", version: 1 },
+    ]);
+    expect(trailingClosed).toContainEqual({ t0: 2.0, t1: 3.5, kind: "gap" });
+
+    // Unclosed gap after the final beat extends to durationS
+    const trailingOpen = runBands(
+      grid(4),
+      [{ id: "g1", t: 2.0, kind: "gap_start", source: "user", version: 1 }],
+      6.0,
+    );
+    expect(trailingOpen).toContainEqual({ t0: 2.0, t1: 6.0, kind: "gap" });
   });
 
   it("collapses dense beats, scales whiskers by ms and normalizes overview heat", () => {

@@ -72,6 +72,17 @@ it("serves the built page and the service, opening the session from the root add
     body: JSON.stringify({ session_path: sessionPath }),
   });
   expect((await opened.json()).passages).toHaveLength(1);
+  // Dedicated blind --session runs do not mount Draft endpoints or /draft.
+  expect(
+    (
+      await fetch(`${origin}/api/draft/demo`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Beatmap-Lens-Local": "1" },
+        body: "{}",
+      })
+    ).status,
+  ).toBe(405);
+  expect((await fetch(`${origin}/draft`)).status).toBe(404);
 });
 
 it("answers malformed requests without stopping", async () => {

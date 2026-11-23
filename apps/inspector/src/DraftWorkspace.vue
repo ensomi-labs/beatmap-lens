@@ -1,6 +1,12 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, shallowRef, watch } from "vue";
-import { deinterleave, draftJson, draftRequest } from "./draft/client";
+import {
+  deinterleave,
+  draftJson,
+  draftRequest,
+  TraceAppendQueue,
+  type TraceSaveStatus,
+} from "./draft/client";
 import {
   type Beat,
   type Boundary,
@@ -10,9 +16,11 @@ import {
   type DraftAudio,
   type DraftProviders,
   extractDraftMeta,
+  flamLoopBounds,
   formatConsequences,
   type GridFitItem,
   isNonBinaryDivisor,
+  nearestGridSlot,
   type PatchOffer,
   projectRedLines,
   rankTroubleSpans,
@@ -89,28 +97,37 @@ const clientId = `page-${Math.random().toString(36).slice(2, 10)}`;
 
 // ---------------------------------------------------------------- trace and state
 
-const tracePath = ref<string | null>(null);
-const traceStatus = ref<"none" | "saving" | "saved" | "error">("none");
-let persistChain: Promise<unknown> = Promise.resolve();
+let mounted = true;
+let trackEpoch = 0;
+let trackAbort: AbortController | null = null;
+let auditionToken = 0;
+let auditionAbort: AbortController | null = null;
+let mixPlayToken = 0;
 
-function appendToTrace(events: TraceEvent[]) {
-  const path = tracePath.value;
-  if (!path || !events.length) return;
-  traceStatus.value = "saving";
-  persistChain = persistChain
-    .then(() => draftJson("trace/append", { tracePath: path, events }))
-    .then(
-      () => {
-        if (tracePath.value === path) traceStatus.value = "saved";
-      },
-      (error: Error) => {
-        traceStatus.value = "error";
-        message.value = `Trace not saved: ${error.message}`;
-      },
-    );
+const tracePath = ref<string | null>(null);
+const traceStatus = ref<TraceSaveStatus>("none");
+const tracePendingCount = ref(0);
+const traceSaveError = ref<string | null>(null);
+
+const traceQueue = new TraceAppendQueue(
+  (path, events) => draftJson("trace/append", { tracePath: path, events }),
+  (snapshot) => {
+    if (!mounted) return;
+    tracePath.value = snapshot.path;
+    traceStatus.value = snapshot.status;
+    tracePendingCount.value = snapshot.pendingCount;
+    traceSaveError.value = snapshot.lastError;
+    if (snapshot.status === "error" && snapshot.lastError) {
+      message.value = `Trace not saved (${snapshot.pendingCount} pending): ${snapshot.lastError}`;
+    }
+  },
+);
+
+function retryTraceSave() {
+  void traceQueue.retry();
 }
 
-const session = new DraftSession((event) => appendToTrace([event]));
+const session = new DraftSession((event) => traceQueue.enqueue([event]));
 const state = shallowRef<SessionState>(session.state);
 const undoState = ref({ undo: false, redo: false });
 
@@ -150,23 +167,60 @@ const loopSpan = ref<Span | null>(null);
 const clicksOn = ref(true);
 const flamSlot = ref<number | null>(null);
 
-async function loadPcm(channels: Float32Array[], sampleRate: number) {
+async function loadPcm(channels: Float32Array[], sampleRate: number, epoch = trackEpoch) {
+  if (!mounted || epoch !== trackEpoch) return;
   if (!engine || engine.sampleRate !== sampleRate) {
-    await engine?.close();
-    engine = new TimingAudioEngine(sampleRate);
-    engine.onEnded = () => {
+    const previous = engine;
+    engine = undefined;
+    await previous?.close();
+    if (!mounted || epoch !== trackEpoch) return;
+    const nextEngine = new TimingAudioEngine(sampleRate);
+    nextEngine.onEnded = () => {
+      if (engine !== nextEngine) return;
       playing.value = false;
       stopFrames();
     };
-    engine.setClickVolume(0.5);
+    nextEngine.setClickVolume(0.5);
+    if (!mounted || epoch !== trackEpoch) {
+      void nextEngine.close();
+      return;
+    }
+    engine = nextEngine;
   }
   engine.load(channels, channels[0]?.length ?? 0);
+  if (!mounted || epoch !== trackEpoch) return;
   pcm.value = channels;
   audioReady.value = true;
   syncClicks();
 }
 
 // ---------------------------------------------------------------- loading
+
+function beginTrackTransition(): { epoch: number; signal: AbortSignal } {
+  commitTransient();
+  const epoch = ++trackEpoch;
+  trackAbort?.abort();
+  const controller = new AbortController();
+  trackAbort = controller;
+  recomputeAbort?.abort();
+  recomputeAbort = null;
+  recomputing.value = null;
+  generation.value += 1;
+  clearAltState();
+  stop();
+  audioReady.value = false;
+  pcm.value = null;
+  looping.value = false;
+  loopSpan.value = null;
+  flamSlot.value = null;
+  auditionView.value = "mix";
+  bandState.value = "idle";
+  clipPath.value = null;
+  const previousEngine = engine;
+  engine = undefined;
+  void previousEngine?.close();
+  return { epoch, signal: controller.signal };
+}
 
 function startDraft(
   audio: DraftAudio,
@@ -175,8 +229,7 @@ function startDraft(
   path: string | null,
 ) {
   stop();
-  tracePath.value = null;
-  traceStatus.value = "none";
+  traceQueue.detach();
   session.load([]);
   session.initDraft(audio, draft, draftProviders);
   sync();
@@ -184,29 +237,35 @@ function startDraft(
   resetSelection();
   activeOfferIndex.value = 0;
   tourIndex.value = -1;
+  looping.value = false;
+  loopSpan.value = null;
+  flamSlot.value = null;
   fitView();
 }
 
-function attachTrace(path: string) {
-  tracePath.value = path;
-  appendToTrace(session.events);
+function attachTrace(path: string, alreadySaved = false) {
+  traceQueue.attach(path, alreadySaved ? [] : session.events, alreadySaved);
 }
 
 async function loadDemo() {
   error.value = "";
+  const { epoch, signal } = beginTrackTransition();
   startDraft(
     demoAudio(),
     { beats: demoBeats(), sounds: demoSounds(), boundaries: [] },
     demoProviders,
     null,
   );
-  await loadPcm([demoPcm()], demoSampleRate);
+  await loadPcm([demoPcm()], demoSampleRate, epoch);
+  if (!mounted || epoch !== trackEpoch) return;
   message.value = "Demo loaded: a mock draft that misses the phase reset at 14 s.";
   try {
-    const demo = await draftJson<{ audioPath: string; tracePath: string }>("demo", {});
+    const demo = await draftJson<{ audioPath: string; tracePath: string }>("demo", {}, signal);
+    if (!mounted || epoch !== trackEpoch) return;
     audioPath.value = demo.audioPath;
     attachTrace(demo.tracePath);
-  } catch {
+  } catch (failure) {
+    if (!mounted || epoch !== trackEpoch || (failure as Error).name === "AbortError") return;
     message.value = "Demo loaded without the local service: no trace, audition views or clips.";
   }
 }
@@ -221,18 +280,27 @@ interface AnalyzeResponse {
   runtime: string;
 }
 
-async function fetchPcm(audio: DraftAudio & { path: string }) {
-  const response = await draftRequest("pcm", { audioPath: audio.path });
-  await loadPcm(deinterleave(await response.arrayBuffer(), audio.channels), audio.sampleRate);
+async function fetchPcm(
+  audio: DraftAudio & { path: string },
+  epoch: number,
+  signal?: AbortSignal,
+) {
+  const response = await draftRequest("pcm", { audioPath: audio.path }, signal);
+  if (!mounted || epoch !== trackEpoch) return;
+  const bytes = await response.arrayBuffer();
+  if (!mounted || epoch !== trackEpoch) return;
+  await loadPcm(deinterleave(bytes, audio.channels), audio.sampleRate, epoch);
 }
 
 async function analyzeTrack() {
   const path = trackInput.value.trim();
   if (!path) return;
+  const { epoch, signal } = beginTrackTransition();
   busy.value = "Analyzing";
   error.value = "";
   try {
-    const result = await draftJson<AnalyzeResponse>("analyze", { audioPath: path });
+    const result = await draftJson<AnalyzeResponse>("analyze", { audioPath: path }, signal);
+    if (!mounted || epoch !== trackEpoch) return;
     startDraft(
       result.audio,
       { beats: result.beats, sounds: result.sounds, boundaries: result.boundaries },
@@ -241,41 +309,51 @@ async function analyzeTrack() {
     );
     attachTrace(result.tracePath);
     message.value = `${result.beats.length} beats · ${result.sounds.length} sounds · ${result.runtime}`;
-    await fetchPcm(result.audio);
+    await fetchPcm(result.audio, epoch, signal);
   } catch (failure) {
+    if (!mounted || epoch !== trackEpoch || (failure as Error).name === "AbortError") return;
     error.value = (failure as Error).message;
   } finally {
-    busy.value = null;
+    if (mounted && epoch === trackEpoch) busy.value = null;
   }
 }
 
 async function openTrace() {
   const path = traceInput.value.trim();
   if (!path) return;
+  const { epoch, signal } = beginTrackTransition();
   busy.value = "Opening";
   error.value = "";
   try {
     const response = await fetch(`/api/draft/trace?path=${encodeURIComponent(path)}`, {
       headers: { "X-Beatmap-Lens-Local": "1" },
+      signal,
     });
+    if (!mounted || epoch !== trackEpoch) return;
     const body = await response.json();
+    if (!mounted || epoch !== trackEpoch) return;
     if (!response.ok) throw new Error(body.error);
     stop();
+    traceQueue.detach();
     session.load(body.events as TraceEvent[]);
     sync();
-    tracePath.value = path;
-    traceStatus.value = "saved";
+    generation.value = Math.max(generation.value, state.value.generation);
+    attachTrace(path, true);
     const audio = draftAudio.value;
     audioPath.value = audio?.path ?? null;
     resetSelection();
+    activeOfferIndex.value = 0;
+    tourIndex.value = -1;
     fitView();
-    if (audio?.title === demoTitle) await loadPcm([demoPcm()], demoSampleRate);
-    else if (audio?.path) await fetchPcm(audio as DraftAudio & { path: string });
+    if (audio?.title === demoTitle) await loadPcm([demoPcm()], demoSampleRate, epoch);
+    else if (audio?.path) await fetchPcm(audio as DraftAudio & { path: string }, epoch, signal);
+    if (!mounted || epoch !== trackEpoch) return;
     message.value = `Trace opened: ${body.events.length} events`;
   } catch (failure) {
+    if (!mounted || epoch !== trackEpoch || (failure as Error).name === "AbortError") return;
     error.value = (failure as Error).message;
   } finally {
-    busy.value = null;
+    if (mounted && epoch === trackEpoch) busy.value = null;
   }
 }
 
@@ -314,15 +392,24 @@ function zoom(key: (typeof zoomPresets)[number]["key"]) {
 const x = (t: number) => xOf(t, view.value, stageWidth.value);
 
 let resizeObserver: ResizeObserver | undefined;
+watch(
+  stageWrap,
+  (element) => {
+    resizeObserver?.disconnect();
+    resizeObserver = undefined;
+    if (!element) return;
+    if (element.clientWidth) stageWidth.value = element.clientWidth;
+    if (typeof ResizeObserver === "function") {
+      resizeObserver = new ResizeObserver(() => {
+        if (element.clientWidth) stageWidth.value = element.clientWidth;
+      });
+      resizeObserver.observe(element);
+    }
+  },
+  { flush: "post", immediate: true },
+);
+
 onMounted(() => {
-  const element = stageWrap.value;
-  if (element?.clientWidth) stageWidth.value = element.clientWidth;
-  if (element && typeof ResizeObserver === "function") {
-    resizeObserver = new ResizeObserver(() => {
-      if (element.clientWidth) stageWidth.value = element.clientWidth;
-    });
-    resizeObserver.observe(element);
-  }
   window.addEventListener("keydown", onKeyDown);
   window.addEventListener("keyup", onKeyUp);
   window.addEventListener("blur", releaseAb);
@@ -401,14 +488,26 @@ function settleLater() {
 
 function nudge(deltaS: number) {
   if (runSelected.value && selection.value) {
+    if (
+      preview.value ||
+      (runShift.value &&
+        (runShift.value.span.t0 !== selection.value.t0 ||
+          runShift.value.span.t1 !== selection.value.t1))
+    ) {
+      commitTransient();
+    }
     const span = runShift.value?.span ?? selection.value;
     runShift.value = { span, dt: (runShift.value?.dt ?? 0) + deltaS };
     settleLater();
     return true;
   }
+  if (runShift.value || (preview.value && preview.value.beatId !== selectedBeatId.value)) {
+    commitTransient();
+  }
   const beat = selectedBeatId.value ? state.value.beats.get(selectedBeatId.value) : undefined;
   if (!beat) return false;
-  preview.value = { beatId: beat.id, t: (preview.value?.t ?? beat.t) + deltaS };
+  const baseT = preview.value?.beatId === beat.id ? preview.value.t : beat.t;
+  preview.value = { beatId: beat.id, t: Math.max(0, baseT + deltaS) };
   settleLater();
   return true;
 }
@@ -429,7 +528,7 @@ const signedResidual = (t: number) => signedGridResidualMs(t, beatTimes.value);
 const trouble = computed(() =>
   rankTroubleSpans(state.value, { gridFitOptions: DRAFT_GRID_FIT_OPTIONS }),
 );
-const bands = computed(() => runBands(displayBeats.value, boundaries.value));
+const bands = computed(() => runBands(displayBeats.value, boundaries.value, duration.value));
 const heat = computed(() =>
   duration.value ? overviewHeat(fits.value, beats.value, duration.value, 160) : [],
 );
@@ -470,6 +569,7 @@ const statementBadge = "Statement · recorded (not honored by raw BeatThis)";
 // ---------------------------------------------------------------- statements and edits
 
 function addStatement(kind: Statement["kind"]) {
+  commitTransient();
   if (kind === "sound_at" || kind === "beat_at") {
     session.upsertStatement({ id: newId("st"), kind, t: cursorS.value });
     sync();
@@ -486,13 +586,20 @@ function addStatement(kind: Statement["kind"]) {
   message.value = `Statement ${statementLabel[kind]} recorded; nothing recomputes until you ask (⌘K).`;
 }
 
+function selectStatement(id: string) {
+  commitTransient();
+  selectedStatementId.value = id;
+}
+
 function removeStatement(id: string) {
+  commitTransient();
   session.deactivateStatement(id);
   sync();
   if (selectedStatementId.value === id) selectedStatementId.value = null;
 }
 
 function addBeat(t: number) {
+  commitTransient();
   const id = newId("u");
   session.applyEdit({ op: "upsert_beat", beat: { id, t, source: "user" } });
   sync();
@@ -500,6 +607,7 @@ function addBeat(t: number) {
 }
 
 function removeSelected() {
+  commitTransient();
   if (selectedBeatId.value) {
     session.applyEdit({ op: "remove_beat", id: selectedBeatId.value });
     sync();
@@ -510,6 +618,7 @@ function removeSelected() {
 }
 
 function addReset() {
+  commitTransient();
   const beat = selectedBeatId.value ? state.value.beats.get(selectedBeatId.value) : undefined;
   const t = beat?.t ?? cursorS.value;
   session.applyEdit({
@@ -521,20 +630,35 @@ function addReset() {
 }
 
 function undo() {
+  if (guardAb()) return;
   commitTransient();
   if (session.undo()) sync();
 }
 
 function redo() {
+  if (guardAb()) return;
+  commitTransient();
   if (session.redo()) sync();
 }
 
 // ---------------------------------------------------------------- recompute and offers
 
+interface BufferedRecompute {
+  epoch: number;
+  generation: number;
+  providerKind: "rule" | "model";
+  provider: string;
+  offers: PatchOffer[];
+}
+
 const generation = ref(0);
 const recomputing = ref<{ span: Span; provider: string } | null>(null);
 let recomputeAbort: AbortController | null = null;
 const activeOfferIndex = ref(0);
+const pinnedOffer = shallowRef<PatchOffer | null>(null);
+const pinnedOfferBeats = shallowRef<Beat[] | null>(null);
+let bufferedRecompute: BufferedRecompute | null = null;
+
 const offers = computed<PatchOffer[]>(() =>
   [...state.value.offers.values()].filter((offer) => offer.status === "pending"),
 );
@@ -544,17 +668,37 @@ const activeOffer = computed<PatchOffer | null>(() =>
 const offerBeats = computed(() =>
   activeOffer.value ? beatsAfter(state.value, activeOffer.value) : null,
 );
+const heardOffer = computed<PatchOffer | null>(() =>
+  abHeld.value && pinnedOffer.value ? pinnedOffer.value : activeOffer.value,
+);
+const heardOfferBeats = computed<Beat[] | null>(() =>
+  abHeld.value && pinnedOfferBeats.value ? pinnedOfferBeats.value : offerBeats.value,
+);
 const ghostBeats = computed(() => {
-  if (mode.value !== "audition" || !offerBeats.value) return [];
+  if (mode.value !== "audition" || !heardOfferBeats.value) return [];
   const current = new Map(beats.value.map((beat) => [beat.id, beat.t]));
-  return offerBeats.value.filter(
+  return heardOfferBeats.value.filter(
     (beat) => visible(beat.t) && Math.abs((current.get(beat.id) ?? -1) - beat.t) > 1e-6,
   );
 });
 
+function commitOfferBatch(batch: BufferedRecompute) {
+  session.recordOfferBatch(batch.offers, {
+    kind: batch.providerKind,
+    id: batch.provider,
+  });
+  sync();
+  activeOfferIndex.value = 0;
+  const surfaced = offers.value.length;
+  message.value = surfaced
+    ? `${surfaced} offer${surfaced === 1 ? "" : "s"} from the rule mock; compare them in Audition (2).`
+    : "The rule mock has no offer for this span.";
+}
+
 async function requestOffer() {
   if (!draftAudio.value) return;
   commitTransient();
+  const epoch = trackEpoch;
   const span = selection.value ?? { t0: view.value.startS, t1: view.value.endS };
   const current = ++generation.value;
   recomputeAbort?.abort();
@@ -578,28 +722,33 @@ async function requestOffer() {
           sounds: sounds.value,
           statements: statements.value,
           suppressions: state.value.suppressions,
+          existingOfferIds: [...state.value.offers.keys()],
         },
       },
       controller.signal,
     );
-    if (current !== generation.value) return;
+    if (!mounted || epoch !== trackEpoch || current !== generation.value) return;
     if (outcome.status === "ok") {
-      session.recordOfferBatch(outcome.offers, {
-        kind: outcome.providerKind,
-        id: outcome.provider,
-      });
-      sync();
-      activeOfferIndex.value = 0;
-      const surfaced = offers.value.length;
-      message.value = surfaced
-        ? `${surfaced} offer${surfaced === 1 ? "" : "s"} from the rule mock; compare them in Audition (2).`
-        : "The rule mock has no offer for this span.";
+      const batch: BufferedRecompute = {
+        epoch,
+        generation: current,
+        providerKind: outcome.providerKind,
+        provider: outcome.provider,
+        offers: outcome.offers,
+      };
+      if (abHeld.value) {
+        bufferedRecompute = batch;
+        message.value = "New offers ready; release Alt to view them.";
+      } else {
+        commitOfferBatch(batch);
+      }
     } else message.value = `Recompute ${outcome.status}.`;
   } catch (failure) {
+    if (!mounted || epoch !== trackEpoch) return;
     if ((failure as Error).name === "AbortError") message.value = "Recompute cancelled.";
     else error.value = (failure as Error).message;
   } finally {
-    if (current === generation.value) {
+    if (mounted && epoch === trackEpoch && current === generation.value) {
       recomputing.value = null;
       recomputeAbort = null;
     }
@@ -610,6 +759,7 @@ function cancelRecompute() {
   if (!recomputeAbort) return false;
   recomputeAbort.abort();
   generation.value++;
+  bufferedRecompute = null;
   recomputing.value = null;
   recomputeAbort = null;
   message.value = "Recompute cancelled.";
@@ -630,6 +780,7 @@ function cycleOffer() {
 
 function acceptOffer(offer = activeOffer.value) {
   if (guardAb() || !offer) return;
+  commitTransient();
   const consequenceSummary = formatConsequences(offer, state.value);
   const outcome = session.acceptOffer(offer.id);
   sync();
@@ -644,6 +795,7 @@ function acceptOffer(offer = activeOffer.value) {
 
 function rejectOffer(offer = activeOffer.value) {
   if (guardAb() || !offer) return;
+  commitTransient();
   session.rejectOffer(offer.id);
   sync();
   activeOfferIndex.value = 0;
@@ -659,6 +811,13 @@ const bandState = ref<"idle" | "loading" | "playing" | "error">("idle");
 let bandAudio: HTMLAudioElement | null = null;
 let bandUrl: string | null = null;
 
+function clearAltState() {
+  abHeld.value = false;
+  pinnedOffer.value = null;
+  pinnedOfferBeats.value = null;
+  bufferedRecompute = null;
+}
+
 function setMode(next: DraftMode) {
   commitTransient();
   releaseAb();
@@ -666,7 +825,9 @@ function setMode(next: DraftMode) {
 }
 
 function pressAb() {
-  if (mode.value !== "audition" || !offerBeats.value || abHeld.value) return;
+  if (mode.value !== "audition" || !activeOffer.value || !offerBeats.value || abHeld.value) return;
+  pinnedOffer.value = activeOffer.value;
+  pinnedOfferBeats.value = offerBeats.value;
   abHeld.value = true;
   syncClicks();
 }
@@ -674,6 +835,13 @@ function pressAb() {
 function releaseAb() {
   if (!abHeld.value) return;
   abHeld.value = false;
+  pinnedOffer.value = null;
+  pinnedOfferBeats.value = null;
+  const buffered = bufferedRecompute;
+  bufferedRecompute = null;
+  if (buffered && buffered.epoch === trackEpoch && buffered.generation === generation.value) {
+    commitOfferBatch(buffered);
+  }
   syncClicks();
 }
 
@@ -683,11 +851,12 @@ function syncClicks() {
     engine.setClicks([flamSlot.value * 1000]);
     return;
   }
-  const beats = abHeld.value && offerBeats.value ? offerBeats.value : displayBeats.value;
-  engine.setClicks(clicksOn.value ? beats.map((beat) => beat.t * 1000) : null);
+  const activeBeats =
+    abHeld.value && pinnedOfferBeats.value ? pinnedOfferBeats.value : displayBeats.value;
+  engine.setClicks(clicksOn.value ? activeBeats.map((beat) => beat.t * 1000) : null);
 }
 
-watch([clicksOn, flamSlot, beats], syncClicks);
+watch([clicksOn, flamSlot, displayBeats, offerBeats, abHeld], syncClicks);
 
 function auditionSpan(): Span {
   const span = selection.value ?? loopSpan.value ?? { t0: view.value.startS, t1: view.value.endS };
@@ -695,6 +864,9 @@ function auditionSpan(): Span {
 }
 
 function stopBand() {
+  auditionToken += 1;
+  auditionAbort?.abort();
+  auditionAbort = null;
   bandAudio?.pause();
   bandAudio = null;
   if (bandUrl) URL.revokeObjectURL(bandUrl);
@@ -711,30 +883,63 @@ async function setAuditionView(next: AuditionView) {
     message.value = "Audition views need the local service and a track on disk.";
     return;
   }
+  const token = ++auditionToken;
+  const epoch = trackEpoch;
+  const controller = new AbortController();
+  auditionAbort = controller;
   const span = auditionSpan();
   bandState.value = "loading";
   try {
-    const response = await draftRequest("audition-view", {
-      audioPath: audioPath.value,
-      startSec: span.t0,
-      endSec: span.t1,
-      view: next,
-    });
-    if (auditionView.value !== next) return;
-    stop();
-    bandUrl = URL.createObjectURL(await response.blob());
-    bandAudio = new Audio(bandUrl);
-    bandAudio.loop = true;
-    await bandAudio.play();
+    const response = await draftRequest(
+      "audition-view",
+      {
+        audioPath: audioPath.value,
+        startSec: span.t0,
+        endSec: span.t1,
+        view: next,
+      },
+      controller.signal,
+    );
+    if (!mounted || token !== auditionToken || epoch !== trackEpoch || auditionView.value !== next)
+      return;
+    const blob = await response.blob();
+    if (!mounted || token !== auditionToken || epoch !== trackEpoch || auditionView.value !== next)
+      return;
+    stopMix();
+    const url = URL.createObjectURL(blob);
+    const audio = new Audio(url);
+    audio.loop = true;
+    bandUrl = url;
+    bandAudio = audio;
+    await audio.play();
+    if (!mounted || token !== auditionToken || epoch !== trackEpoch || auditionView.value !== next) {
+      audio.pause();
+      if (bandAudio === audio) bandAudio = null;
+      if (bandUrl === url) {
+        URL.revokeObjectURL(url);
+        bandUrl = null;
+      }
+      return;
+    }
     bandState.value = "playing";
     message.value = `Listening to ${next} ${formatSourceTime(span.t0 * 1000)}–${formatSourceTime(span.t1 * 1000)} (listening only; times stay on the mix).`;
   } catch (failure) {
+    if (
+      !mounted ||
+      token !== auditionToken ||
+      epoch !== trackEpoch ||
+      (failure as Error).name === "AbortError"
+    )
+      return;
     bandState.value = "error";
     error.value = (failure as Error).message;
+  } finally {
+    if (auditionAbort === controller) auditionAbort = null;
   }
 }
 
 function flamCheck() {
+  commitTransient();
   const unexplained = fits.value.filter((fit) => fit.status === "unexplained");
   const selected = unexplained.find((fit) => fit.soundId === selectedSoundId.value);
   const target =
@@ -746,13 +951,22 @@ function flamCheck() {
     message.value = "No off-grid sound in view to check.";
     return;
   }
-  const signedMs = signedResidual(target.t);
-  const slot = target.t - signedMs / 1000;
-  flamSlot.value = slot;
+  const slotInfo = nearestGridSlot(target.t, beatTimes.value);
+  if (!slotInfo) {
+    flamSlot.value = null;
+    message.value = "No beats available to compare against.";
+    return;
+  }
+  const { slotTime, residualMs } = slotInfo;
+  flamSlot.value = slotTime;
   selectedSoundId.value = target.soundId;
-  loopSpan.value = { t0: Math.max(0, slot - 0.4), t1: slot + 0.4 };
+  loopSpan.value = flamLoopBounds(target.t, slotTime, duration.value);
   looping.value = true;
-  message.value = `Flam check: the click marks the nearest grid slot; the sound is ${Math.abs(signedMs).toFixed(1)} ms ${signedMs > 0 ? "late" : "early"}.`;
+  const direction = residualMs > 0 ? "late" : residualMs < 0 ? "early" : "on the slot";
+  message.value =
+    direction === "on the slot"
+      ? "Flam check: the click marks the nearest grid slot; the sound aligns with the slot."
+      : `Flam check: the click marks the nearest grid slot; the sound is ${Math.abs(residualMs).toFixed(1)} ms ${direction}.`;
   void play();
 }
 
@@ -779,20 +993,38 @@ function drawFrame() {
   frame = requestAnimationFrame(drawFrame);
 }
 
+function stopMix() {
+  mixPlayToken += 1;
+  stopFrames();
+  if (engine) {
+    const wasPlaying = engine.playing;
+    const shown = engine.stop();
+    if (wasPlaying && shown !== undefined && !looping.value) cursorS.value = shown / 1000;
+  }
+  playing.value = false;
+}
+
 async function play() {
-  if (!engine || !audioReady.value) return;
+  if (!engine || !audioReady.value || !mounted) return;
   stopBand();
+  const myMixToken = ++mixPlayToken;
+  const epoch = trackEpoch;
+  const targetEngine = engine;
   const loop =
     looping.value && loopSpan.value
       ? { startMs: loopSpan.value.t0 * 1000, endMs: loopSpan.value.t1 * 1000 }
       : null;
-  const started = await engine.play({
+  const started = await targetEngine.play({
     fromMs: loop ? loop.startMs : cursorS.value * 1000,
     endMs: duration.value * 1000,
     rate: 1,
     loop,
   });
   if (!started) return;
+  if (!mounted || myMixToken !== mixPlayToken || epoch !== trackEpoch || engine !== targetEngine) {
+    targetEngine.stop();
+    return;
+  }
   playing.value = true;
   syncClicks();
   stopFrames();
@@ -800,13 +1032,8 @@ async function play() {
 }
 
 function stop() {
-  stopFrames();
   stopBand();
-  if (engine?.playing) {
-    const shown = engine.stop();
-    if (shown !== undefined && !looping.value) cursorS.value = shown / 1000;
-  }
-  playing.value = false;
+  stopMix();
 }
 
 function togglePlay() {
@@ -847,6 +1074,7 @@ function tour(step: 1 | -1) {
 function goToTrouble(index: number) {
   const entry = trouble.value[index];
   if (!entry) return;
+  commitTransient();
   tourIndex.value = index;
   flamSlot.value = null;
   selection.value = entry.span;
@@ -879,6 +1107,7 @@ const titleStem = computed(() =>
 );
 
 function exportRedLines() {
+  commitTransient();
   const projection = projectRedLines(state.value.beats, state.value.boundaries);
   const text = [
     `// ${projection.barPolicy}: ${projection.losses[0] ?? "meter is a placeholder"}`,
@@ -891,33 +1120,43 @@ function exportRedLines() {
 }
 
 function exportTrace() {
+  commitTransient();
   download(`${titleStem.value}.draft.jsonl`, session.exportNdjson());
 }
 
 async function exportClip() {
+  commitTransient();
   if (!audioPath.value) {
     message.value = "Clips need the local service and a track on disk.";
     return;
   }
+  const epoch = trackEpoch;
+  const signal = trackAbort?.signal;
   const span = auditionSpan();
   busy.value = "Rendering clip";
   try {
-    const exportedBeats = (abHeld.value && offerBeats.value ? offerBeats.value : beats.value).map(
-      (beat) => beat.t,
+    const exportedBeats = (
+      abHeld.value && heardOfferBeats.value ? heardOfferBeats.value : beats.value
+    ).map((beat) => beat.t);
+    const result = await draftJson<{ outputPath: string }>(
+      "export-clip",
+      {
+        audioPath: audioPath.value,
+        startSec: span.t0,
+        endSec: span.t1,
+        beats: exportedBeats,
+        format: "wav",
+      },
+      signal,
     );
-    const result = await draftJson<{ outputPath: string }>("export-clip", {
-      audioPath: audioPath.value,
-      startSec: span.t0,
-      endSec: span.t1,
-      beats: exportedBeats,
-      format: "wav",
-    });
+    if (!mounted || epoch !== trackEpoch) return;
     clipPath.value = result.outputPath;
     message.value = "Clip written; give its path to Gemini to read_file it.";
   } catch (failure) {
+    if (!mounted || epoch !== trackEpoch || (failure as Error).name === "AbortError") return;
     error.value = (failure as Error).message;
   } finally {
-    busy.value = null;
+    if (mounted && epoch === trackEpoch) busy.value = null;
   }
 }
 
@@ -969,6 +1208,7 @@ function onStagePointerDown(event: PointerEvent) {
   const soundId = target.getAttribute?.("data-sound-id");
   const statementId = target.getAttribute?.("data-statement-id");
   if (statementId) {
+    commitTransient();
     selectedStatementId.value = statementId;
     selectedBeatId.value = null;
     return;
@@ -983,11 +1223,13 @@ function onStagePointerDown(event: PointerEvent) {
     return;
   }
   if (soundId) {
+    commitTransient();
     selectedSoundId.value = soundId;
     selectedBeatId.value = null;
     return;
   }
   if (event.shiftKey) {
+    commitTransient();
     gesture = { kind: "select", startT: t };
     selection.value = { t0: t, t1: t };
     runSelected.value = false;
@@ -1040,6 +1282,7 @@ function onStageDoubleClick(event: MouseEvent) {
   const t = tOf(px, view.value, stageWidth.value);
   const band = bands.value.find((entry) => t >= entry.t0 && t <= entry.t1);
   if (target.getAttribute?.("data-band") && band) {
+    commitTransient();
     selection.value = { t0: band.t0 - 0.0005, t1: band.t1 + 0.0005 };
     runSelected.value = true;
     message.value = "Run selected: arrows shift its offset (Shift: 10 ms).";
@@ -1142,13 +1385,22 @@ function onKeyUp(event: KeyboardEvent) {
 }
 
 onBeforeUnmount(() => {
+  commitTransient();
+  mounted = false;
+  trackEpoch += 1;
+  trackAbort?.abort();
+  trackAbort = null;
+  recomputeAbort?.abort();
+  recomputeAbort = null;
   window.removeEventListener("keydown", onKeyDown);
   window.removeEventListener("keyup", onKeyUp);
   window.removeEventListener("blur", releaseAb);
   resizeObserver?.disconnect();
   clearTimeout(settleTimer);
   stop();
-  void engine?.close();
+  const activeEngine = engine;
+  engine = undefined;
+  void activeEngine?.close();
 });
 
 // ---------------------------------------------------------------- waveform
@@ -1194,15 +1446,36 @@ const selectedSound = computed(() =>
 const span = (value: Span) =>
   `${formatSourceTime(value.t0 * 1000, 1)}–${formatSourceTime(value.t1 * 1000, 1)}`;
 const statusText = computed(() => {
-  if (mode.value === "audition" && activeOffer.value) {
-    const offer = activeOffer.value;
+  if (mode.value === "audition" && heardOffer.value) {
+    const offer = heardOffer.value;
     const conflicts = offer.conflicts.length ? ` · ${offer.conflicts.length} conflict(s)` : "";
-    return `${abHeld.value ? "Hearing" : "Offer"} ${activeOfferIndex.value + 1}/${offers.value.length}: ${formatConsequences(offer, state.value)}${conflicts}${abHeld.value ? " · Release Alt to change the offer" : ""}`;
+    const position = abHeld.value
+      ? Math.max(1, offers.value.findIndex((entry) => entry.id === offer.id) + 1)
+      : activeOfferIndex.value + 1;
+    return `${abHeld.value ? "Hearing" : "Offer"} ${position}/${Math.max(1, offers.value.length)}: ${formatConsequences(offer, state.value)}${conflicts}${abHeld.value ? " · Release Alt to change the offer" : ""}`;
   }
   return message.value;
 });
+const traceLabel = computed(() => {
+  if (busy.value) return busy.value;
+  if (!draftAudio.value) return "No track";
+  if (traceStatus.value === "error") {
+    return tracePendingCount.value > 0
+      ? `Trace unsaved (${tracePendingCount.value})`
+      : "Trace unsaved";
+  }
+  if (traceStatus.value === "saving" || tracePendingCount.value > 0) return "Saving";
+  if (traceStatus.value === "saved") return "Trace saved";
+  return "Draft";
+});
 const healthTone = computed(() =>
-  error.value ? "error" : traceStatus.value === "error" ? "warn" : draftAudio.value ? "ready" : "idle",
+  error.value
+    ? "error"
+    : traceStatus.value === "error" || tracePendingCount.value > 0
+      ? "warn"
+      : draftAudio.value
+        ? "ready"
+        : "idle",
 );
 </script>
 
@@ -1288,10 +1561,24 @@ const healthTone = computed(() =>
     </template>
 
     <template #toolbar-end>
-      <span class="health-status" :class="`health-status--${healthTone}`" aria-live="polite">
+      <span
+        class="health-status"
+        :class="`health-status--${healthTone}`"
+        :title="traceSaveError ?? ''"
+        aria-live="polite"
+      >
         <span class="health-dot" aria-hidden="true"></span>
-        {{ busy ?? (draftAudio ? (traceStatus === "saved" ? "Trace saved" : traceStatus === "saving" ? "Saving" : "Draft") : "No track") }}
+        {{ traceLabel }}
       </span>
+      <button
+        v-if="traceStatus === 'error' && tracePendingCount > 0"
+        class="tool-button"
+        type="button"
+        title="Retry saving unacknowledged trace events"
+        @click="retryTraceSave"
+      >
+        Retry save
+      </button>
     </template>
 
     <template #left>
@@ -1328,7 +1615,11 @@ const healthTone = computed(() =>
           class="draft-statement"
           :class="{ 'is-active': statement.id === selectedStatementId }"
         >
-          <button type="button" class="draft-statement-select" @click="selectedStatementId = statement.id">
+          <button
+            type="button"
+            class="draft-statement-select"
+            @click="selectStatement(statement.id)"
+          >
             <span class="draft-chip">{{ statementLabel[statement.kind] }}</span>
             <span class="data">{{ span(statementSpan(statement)) }}</span>
           </button>
@@ -1583,6 +1874,7 @@ const healthTone = computed(() =>
                 <template v-for="sound in visibleSounds" :key="sound.id">
                   <template v-if="fitById.get(sound.id)?.status === 'unexplained'">
                     <line
+                      v-if="beatTimes.length"
                       class="whisker"
                       :x1="x(sound.t)"
                       :x2="x(sound.t) - whiskerPx(signedResidual(sound.t))"
@@ -1597,7 +1889,7 @@ const healthTone = computed(() =>
                       :cy="(lane.bottom + lane.soundsBottom) / 2"
                       :r="2 + 4 * sound.emphasis"
                     >
-                      <title>unexplained {{ signedResidual(sound.t).toFixed(1) }} ms</title>
+                      <title>{{ beatTimes.length ? `unexplained ${signedResidual(sound.t).toFixed(1)} ms` : "unexplained (no beats)" }}</title>
                     </circle>
                   </template>
                   <text

@@ -151,10 +151,16 @@ def mel_filters(sample_rate, n_fft, n_mels=FLUX_MELS, fmin=30.0, fmax=None):
     return np.maximum(0.0, np.minimum(rising, falling))
 
 
+def _flux_hop(sample_rate, hop_s=FLUX_HOP_S):
+    """Exact integer hop in samples and its exact duration in seconds."""
+    hop_samples = max(1, int(round(sample_rate * hop_s)))
+    return hop_samples, hop_samples / float(sample_rate)
+
+
 def log_mel(mono, sample_rate, hop_s=FLUX_HOP_S):
-    """Log-compressed Mel power with frames centred at k * hop_s."""
-    hop = int(round(sample_rate * hop_s))
-    n_fft = 1 << int(round(math.log2(0.023 * sample_rate)))
+    """Log-compressed Mel power with frames centred at k * (hop_samples / sample_rate)."""
+    hop, _ = _flux_hop(sample_rate, hop_s)
+    n_fft = max(2, 1 << int(round(math.log2(max(2.0, 0.023 * sample_rate)))))
     padded = np.pad(mono.astype(np.float64), n_fft // 2)
     count = 1 + max(0, (padded.size - n_fft) // hop)
     frames = sliding_window_view(padded, n_fft)[: count * hop : hop]
@@ -178,10 +184,15 @@ def onset_flux_sounds(mono, sample_rate, hop_s=FLUX_HOP_S):
     95th percentile of all peaks' flux, clipped to 1; confidence is how far the peak stands above
     its local threshold.
     """
+    _, actual_hop_s = _flux_hop(sample_rate, hop_s)
     flux = onset_envelope(mono, sample_rate, hop_s)
+    if flux.size == 0:
+        return []
     scale = float(np.percentile(flux, 99)) or 1.0
     norm = flux / scale
-    local = np.convolve(norm, np.ones(21) / 21, mode="same")
+    half_mean = 10
+    kernel = np.ones(2 * half_mean + 1, dtype=np.float64) / (2 * half_mean + 1)
+    local = np.convolve(np.pad(norm, half_mean, mode="constant"), kernel, mode="valid")
     padded = np.pad(norm, 3, constant_values=-np.inf)
     local_max = sliding_window_view(padded, 7).max(axis=1)
     threshold = local + 0.05
@@ -198,7 +209,7 @@ def onset_flux_sounds(mono, sample_rate, hop_s=FLUX_HOP_S):
             if curvature < 0:
                 offset = float(np.clip(0.5 * (a - c) / curvature, -0.5, 0.5))
         sounds.append({
-            "t": (i + offset) * hop_s,
+            "t": (i + offset) * actual_hop_s,
             "emphasis": float(min(1.0, norm[i] / emphasis_scale)),
             "conf": float(np.clip((norm[i] - threshold[i]) / max(norm[i], 1e-9), 0.0, 1.0)),
         })
@@ -211,9 +222,12 @@ def rule_beats(mono, sample_rate, duration_s, hop_s=FLUX_HOP_S):
     Used only when BeatThis is unavailable, and labelled as a rule. Confidence is the normalised
     envelope at each beat.
     """
+    _, actual_hop_s = _flux_hop(sample_rate, hop_s)
     flux = onset_envelope(mono, sample_rate, hop_s)
     centred = flux - flux.mean()
-    lags = np.arange(int(0.3 / hop_s), int(1.0 / hop_s) + 1)
+    min_lag = max(1, int(round(0.3 / actual_hop_s)))
+    max_lag = max(min_lag, int(round(1.0 / actual_hop_s)))
+    lags = np.arange(min_lag, max_lag + 1)
     if centred.size <= lags[-1] * 2:
         return []
     corr = np.array([np.dot(centred[:-lag], centred[lag:]) for lag in lags])
@@ -221,8 +235,8 @@ def rule_beats(mono, sample_rate, duration_s, hop_s=FLUX_HOP_S):
     phase = int(np.argmax([flux[p::period].sum() for p in range(period)]))
     peak = float(flux.max()) or 1.0
     return [
-        {"t": frame * hop_s, "conf": float(min(1.0, flux[frame] / peak))}
-        for frame in range(phase, min(flux.size, int(duration_s / hop_s) + 1), period)
+        {"t": frame * actual_hop_s, "conf": float(min(1.0, flux[frame] / peak))}
+        for frame in range(phase, min(flux.size, int(duration_s / actual_hop_s) + 1), period)
     ]
 
 
@@ -275,8 +289,14 @@ def analyze(path, checkpoint_name="final0", device="cpu", use_beatthis=True):
 
 def band_view(pcm, sample_rate, view, order=4):
     """Zero-phase band split: the squared magnitude of an order-4 Butterworth response applied in
-    the frequency domain (what a forward-backward filter does), so no sound moves in time."""
-    freqs = np.fft.rfftfreq(pcm.shape[0], 1.0 / sample_rate)
+    the frequency domain (what a forward-backward filter does), zero-padded to avoid circular
+    wrap-around across recording edges, so no sound moves in time."""
+    length = pcm.shape[0]
+    if length == 0:
+        return pcm.astype(np.float64, copy=True)
+    pad = max(1024, int(round(0.25 * sample_rate)))
+    n_fft = 1 << (length + 2 * pad - 1).bit_length()
+    freqs = np.fft.rfftfreq(n_fft, 1.0 / sample_rate)
     lowpass = lambda cutoff: 1.0 / (1.0 + (freqs / cutoff) ** (2 * order))  # noqa: E731
     with np.errstate(divide="ignore"):
         highpass = lambda cutoff: 1.0 / (1.0 + (cutoff / freqs) ** (2 * order))  # noqa: E731
@@ -285,7 +305,8 @@ def band_view(pcm, sample_rate, view, order=4):
             "mid": lambda: highpass(LOW_HZ) * lowpass(HIGH_HZ),
             "high": lambda: highpass(HIGH_HZ),
         }[view]()
-    return np.fft.irfft(np.fft.rfft(pcm, axis=0) * gain[:, None], n=pcm.shape[0], axis=0)
+    filtered = np.fft.irfft(np.fft.rfft(pcm, n=n_fft, axis=0) * gain[:, None], n=n_fft, axis=0)
+    return filtered[:length]
 
 
 def _median(values, kernel, axis, rows=96):

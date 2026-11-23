@@ -67,8 +67,55 @@ class OnsetFluxTest(unittest.TestCase):
         beats = draft.rule_beats(click_train(times, 10.0), RATE, 10.0)
         self.assertAlmostEqual(float(np.median(np.diff([b["t"] for b in beats]))), 0.5, places=2)
 
+    def test_exact_hop_prevents_progressive_drift_at_22050_hz(self):
+        # At 22,050 Hz, round(22050 * 0.01) = 220 samples = 9.9773 ms, not 10 ms.
+        # An impulse at 40.000 s drifted ~90 ms late when multiplied by nominal 0.01 s.
+        rate = 22050
+        duration = 41.0
+        signal = np.zeros(int(duration * rate), dtype=np.float64)
+        impulse_index = int(round(40.000 * rate))
+        signal[impulse_index] = 1.0
+        sounds = draft.onset_flux_sounds(signal, rate)
+        self.assertEqual(len(sounds), 1, sounds)
+        self.assertLess(abs(sounds[0]["t"] - 40.000), 0.002, sounds[0])
+
+    def test_rule_beats_do_not_drift_at_22050_hz(self):
+        # A pulse at an exact 50-hop period (220 samples/hop at 22,050 Hz) drifted ~90 ms late
+        # by 40 s when rule_beats multiplied frame indices by nominal 0.01 s instead of hop/sr.
+        rate = 22050
+        step = 50 * (220 / rate)
+        times = np.arange(step, 41.0, step)
+        beats = draft.rule_beats(click_train(times, 42.0, rate=rate), rate, 42.0)
+        self.assertGreater(len(beats), 70)
+        target = float(times[-1])
+        nearest = min(beats, key=lambda b: abs(b["t"] - target))
+        self.assertLess(abs(nearest["t"] - target), 0.010, (target, nearest))
+
+    def test_short_100ms_recording_analyzes_cleanly(self):
+        # 100 ms at 44.1 kHz yields ~11 flux frames (< 21-frame moving-mean kernel).
+        signal = click_train([0.04], 0.1, rate=RATE)
+        sounds = draft.onset_flux_sounds(signal, RATE)
+        self.assertIsInstance(sounds, list)
+        beats = draft.rule_beats(signal, RATE, 0.1)
+        self.assertEqual(beats, [])
+        if draft.shutil.which("ffmpeg"):
+            with tempfile.TemporaryDirectory() as folder:
+                source = Path(folder) / "short.wav"
+                write_mono(source, signal, rate=RATE)
+                analysis = draft.analyze(source, use_beatthis=False)
+                self.assertEqual(analysis["beats"]["provider"]["kind"], "rule")
+                self.assertIsInstance(analysis["sounds"]["items"], list)
+
 
 class AuditionViewTest(unittest.TestCase):
+    def test_bands_do_not_wrap_last_sample_impulse_into_first_sample(self):
+        pcm = np.zeros((RATE, 1), dtype=np.float64)
+        pcm[-1, 0] = 1.0
+        for view in ("low", "mid", "high"):
+            out = draft.audition_view(pcm, RATE, view)
+            self.assertEqual(out.shape, pcm.shape)
+            self.assertLess(abs(float(out[0, 0])), 1e-4, f"{view} wrapped into sample 0: {out[0, 0]}")
+
     def test_bands_split_low_and_high(self):
         t = np.arange(RATE) / RATE
         low, high = np.sin(2 * np.pi * 100 * t), np.sin(2 * np.pi * 5000 * t)

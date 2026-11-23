@@ -17,6 +17,7 @@ import {
   isOfferSuppressed,
   lineFit,
   lowerBound,
+  nearestGridSlot,
   type OfferRole,
   type OfferScopeKind,
   type PatchOffer,
@@ -26,7 +27,6 @@ import {
   type SoundAnchor,
   type Span,
   type Statement,
-  signedGridResidualMs,
   spanContainsTime,
   spansOverlap,
   validatePatchOffer,
@@ -44,6 +44,8 @@ export interface RecomputeRequest {
   sounds: SoundAnchor[];
   statements: Statement[];
   suppressions?: RejectionSuppression[];
+  /** Existing offer IDs in the session so newly generated offer/batch IDs never collide across reloads. */
+  existingOfferIds?: string[];
 }
 
 export type RecomputeOutcome =
@@ -57,6 +59,8 @@ export type RecomputeOutcome =
   | { status: "stale" | "superseded" | "cancelled"; generation: number };
 
 interface OfferDraft {
+  /** Independent proposals use distinct groupKeys; mutually exclusive siblings share one. */
+  groupKey: string;
   role: OfferRole;
   scopeKind: OfferScopeKind;
   optionIndex?: number;
@@ -64,6 +68,54 @@ interface OfferDraft {
   readScope: Span | "song";
   writeScope: Span;
   ops: PatchOp;
+}
+
+interface IdAllocator {
+  stem: string;
+  mint(base: string): string;
+}
+
+function fnv1aHex(input: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < input.length; i += 1) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+function createIdAllocator(request: RecomputeRequest): IdAllocator {
+  const used = new Set<string>();
+  for (const beat of request.beats) used.add(beat.id);
+  for (const boundary of request.boundaries) used.add(boundary.id);
+  for (const sound of request.sounds) used.add(sound.id);
+  for (const offerId of request.existingOfferIds ?? []) used.add(offerId);
+
+  const basisSeq = request.basisSeq ?? 0;
+  const signature = [
+    basisSeq,
+    request.generation,
+    request.span.t0.toFixed(4),
+    request.span.t1.toFixed(4),
+    request.beats.length,
+    request.boundaries.length,
+    request.beats.map((b) => `${b.id}@${b.t.toFixed(4)}v${b.version}`).join(","),
+    request.boundaries.map((b) => `${b.id}@${b.t.toFixed(4)}v${b.version}`).join(","),
+  ].join("|");
+  const stem = `s${basisSeq}-g${request.generation}-${fnv1aHex(signature)}`;
+
+  return {
+    stem,
+    mint(base: string): string {
+      let candidate = base;
+      let suffix = 1;
+      while (used.has(candidate)) {
+        candidate = `${base}_${suffix++}`;
+      }
+      used.add(candidate);
+      return candidate;
+    },
+  };
 }
 
 const yieldTurn = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
@@ -104,24 +156,33 @@ export async function ruleMockRecompute(
   signal?: AbortSignal,
 ): Promise<PatchOffer[]> {
   const snapshot = buildSnapshotState(request);
+  const ids = createIdAllocator(request);
   const rules = [steadyRefits, extend, quickFix, alternatives];
   const drafts: OfferDraft[] = [];
   for (const rule of rules) {
     checkAborted(signal);
-    drafts.push(...rule(request, snapshot));
+    drafts.push(...rule(request, snapshot, ids));
     await yieldTurn();
   }
   checkAborted(signal);
-  const batchId = `b${request.generation}-${Math.round(request.span.t0 * 1000)}`;
   const basisSeq = request.basisSeq ?? 0;
+  const batchIds = new Map<string, string>();
+  const groupCounts = new Map<string, number>();
   const offers: PatchOffer[] = [];
-  for (let index = 0; index < drafts.length; index += 1) {
-    const draft = drafts[index] as OfferDraft;
+  for (const draft of drafts) {
     const semanticKey = computeSemanticKey(draft.writeScope, draft.ops);
     if (isOfferSuppressed(snapshot, { semanticKey, writeScope: draft.writeScope, ops: draft.ops }))
       continue;
+    let batchId = batchIds.get(draft.groupKey);
+    if (!batchId) {
+      batchId = ids.mint(`b-${ids.stem}-${draft.groupKey}`);
+      batchIds.set(draft.groupKey, batchId);
+    }
+    const slotIndex = groupCounts.get(draft.groupKey) ?? 0;
+    groupCounts.set(draft.groupKey, slotIndex + 1);
+    const id = ids.mint(`${batchId}:${slotIndex}`);
     const candidate: PatchOffer = {
-      id: `${batchId}:${index}`,
+      id,
       batchId,
       ...(draft.optionIndex !== undefined ? { optionIndex: draft.optionIndex } : {}),
       providerId: ruleMockProvider,
@@ -153,7 +214,11 @@ export async function ruleMockRecompute(
 }
 
 /** `steady` statements: a least-squares line through the beats they cover (fixed slope for a BPM). */
-function steadyRefits(request: RecomputeRequest, state: SessionState): OfferDraft[] {
+function steadyRefits(
+  request: RecomputeRequest,
+  state: SessionState,
+  _ids: IdAllocator,
+): OfferDraft[] {
   return request.statements.flatMap((statement) => {
     if (
       statement.active === false ||
@@ -186,6 +251,7 @@ function steadyRefits(request: RecomputeRequest, state: SessionState): OfferDraf
     if (!upsertBeats.length) return [];
     return [
       {
+        groupKey: `steady-${statement.id}`,
         role: "rewrite",
         scopeKind: "local",
         summary: `Steady refit at ${(60 / slope).toFixed(2)} BPM`,
@@ -202,17 +268,17 @@ function steadyRefits(request: RecomputeRequest, state: SessionState): OfferDraf
 }
 
 /** Continues the span's last steady beats forward until the next beat, boundary or the end. */
-function extend(request: RecomputeRequest, state: SessionState): OfferDraft[] {
-  const inside = request.beats
-    .filter((beat) => spanContainsTime(request.span, beat.t))
-    .sort((a, b) => a.t - b.t);
+function extend(request: RecomputeRequest, state: SessionState, ids: IdAllocator): OfferDraft[] {
+  const sortedBeats = [...request.beats].sort((a, b) => a.t - b.t);
+  const sortedBoundaries = [...request.boundaries].sort((a, b) => a.t - b.t);
+  const inside = sortedBeats.filter((beat) => spanContainsTime(request.span, beat.t));
   if (inside.length < 3) return [];
   const anchor = inside.slice(-8).map((beat) => beat.t);
   const fit = lineFit(anchor);
   if (fit.slope <= 0.15 || fit.maxError > 0.012) return [];
   const last = anchor.at(-1) as number;
-  const later = request.beats.find((beat) => beat.t > last + 0.001)?.t ?? Number.POSITIVE_INFINITY;
-  const cut = request.boundaries.find((entry) => entry.t > last + 0.001)?.t;
+  const later = sortedBeats.find((beat) => beat.t > last + 0.001)?.t ?? Number.POSITIVE_INFINITY;
+  const cut = sortedBoundaries.find((entry) => entry.t > last + 0.001)?.t;
   const limit = Math.min(
     later - 0.5 * fit.slope,
     cut ?? Number.POSITIVE_INFINITY,
@@ -222,7 +288,7 @@ function extend(request: RecomputeRequest, state: SessionState): OfferDraft[] {
   for (let k = 1; k <= 64; k++) {
     const t = fit.intercept + fit.slope * (anchor.length - 1 + k);
     if (t >= limit) break;
-    upsertBeats.push({ id: `x${request.generation}-${k}`, t, source: "rule", version: 1 });
+    upsertBeats.push({ id: ids.mint(`x-${ids.stem}-${k}`), t, source: "rule", version: 1 });
   }
   if (!upsertBeats.length) return [];
   const firstNew = (upsertBeats[0] as BeatInput).t;
@@ -230,6 +296,7 @@ function extend(request: RecomputeRequest, state: SessionState): OfferDraft[] {
   const writeScope: Span = { t0: firstNew, t1: lastNew + 0.001 };
   return [
     {
+      groupKey: "extend",
       role: "extend",
       scopeKind: "forward_continuation",
       summary: `Continue ${(60 / fit.slope).toFixed(2)} BPM forward`,
@@ -244,7 +311,7 @@ function extend(request: RecomputeRequest, state: SessionState): OfferDraft[] {
 }
 
 /** Snaps a beat onto a strong sound 3–35 ms away. */
-function quickFix(request: RecomputeRequest, state: SessionState): OfferDraft[] {
+function quickFix(request: RecomputeRequest, state: SessionState, _ids: IdAllocator): OfferDraft[] {
   const strong = request.sounds.filter((sound) => sound.emphasis >= 0.4).map((sound) => sound.t);
   strong.sort((a, b) => a - b);
   const moved: Beat[] = [];
@@ -265,6 +332,7 @@ function quickFix(request: RecomputeRequest, state: SessionState): OfferDraft[] 
   if (!upsertBeats.length) return [];
   return [
     {
+      groupKey: "quick_fix",
       role: "quick_fix",
       scopeKind: "local",
       summary: "Snap beats onto strong sounds",
@@ -281,9 +349,14 @@ function quickFix(request: RecomputeRequest, state: SessionState): OfferDraft[] 
 
 /**
  * Two exclusive readings of unexplained sounds: a phase reset at the first one (later beats move
- * by its residual), or a free run from it (each nearby beat snaps onto its sound).
+ * by its residual, stopping at the earliest boundary or selection end), or a free run from it
+ * (each nearby beat in the selection snaps onto its sound).
  */
-function alternatives(request: RecomputeRequest, state: SessionState): OfferDraft[] {
+function alternatives(
+  request: RecomputeRequest,
+  state: SessionState,
+  ids: IdAllocator,
+): OfferDraft[] {
   const fits = computeGridFit(
     request.sounds,
     request.beats,
@@ -294,21 +367,27 @@ function alternatives(request: RecomputeRequest, state: SessionState): OfferDraf
   const first = fits[0] as (typeof fits)[number];
   const sortedBeats = [...request.beats].sort((a, b) => a.t - b.t);
   const beatTimes = sortedBeats.map((beat) => beat.t);
-  const signedResMs = signedGridResidualMs(first.t, beatTimes);
-  const deltaSec = signedResMs / 1000;
-  const nextBoundary = request.boundaries.find((entry) => entry.t > first.t)?.t ?? request.span.t1;
-  const resetSpan: Span = {
-    t0: Math.max(0, first.t - 0.0005),
-    t1: Math.max(nextBoundary, request.span.t1),
-  };
-  const shiftSpan: Span = {
-    t0: Math.max(0, first.t - 0.5 * Math.abs(deltaSec)),
-    t1: resetSpan.t1,
-  };
-  const shiftedBeats = sortedBeats.filter((beat) => spanContainsTime(shiftSpan, beat.t));
+  const nearestSlot = nearestGridSlot(first.t, beatTimes);
+  if (!nearestSlot) return [];
+  const deltaSec = nearestSlot.residualMs / 1000;
+  const sortedBoundaries = [...request.boundaries].sort((a, b) => a.t - b.t);
+  const nextBoundary = sortedBoundaries.find((entry) => entry.t > first.t + 1e-6)?.t;
+  const upperBound = Math.min(nextBoundary ?? request.span.t1, request.span.t1);
+  const shiftT0 = Math.max(0, request.span.t0, first.t - 0.5 * Math.abs(deltaSec));
+  const shiftedBeats = sortedBeats.filter(
+    (beat) =>
+      beat.t >= shiftT0 &&
+      beat.t < upperBound &&
+      beat.t + deltaSec >= request.span.t0 &&
+      beat.t + deltaSec < upperBound,
+  );
+  const touchedTimes = [first.t, ...shiftedBeats.flatMap((beat) => [beat.t, beat.t + deltaSec])];
+  const resetT0 = Math.max(request.span.t0, Math.min(...touchedTimes) - 0.0005);
+  const resetT1 = Math.min(upperBound, Math.max(...touchedTimes) + 0.0005);
+  const resetSpan: Span = { t0: resetT0, t1: Math.max(resetT0, resetT1) };
   const resetOps: PatchOp = {
     upsertBoundaries: [
-      { id: `r${request.generation}`, t: first.t, kind: "reset", source: "rule", version: 1 },
+      { id: ids.mint(`r-${ids.stem}`), t: first.t, kind: "reset", source: "rule", version: 1 },
     ],
     upsertBeats: shiftedBeats.map((beat) => ({
       ...beat,
@@ -329,7 +408,7 @@ function alternatives(request: RecomputeRequest, state: SessionState): OfferDraf
           Math.abs((beatTimes[a] as number) - fit.t) - Math.abs((beatTimes[b] as number) - fit.t),
       )[0];
     const beat = index === undefined ? undefined : sortedBeats[index];
-    if (!beat) continue;
+    if (!beat || !spanContainsTime(request.span, beat.t)) continue;
     const dist = Math.abs(beat.t - fit.t);
     if (dist < 0.12) {
       const prev = freeMoves.get(beat.id);
@@ -339,7 +418,13 @@ function alternatives(request: RecomputeRequest, state: SessionState): OfferDraf
   const freeMovedList = [...freeMoves.values()];
   const freeOps: PatchOp = {
     upsertBoundaries: [
-      { id: `f${request.generation}`, t: first.t, kind: "free_start", source: "rule", version: 1 },
+      {
+        id: ids.mint(`f-${ids.stem}`),
+        t: first.t,
+        kind: "free_start",
+        source: "rule",
+        version: 1,
+      },
     ],
     upsertBeats: freeMovedList.map(({ beat, t }) => ({ ...beat, t, source: "rule" })),
     expectedVersions: expectedVersionsFor(freeMovedList.map(({ beat }) => beat)),
@@ -348,6 +433,7 @@ function alternatives(request: RecomputeRequest, state: SessionState): OfferDraf
 
   return [
     {
+      groupKey: "alternative",
       role: "alternative",
       scopeKind: "local",
       optionIndex: 0,
@@ -357,6 +443,7 @@ function alternatives(request: RecomputeRequest, state: SessionState): OfferDraf
       ops: resetOps,
     },
     {
+      groupKey: "alternative",
       role: "alternative",
       scopeKind: "local",
       optionIndex: 1,

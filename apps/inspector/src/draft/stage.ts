@@ -34,9 +34,14 @@ export interface RunBand extends Span {
 /**
  * Runs along the ruler: boundaries cut the beats into segments; a gap boundary opens a gap; a
  * `free_start` segment is free; otherwise a segment is steady when its intervals stay within
- * 1.5 % of their median (labelled with that BPM), else free.
+ * 1.5 % of their median (labelled with that BPM), else free. Trailing boundaries after the final
+ * beat (and an unclosed trailing gap up to `durationS`) are also consumed.
  */
-export function runBands(beats: readonly Beat[], boundaries: readonly Boundary[]): RunBand[] {
+export function runBands(
+  beats: readonly Beat[],
+  boundaries: readonly Boundary[],
+  durationS?: number,
+): RunBand[] {
   const cuts = [...boundaries].sort((a, b) => a.t - b.t);
   const bands: RunBand[] = [];
   let segment: number[] = [];
@@ -58,22 +63,31 @@ export function runBands(beats: readonly Beat[], boundaries: readonly Boundary[]
     }
     segment = [];
   };
+  const applyBoundary = (boundary: Boundary) => {
+    flush();
+    if (boundary.kind === "gap_start") {
+      if (gapFrom === undefined) gapFrom = boundary.t;
+    } else if (boundary.kind === "gap_end" && gapFrom !== undefined) {
+      if (boundary.t > gapFrom) bands.push({ t0: gapFrom, t1: boundary.t, kind: "gap" });
+      gapFrom = undefined;
+    }
+    forcedFree = boundary.kind === "free_start" || (forcedFree && boundary.kind === "reset");
+  };
   let cut = 0;
   const times = beats.map((beat) => beat.t).sort((a, b) => a - b);
   for (const t of times) {
     while (cut < cuts.length && (cuts[cut] as Boundary).t <= t + 1e-9) {
-      const boundary = cuts[cut++] as Boundary;
-      flush();
-      if (boundary.kind === "gap_start") gapFrom = boundary.t;
-      if (boundary.kind === "gap_end" && gapFrom !== undefined) {
-        bands.push({ t0: gapFrom, t1: boundary.t, kind: "gap" });
-        gapFrom = undefined;
-      }
-      forcedFree = boundary.kind === "free_start" || (forcedFree && boundary.kind === "reset");
+      applyBoundary(cuts[cut++] as Boundary);
     }
     if (gapFrom === undefined) segment.push(t);
   }
   flush();
+  while (cut < cuts.length) {
+    applyBoundary(cuts[cut++] as Boundary);
+  }
+  if (gapFrom !== undefined && durationS !== undefined && durationS > gapFrom) {
+    bands.push({ t0: gapFrom, t1: durationS, kind: "gap" });
+  }
   return bands;
 }
 

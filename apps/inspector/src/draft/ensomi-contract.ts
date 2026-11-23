@@ -21,6 +21,7 @@ export {
   type AudioDescriptor,
   type AuthorKind,
   applyEvent,
+  assertTraceEventEnvelope,
   type Beat,
   type BeatInput,
   type Boundary,
@@ -30,6 +31,7 @@ export {
   type ConflictKind,
   type Constraint,
   type ConstraintForm,
+  canonicalJson,
   compileConstraints,
   computeConsequences,
   computeGridFit,
@@ -222,24 +224,62 @@ export function lowerBound(values: readonly number[], target: number): number {
   return low;
 }
 
+export interface NearestGridSlot {
+  slotTime: number;
+  /** Signed residual in ms: `soundTime - slotTime` (negative = early, positive = late). */
+  residualMs: number;
+}
+
 /**
- * Signed residual in ms from the nearest quarter-beat grid slot inside the enclosing beat
- * interval (or from the nearest beat outside the beat range). Used for whisker direction,
- * flam-check click placement, and phase-reset offset estimation.
+ * Nearest quarter-beat grid slot inside the enclosing beat interval (or nearest beat outside
+ * the beat range), returning `null` when there are no beats. Always computes exact signed
+ * `soundTime - slotTime` (negative = early, positive = late), independent of whether `ensomi`'s
+ * `computeGridFit` reports signed or unsigned `residualMs`.
  */
-export function signedGridResidualMs(soundT: number, sortedBeatTimes: readonly number[]): number {
-  if (!sortedBeatTimes.length) return 0;
+export function nearestGridSlot(
+  soundT: number,
+  sortedBeatTimes: readonly number[],
+): NearestGridSlot | null {
+  if (!sortedBeatTimes.length) return null;
   const after = lowerBound(sortedBeatTimes, soundT);
   const b0 = sortedBeatTimes[after - 1];
   const b1 = sortedBeatTimes[after];
   if (b0 !== undefined && b1 !== undefined && b1 > b0 && b1 - b0 <= 2) {
     const step = (b1 - b0) / 4;
-    const slot = b0 + Math.round((soundT - b0) / step) * step;
-    return (soundT - slot) * 1000;
+    const slotTime = b0 + Math.round((soundT - b0) / step) * step;
+    return { slotTime, residualMs: (soundT - slotTime) * 1000 };
   }
   const candidates = [b0, b1].filter((v): v is number => v !== undefined);
   const nearest = candidates.sort((a, b) => Math.abs(a - soundT) - Math.abs(b - soundT))[0];
-  return nearest === undefined ? 0 : (soundT - nearest) * 1000;
+  if (nearest === undefined) return null;
+  return { slotTime: nearest, residualMs: (soundT - nearest) * 1000 };
+}
+
+/**
+ * Signed residual in ms from the nearest quarter-beat grid slot (`soundTime - slotTime`,
+ * negative = early, positive = late). Returns `0` when there are no beats; callers that need to
+ * distinguish "no beats" from "0 ms residual" should use `nearestGridSlot`.
+ */
+export function signedGridResidualMs(soundT: number, sortedBeatTimes: readonly number[]): number {
+  return nearestGridSlot(soundT, sortedBeatTimes)?.residualMs ?? 0;
+}
+
+/**
+ * Loop bounds for a flam check: always contains BOTH `soundT` and `slotTime` with `marginS` on
+ * each side, clamped cleanly into `[0, durationS]`.
+ */
+export function flamLoopBounds(
+  soundT: number,
+  slotTime: number,
+  durationS: number,
+  marginS = 0.4,
+): { t0: number; t1: number } {
+  const lo = Math.min(soundT, slotTime);
+  const hi = Math.max(soundT, slotTime);
+  const ceiling = durationS > 0 ? durationS : hi + marginS;
+  const t0 = Math.max(0, Math.min(ceiling, lo - marginS));
+  const t1 = Math.max(t0, Math.min(ceiling, hi + marginS));
+  return { t0, t1 };
 }
 
 /** Least-squares t = intercept + slope * k over beat indexes k = 0…n-1. */
