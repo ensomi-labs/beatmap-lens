@@ -1,1 +1,1 @@
-export type WorkspaceMode = "annotate" | "inspect" | "review" | "compare" | "timing";
+export type WorkspaceMode = "annotate" | "inspect" | "review" | "compare" | "timing" | "draft";

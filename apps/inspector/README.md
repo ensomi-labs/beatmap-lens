@@ -23,7 +23,7 @@ and Compare cannot open.
 
 ## Workspaces
 
-The mode switch moves between five workspaces:
+The mode switch moves between six workspaces:
 
 | Workspace | What it is for |
 | --- | --- |
@@ -32,6 +32,7 @@ The mode switch moves between five workspaces:
 | **Review** | Open `.osu` files, frozen tasks and agent handoffs from disk and record human review. |
 | **Compare** | Judge two generated charts of the same song by listening, without knowing which model made which. |
 | **Timing** | Mark beats and non-beats in passages of the source audio, with blind timing proposals drawn over it. |
+| **Draft** | Review a machine draft of a track's beats (raw BeatThis) against the sounds heard in it, edit it, state constraints and audition offers. |
 
 Every open workspace shares one frame: a toolbar (mode tabs, the open document,
 transport, time counter, state), a main view, side panes and a status bar. Drag the
@@ -43,7 +44,7 @@ toolbar hide and show the side panes. The browser remembers widths, hidden panes
 collapsed inspector sections per workspace. At 920 px and narrower, **Source**,
 **Preview** and **Details** switch between the regions instead.
 
-`/compare` and `/timing` open Compare and Timing directly. The connected Review inbox at `/review` is served
+`/compare`, `/timing` and `/draft` open Compare, Timing and Draft directly. The connected Review inbox at `/review` is served
 by `pnpm review:workspace` instead; see [agent–human review](../../docs/annotation/agent-workflow.md).
 
 ## Compare
@@ -191,6 +192,50 @@ playhead with its sample index, the save state and **Save marks**; the status ba
 shows zoom, follow, loop region, rate, the recording's rate and channels, rate
 conversion, the playhead offset and the marks file.
 
+## Draft
+
+Draft is separate from Timing and leaves its blind protocol alone. Open `/draft`
+from `pnpm dev`, or serve a build with
+`node apps/inspector/server/draft-server.ts [--port 4178]`. **Analyze** takes a
+local `.wav`, `.mp3`, `.ogg`, `.flac` or `.m4a` path; **Load demo** opens a
+generated track whose mock draft misses a phase reset at 14 s.
+
+- **Beats** come from raw BeatThis: `Audio2Frames` logits on the ffmpeg-decoded
+  PCM, peak-picked directly with each peak's probability as confidence. No tempo
+  is folded, no meter assumed, no grid fitted. The service runs
+  `server/draft_analyze.py` with `ENSOMI_PYTHON`, else the ensomi-model virtualenv
+  (`ENSOMI_MODEL_DIR`, default `~/ensomi/ensomi-model`), else
+  `uv run --locked python`. BeatThis reads the checkpoint
+  `ENSOMI_BEATTHIS_CHECKPOINT` (a file, or a name in torch's hub cache, default
+  `final0`); when it is missing the beats come from a labelled rule instead.
+- **Sounds** are global onset-flux peaks of the log-Mel envelope, independent of
+  the beats and marked experimental.
+- **Edits** (Edit mode, <kbd>1</kbd>) change beats at once: drag a beat (one edit on
+  release), double-click to add, <kbd>A</kbd> adds at the cursor,
+  <kbd>Delete</kbd> removes, <kbd>←</kbd>/<kbd>→</kbd> nudge 1 ms
+  (<kbd>Shift</kbd>: 10 ms, one edit after a pause), double-click a ruler run and
+  use the arrows to shift its offset, <kbd>R</kbd> places a reset.
+- **Statements** record claims about the Shift+drag selection and change nothing:
+  <kbd>E</kbd> steady, <kbd>Shift</kbd>+<kbd>E</kbd> free, <kbd>Q</kbd> no pulse,
+  <kbd>V</kbd> keep, <kbd>T</kbd> beat run, <kbd>M</kbd> sound at the cursor.
+- **Offers** come only from <kbd>⌘K</kbd> (Request offer), produced by a transparent
+  rule mock reserved for the N1 model; <kbd>Esc</kbd> cancels.
+- **Audition** (<kbd>2</kbd>): hold <kbd>Alt</kbd> to hear the active offer's clicks
+  (the offer cannot change while held), <kbd>\</kbd> cycles sibling offers,
+  <kbd>Tab</kbd> accepts, <kbd>Shift</kbd>+<kbd>Tab</kbd> rejects and suppresses,
+  <kbd>G</kbd> clicks the grid slot of an off-grid sound. The view bar switches
+  playback to an HPSS part or a band (<250 Hz, 250–2500 Hz, >2500 Hz) of the
+  selection, for listening only; times stay on the original mix.
+- <kbd>J</kbd>/<kbd>Shift</kbd>+<kbd>J</kbd> tour the trouble spans (low confidence,
+  interval jumps, unexplained sounds, conflicts), looping each with clicks.
+
+The trace appends to `.local/draft-traces/*.jsonl`; **Open trace** re-folds one.
+**.osu red lines** exports `[TimingPoints]` with barlines not inferred, and
+**Export clip for Gemini** renders a click-overlay WAV with
+`harness/audio-harness.py` into `.local/draft-clips/` and shows its path.
+`src/draft/ensomi-contract.ts` holds the shared ensomi v0 contract until the
+`ensomi` package can be imported.
+
 ## Code map
 
 | Path | Responsibility |
@@ -201,12 +246,15 @@ conversion, the playhead offset and the marks file.
 | `src/annotation/` | Annotation contracts, dataset storage, playback clocks, scene buffering |
 | `src/compare/` | Comparison contracts, excerpt proposals, audio envelope |
 | `src/timing/` | Timing formats, time axis, marks, spectrogram, and the Timing engine: clock model, transport, display and input paths, audio engine, playhead layer |
+| `src/draft/` | The ensomi v0 Draft contract (entities, edits, statements, offers, trace fold, derived views), the rule-mock recompute, the trace session, stage geometry and the synthetic demo |
 | `benchmarks/timing/` | The Timing engine latency harness (lab experiments, app scenarios, analysis) |
 | `server/local-service.ts` | Localhost-only request guard and helpers shared by both services |
 | `server/local-files.ts` | Full-path dataset, catalog and corpus access for Annotate |
 | `server/comparisons.ts` | Blind comparison sessions and verdict files for Compare |
 | `server/timing.ts` | Blind timing sessions, PCM serving, marks files and guarded reveal |
 | `server/timing-server.ts` | The plain-Node server for a timing bundle |
+| `server/draft.ts`, `server/draft_analyze.py` | The Draft service: analysis, PCM, audition views, clips, recompute and trace files |
+| `server/draft-server.ts` | The plain-Node server opened on Draft |
 | `scripts/ui-shots/` | Synthetic inputs, screenshots and browser checks of every mode (Playwright supplied by the caller) |
 | `server/review-workspace.mjs` | The connected Review service behind `/review` |
 
