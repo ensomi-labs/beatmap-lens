@@ -60,6 +60,7 @@ HIGH_HZ = 2500.0
 AUDITION_PAD_S = 0.5
 BREAK_GAP_SEC = 2.5
 MAX_CACHED_TRACKS = 3
+MAX_AUDITION_WINDOW_CACHE = 2
 
 # Symmetric 15-tap Hann-windowed sinc half-band FIR for exact 2:1 anti-aliased decimation.
 _FIR_IDX = np.arange(-7, 8, dtype=np.float64)
@@ -2105,6 +2106,41 @@ def recompute_constrained(
 # ---------------------------------------------------------------- Zero-Phase Stereo Audition & Clip Export
 
 
+def band_views_all(
+    pcm: np.ndarray,
+    sample_rate: int,
+    order: int = 4,
+    cancel_event: threading.Event | None = None,
+) -> dict[str, np.ndarray]:
+    """Compute all three zero-phase FFT band views ('low', 'mid', 'high') in float32 from one rfft."""
+    length = pcm.shape[0]
+    if length == 0:
+        empty = pcm.astype(np.float32, copy=True)
+        return {"low": empty, "mid": empty.copy(), "high": empty.copy()}
+    _check_cancel(cancel_event)
+    pad = max(1024, int(round(0.25 * sample_rate)))
+    n_fft = 1 << (length + 2 * pad - 1).bit_length()
+    freqs = np.fft.rfftfreq(n_fft, 1.0 / sample_rate)
+    lp_low = 1.0 / (1.0 + (freqs / LOW_HZ) ** (2 * order))
+    lp_high = 1.0 / (1.0 + (freqs / HIGH_HZ) ** (2 * order))
+    with np.errstate(divide="ignore"):
+        hp_low = 1.0 / (1.0 + (LOW_HZ / freqs) ** (2 * order))
+        hp_high = 1.0 / (1.0 + (HIGH_HZ / freqs) ** (2 * order))
+    gains = {
+        "low": lp_low,
+        "mid": hp_low * lp_high,
+        "high": hp_high,
+    }
+    spec = np.fft.rfft(pcm.astype(np.float64, copy=False), n=n_fft, axis=0)
+    out: dict[str, np.ndarray] = {}
+    for name, gain in gains.items():
+        _check_cancel(cancel_event)
+        arr = np.fft.irfft(spec * gain[:, None], n=n_fft, axis=0)[:length].astype(np.float32)
+        arr.setflags(write=False)
+        out[name] = arr
+    return out
+
+
 def band_view(pcm: np.ndarray, sample_rate: int, view: str, order: int = 4) -> np.ndarray:
     """Zero-phase Butterworth-squared frequency response on linear zero-padded FFT (no edge wrap)."""
     length = pcm.shape[0]
@@ -2142,6 +2178,65 @@ def _median(values: np.ndarray, kernel: int, axis: int, rows: int = 96) -> np.nd
         block = sliding_window_view(padded[first : first + rows], eff_kernel, axis=1)
         out[first : first + rows] = np.median(block, axis=-1)
     return np.moveaxis(out, 1, axis)
+
+
+def hpss_views_both(
+    pcm: np.ndarray,
+    sample_rate: int,
+    kernel: int = 17,
+    cancel_event: threading.Event | None = None,
+) -> dict[str, np.ndarray]:
+    """Compute both 'percussive' and 'harmonic' float32 views from one STFT + median pass per channel."""
+    if pcm.shape[0] == 0:
+        empty = pcm.astype(np.float32, copy=True)
+        return {"percussive": empty, "harmonic": empty.copy()}
+    n_fft = 2048 if sample_rate > 32000 else 1024
+    hop = n_fft // 4
+    window = np.hanning(n_fft)
+    win_sq = window**2
+    n_samples, n_channels = pcm.shape
+    out_perc = np.zeros((n_samples, n_channels), dtype=np.float32)
+    out_harm = np.zeros((n_samples, n_channels), dtype=np.float32)
+    pcm_f64 = pcm.astype(np.float64, copy=False)
+
+    padded_len = n_samples + 2 * n_fft + hop
+    frame_count = 1 + max(0, (padded_len - n_fft) // hop)
+    weight = np.zeros(padded_len, dtype=np.float64)
+    for index in range(frame_count):
+        start = index * hop
+        weight[start : start + n_fft] += win_sq
+    denom_weight = np.maximum(weight, 1e-8)
+
+    for channel in range(n_channels):
+        _check_cancel(cancel_event)
+        padded = np.pad(pcm_f64[:, channel], (n_fft, n_fft + hop))
+        frames = sliding_window_view(padded, n_fft)[::hop]
+        spec = np.fft.rfft(frames * window, axis=1)
+        _check_cancel(cancel_event)
+        magnitude = np.abs(spec)
+        harmonic = _median(magnitude, kernel, axis=0)
+        _check_cancel(cancel_event)
+        percussive = _median(magnitude, kernel, axis=1)
+        _check_cancel(cancel_event)
+
+        h2 = harmonic**2
+        p2 = percussive**2
+        mask_perc = p2 / (p2 + h2 + 1e-12)
+        mask_harm = h2 / (h2 + p2 + 1e-12)
+
+        for dst, mask in ((out_perc, mask_perc), (out_harm, mask_harm)):
+            _check_cancel(cancel_event)
+            pieces = np.fft.irfft(spec * mask, n=n_fft, axis=1) * window
+            signal = np.zeros(padded.size, dtype=np.float64)
+            for index, piece in enumerate(pieces):
+                start = index * hop
+                signal[start : start + n_fft] += piece
+            restored = signal / denom_weight
+            dst[:, channel] = restored[n_fft : n_fft + n_samples].astype(np.float32)
+
+    out_perc.setflags(write=False)
+    out_harm.setflags(write=False)
+    return {"percussive": out_perc, "harmonic": out_harm}
 
 
 def hpss_view(pcm: np.ndarray, sample_rate: int, view: str, kernel: int = 17) -> np.ndarray:
@@ -2229,6 +2324,7 @@ class TrackEntry:
     ctime_ns: int = 0
     ino: int = 0
     audio_sha256: str | None = None
+    cache_key: tuple = ()
     feature_lock: threading.Lock = field(default_factory=threading.Lock)
     _features: dict | None = None
 
@@ -2362,6 +2458,7 @@ class TrackCache:
                     ctime_ns=st.st_ctime_ns,
                     ino=st.st_ino,
                     audio_sha256=norm_sha,
+                    cache_key=key,
                 )
                 with self._lock:
                     self._entries[key] = entry
@@ -2380,6 +2477,97 @@ class TrackCache:
                 raise
 
 
+@dataclass
+class _InflightAuditionGroup:
+    event: threading.Event = field(default_factory=threading.Event)
+    views: dict[str, np.ndarray] | None = None
+    error: Exception | None = None
+
+
+class AuditionWindowCache:
+    """Thread-safe bounded 2-window filter slice cache reusing HPSS and FFT band decompositions."""
+
+    def __init__(self, max_windows: int = MAX_AUDITION_WINDOW_CACHE) -> None:
+        self.max_windows = max(1, int(max_windows))
+        self._lock = threading.Lock()
+        self._entries: OrderedDict[tuple, dict[str, np.ndarray]] = OrderedDict()
+        self._inflight: dict[tuple, _InflightAuditionGroup] = {}
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._entries)
+
+    def keys(self) -> list[tuple]:
+        with self._lock:
+            return list(self._entries.keys())
+
+    def get_or_compute(
+        self,
+        win_key: tuple,
+        sub_pcm: np.ndarray,
+        sample_rate: int,
+        filter_name: str,
+        cancel_event: threading.Event | None = None,
+    ) -> np.ndarray:
+        _check_cancel(cancel_event)
+        group = "hpss" if filter_name in ("percussive", "harmonic") else "band"
+        inflight_key = (win_key, group)
+
+        while True:
+            with self._lock:
+                existing_win = self._entries.get(win_key)
+                if existing_win is not None:
+                    self._entries.move_to_end(win_key)
+                    cached_arr = existing_win.get(filter_name)
+                    if cached_arr is not None:
+                        return cached_arr
+                inflight = self._inflight.get(inflight_key)
+                if inflight is None:
+                    inflight = _InflightAuditionGroup()
+                    self._inflight[inflight_key] = inflight
+                    is_worker = True
+                else:
+                    is_worker = False
+
+            if not is_worker:
+                while not inflight.event.wait(timeout=0.05):
+                    _check_cancel(cancel_event)
+                if inflight.views is not None and filter_name in inflight.views:
+                    with self._lock:
+                        if win_key in self._entries:
+                            self._entries.move_to_end(win_key)
+                    return inflight.views[filter_name]
+                if inflight.error is not None and not isinstance(inflight.error, CancelledError):
+                    raise inflight.error
+                continue
+
+            try:
+                if group == "hpss":
+                    computed = hpss_views_both(sub_pcm, sample_rate, cancel_event=cancel_event)
+                else:
+                    computed = band_views_all(sub_pcm, sample_rate, cancel_event=cancel_event)
+                _check_cancel(cancel_event)
+                with self._lock:
+                    bucket = self._entries.get(win_key)
+                    if bucket is None:
+                        bucket = {}
+                        self._entries[win_key] = bucket
+                    bucket.update(computed)
+                    self._entries.move_to_end(win_key)
+                    while len(self._entries) > self.max_windows:
+                        self._entries.popitem(last=False)
+                    self._inflight.pop(inflight_key, None)
+                    inflight.views = computed
+                    inflight.event.set()
+                return computed[filter_name]
+            except Exception as exc:
+                with self._lock:
+                    self._inflight.pop(inflight_key, None)
+                    inflight.error = exc
+                    inflight.event.set()
+                raise
+
+
 class TempoEngine:
     """Stateful warm engine holding bounded PCM LRU cache and optional BeatThis checkpoint."""
 
@@ -2389,9 +2577,12 @@ class TempoEngine:
         backend: str | None = None,
         checkpoint_name: str | None = None,
         device: str | None = None,
+        max_audition_windows: int = MAX_AUDITION_WINDOW_CACHE,
     ) -> None:
         self.cache = TrackCache(max_tracks=max_cached_tracks)
         self._track_cache = self.cache
+        self.audition_window_cache = AuditionWindowCache(max_windows=max_audition_windows)
+        self._audition_window_cache = self.audition_window_cache
         self.backend = (backend or os.environ.get("TEMPO_ANALYZER_BACKEND") or "auto").strip().lower()
         self.checkpoint_name = checkpoint_name or os.environ.get("ENSOMI_BEATTHIS_CHECKPOINT", "final0")
         self.requested_device = device or os.environ.get("ENSOMI_BEATTHIS_DEVICE")
@@ -2634,9 +2825,20 @@ class TempoEngine:
         exact_count = end_sample - start_sample
 
         _check_cancel(cancel_event)
-        rendered = audition_view(sub_pcm, sr, filter_name)
-        _check_cancel(cancel_event)
-        trimmed = rendered[actual_lead_samples : actual_lead_samples + exact_count]
+        if filter_name == "mix":
+            trimmed = entry.pcm[start_sample:end_sample]
+        else:
+            track_key = entry.cache_key or (entry.path, entry.size_bytes, entry.mtime_ns)
+            win_key = (track_key, i0, i1, sr)
+            rendered = self.audition_window_cache.get_or_compute(
+                win_key,
+                sub_pcm,
+                sr,
+                filter_name,
+                cancel_event=cancel_event,
+            )
+            _check_cancel(cancel_event)
+            trimmed = rendered[actual_lead_samples : actual_lead_samples + exact_count]
         base_meta = {
             "filter": filter_name,
             "startSec": round(start_sample / float(sr), 9),

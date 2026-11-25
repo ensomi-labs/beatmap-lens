@@ -62,10 +62,12 @@ import {
 } from "./client";
 import {
   AUDITION_FILTER_OPTIONS,
+  AuditionSliceCache,
   buildDisplayOffers,
   computeAuditionWindow,
   computeOfferBeatPreview,
   computeUnbeatCaptureRadiusSec,
+  type DecodedAuditionSlice,
   findSegmentAtTime,
   formatSecSpan,
   formatShortTimeSec,
@@ -105,7 +107,7 @@ const rangeShiftStepsMs = [-10, -2, 2, 10] as const;
 const minimumPrerollMs = 120;
 const fineMsPerDevicePx = 0.5;
 const beatLoopHalfMs = 500;
-const flamHalfSec = 0.25;
+const flamHalfSec = 0.75;
 
 const singleShotKeys = new Set([
   " ",
@@ -138,6 +140,7 @@ interface TempoPreferences {
   volume: number;
   clicks: boolean;
   clickVolume: number;
+  cacheAuditionFilters: boolean;
 }
 
 function readPreferences(): TempoPreferences {
@@ -147,9 +150,11 @@ function readPreferences(): TempoPreferences {
       volume: typeof raw.volume === "number" ? raw.volume : 0.8,
       clicks: typeof raw.clicks === "boolean" ? raw.clicks : false,
       clickVolume: typeof raw.clickVolume === "number" ? raw.clickVolume : 0.65,
+      cacheAuditionFilters:
+        typeof raw.cacheAuditionFilters === "boolean" ? raw.cacheAuditionFilters : true,
     };
   } catch {
-    return { volume: 0.8, clicks: false, clickVolume: 0.65 };
+    return { volume: 0.8, clicks: false, clickVolume: 0.65, cacheAuditionFilters: true };
   }
 }
 
@@ -280,11 +285,29 @@ let motionPlacedAtMs = Number.NEGATIVE_INFINITY;
 let fitPending = true;
 let disposed = false;
 
+interface AuditionAnchorWindow {
+  songId: string;
+  startSec: number;
+  endSec: number;
+}
+
+const auditionSliceCache = new AuditionSliceCache();
+let auditionAnchorWindow: AuditionAnchorWindow | null = null;
+let workingAuditionChannels: Float32Array[] | null = null;
+let patchedAuditionSpan: { startFrame: number; endFrame: number } | null = null;
+
 // AbortControllers for clean latest-wins cancellation
 let songOpenAbort: AbortController | null = null;
 let snapsAbort: AbortController | null = null;
 let snapDebounceTimer: ReturnType<typeof setTimeout> | undefined;
 let auditionAbort: AbortController | null = null;
+let auditionPrefetchAbort: AbortController | null = null;
+let auditionPrefetchTimer: ReturnType<typeof setTimeout> | undefined;
+let inflightPrefetchSlice: {
+  key: string;
+  promise: Promise<DecodedAuditionSlice | null>;
+} | null = null;
+let stopPrefetchAfterCurrent = false;
 let recomputeAbort: AbortController | null = null;
 
 const isSongReadyForActions = computed(
@@ -559,9 +582,354 @@ function syncClicks() {
 }
 
 // Switch between Mix and filtered Audition buffers seamlessly without interrupting playback!
-watch([subMode, auditionFilter], () => {
-  void syncAuditionBuffer();
-});
+watch(
+  [subMode, auditionFilter],
+  () => {
+    if (subMode.value !== "audition") {
+      abortAuditionPrefetch();
+    }
+    void syncAuditionBuffer();
+  },
+  { flush: "sync" },
+);
+
+function sliceCacheKey(
+  epoch: number,
+  songId: string,
+  filter: AuditionFilter,
+  t0: number,
+  t1: number,
+): string {
+  return `${epoch}:${songId}:${filter}:${t0}:${t1}`;
+}
+
+function abortAuditionPrefetch() {
+  clearTimeout(auditionPrefetchTimer);
+  auditionPrefetchTimer = undefined;
+  stopPrefetchAfterCurrent = false;
+  inflightPrefetchSlice = null;
+  auditionPrefetchAbort?.abort();
+  auditionPrefetchAbort = null;
+}
+
+function clearAuditionSongMemory() {
+  abortAuditionPrefetch();
+  auditionSliceCache.clear();
+  auditionAnchorWindow = null;
+  workingAuditionChannels = null;
+  patchedAuditionSpan = null;
+}
+
+function isAnchorWindowReusable(
+  anchor: AuditionAnchorWindow | null,
+  songId: string,
+  playheadSec: number,
+  forwardBias: boolean,
+): anchor is AuditionAnchorWindow {
+  if (!anchor || anchor.songId !== songId) return false;
+  const dur = Math.max(0.1, durationSec.value);
+  if (dur <= 60) {
+    return Math.abs(anchor.startSec) < 1e-6 && Math.abs(anchor.endSec - dur) < 1e-3;
+  }
+  if (anchor.endSec <= anchor.startSec || anchor.endSec > dur + 1e-3) return false;
+  if (playheadSec < anchor.startSec || playheadSec >= anchor.endSec) return false;
+  const reachesEnd = anchor.endSec >= dur - 1e-3;
+  if (!reachesEnd && anchor.endSec - playheadSec <= 5.0) return false;
+
+  if (!forwardBias) {
+    const r = activeRange.value;
+    if (r && r.t1 > r.t0 && r.t1 - r.t0 <= 60 && playheadSec >= r.t0 && playheadSec < r.t1) {
+      if (anchor.startSec > r.t0 + 1e-4 || anchor.endSec < r.t1 - 1e-4) return false;
+    }
+    const loopStartSec = loopRegion.value.startMs / 1000;
+    const loopEndSec = loopRegion.value.endMs / 1000;
+    if (
+      looping.value &&
+      loopEndSec > loopStartSec &&
+      loopEndSec - loopStartSec <= 60 &&
+      playheadSec >= loopStartSec &&
+      playheadSec < loopEndSec
+    ) {
+      if (anchor.startSec > loopStartSec + 1e-4 || anchor.endSec < loopEndSec - 1e-4) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+function resolveAuditionWindow(
+  songId: string,
+  playheadSec: number,
+  forwardBias: boolean,
+): Range {
+  if (isAnchorWindowReusable(auditionAnchorWindow, songId, playheadSec, forwardBias)) {
+    return { t0: auditionAnchorWindow.startSec, t1: auditionAnchorWindow.endSec };
+  }
+  const win = computeAuditionWindow({
+    durationSec: durationSec.value,
+    playheadSec,
+    activeRange: activeRange.value,
+    looping: looping.value,
+    loopStartSec: loopRegion.value.startMs / 1000,
+    loopEndSec: loopRegion.value.endMs / 1000,
+    ...(forwardBias ? { forwardBias: true } : {}),
+  });
+  auditionAnchorWindow = { songId, startSec: win.t0, endSec: win.t1 };
+  return win;
+}
+
+function applyDecodedAuditionSlice(
+  songId: string,
+  targetFilter: AuditionFilter,
+  win: Range,
+  slice: DecodedAuditionSlice,
+  engineKey: string,
+) {
+  if (!engine || !mixChannels) return;
+  const numCh = mixChannels.length;
+  if (
+    !workingAuditionChannels ||
+    workingAuditionChannels.length !== numCh ||
+    (workingAuditionChannels[0]?.length ?? 0) !== mixFrames
+  ) {
+    workingAuditionChannels = mixChannels.map((ch) => Float32Array.from(ch));
+    patchedAuditionSpan = null;
+  } else if (patchedAuditionSpan) {
+    const { startFrame: prevStart, endFrame: prevEnd } = patchedAuditionSpan;
+    for (let c = 0; c < numCh; c += 1) {
+      const dst = workingAuditionChannels[c];
+      const orig = mixChannels[c];
+      if (!dst || !orig) continue;
+      const r0 = Math.max(0, Math.min(orig.length, prevStart));
+      const r1 = Math.max(r0, Math.min(orig.length, prevEnd));
+      if (r1 > r0) {
+        dst.set(orig.subarray(r0, r1), r0);
+      }
+    }
+    patchedAuditionSpan = null;
+  }
+
+  const startFrame = Math.max(0, slice.startFrame);
+  let maxEndFrame = startFrame;
+  for (let c = 0; c < numCh; c += 1) {
+    const dst = workingAuditionChannels[c];
+    const src = slice.channels[Math.min(c, slice.channels.length - 1)];
+    if (!dst || !src) continue;
+    const copyLen = Math.min(src.length, Math.max(0, dst.length - startFrame));
+    if (copyLen > 0) {
+      dst.set(src.subarray(0, copyLen), startFrame);
+      maxEndFrame = Math.max(maxEndFrame, startFrame + copyLen);
+    }
+  }
+  patchedAuditionSpan = maxEndFrame > startFrame ? { startFrame, endFrame: maxEndFrame } : null;
+
+  const splicedBuffer = engine.createBuffer(workingAuditionChannels, mixFrames);
+  engine.swapBuffer(splicedBuffer);
+  activeEngineFilterKey = engineKey;
+  activeAuditionWindow.value = {
+    songId,
+    filter: targetFilter,
+    startSec: win.t0,
+    endSec: win.t1,
+  };
+  syncClicks();
+}
+
+async function fetchAndDecodeAuditionSlice(
+  capturedEpoch: number,
+  songId: string,
+  filter: AuditionFilter,
+  win: Range,
+  targetEngine: StageAudioEngine,
+  signal: AbortSignal,
+): Promise<DecodedAuditionSlice | null> {
+  const rawSlice = await fetchAuditionAudio(
+    songId,
+    { t0: win.t0, t1: win.t1, filter },
+    signal,
+  );
+  if (
+    signal.aborted ||
+    disposed ||
+    capturedEpoch !== songEpoch ||
+    selectedSongId.value !== songId ||
+    loadedSongId.value !== songId ||
+    engine !== targetEngine
+  ) {
+    return null;
+  }
+  const decoded = await decodeBytesToChannels(rawSlice.bytes, targetEngine.context);
+  if (
+    signal.aborted ||
+    disposed ||
+    capturedEpoch !== songEpoch ||
+    selectedSongId.value !== songId ||
+    loadedSongId.value !== songId ||
+    engine !== targetEngine
+  ) {
+    return null;
+  }
+  const startFrame =
+    rawSlice.startSample !== null && rawSlice.sampleRate !== null && rawSlice.sampleRate > 0
+      ? targetEngine.sampleRate === rawSlice.sampleRate
+        ? rawSlice.startSample
+        : Math.round((rawSlice.startSample * targetEngine.sampleRate) / rawSlice.sampleRate)
+      : Math.max(0, Math.round(win.t0 * targetEngine.sampleRate));
+  const byteLength = decoded.channels.reduce((sum, ch) => sum + ch.byteLength, 0);
+  const entry: DecodedAuditionSlice = {
+    startFrame,
+    channels: decoded.channels,
+    sampleRate: targetEngine.sampleRate,
+    byteLength,
+  };
+  auditionSliceCache.set(sliceCacheKey(capturedEpoch, songId, filter, win.t0, win.t1), entry);
+  return entry;
+}
+
+function scheduleAuditionPrefetch(nextWinHint?: Range) {
+  if (
+    disposed ||
+    subMode.value !== "audition" ||
+    !preferences.value.cacheAuditionFilters ||
+    auditionRendering.value ||
+    !isSongReadyForActions.value ||
+    audioState.value !== "ready"
+  ) {
+    return;
+  }
+  if (auditionPrefetchAbort && !nextWinHint) {
+    return;
+  }
+  if (auditionPrefetchTimer !== undefined && !nextWinHint) {
+    return;
+  }
+  clearTimeout(auditionPrefetchTimer);
+  auditionPrefetchTimer = setTimeout(() => {
+    auditionPrefetchTimer = undefined;
+    void runAuditionPrefetch(nextWinHint);
+  }, 15);
+}
+
+async function runAuditionPrefetch(nextWinHint?: Range) {
+  if (
+    disposed ||
+    subMode.value !== "audition" ||
+    !preferences.value.cacheAuditionFilters ||
+    auditionRendering.value ||
+    !isSongReadyForActions.value ||
+    audioState.value !== "ready" ||
+    !engine ||
+    !mixChannels
+  ) {
+    return;
+  }
+  if (auditionPrefetchAbort) {
+    if (!nextWinHint) return;
+    abortAuditionPrefetch();
+  }
+
+  const songId = loadedSongId.value;
+  if (!songId || songId !== selectedSongId.value) return;
+  const capturedEpoch = songEpoch;
+  const targetEngine = engine;
+  const curFilter = auditionFilter.value;
+
+  const tasks: Array<{ filter: AuditionFilter; win: Range; key: string }> = [];
+  if (nextWinHint && curFilter !== "mix") {
+    const nextKey = sliceCacheKey(capturedEpoch, songId, curFilter, nextWinHint.t0, nextWinHint.t1);
+    if (!auditionSliceCache.has(nextKey)) {
+      tasks.push({ filter: curFilter, win: nextWinHint, key: nextKey });
+    }
+  } else {
+    const curWin =
+      activeAuditionWindow.value && activeAuditionWindow.value.songId === songId
+        ? { t0: activeAuditionWindow.value.startSec, t1: activeAuditionWindow.value.endSec }
+        : resolveAuditionWindow(songId, shownPlayheadMs() / 1000, false);
+    const baseOrder: AuditionFilter[] =
+      curFilter === "low" || curFilter === "mid" || curFilter === "high"
+        ? ["low", "mid", "high", "percussive", "harmonic"]
+        : ["percussive", "harmonic", "low", "mid", "high"];
+    const orderedFilters: AuditionFilter[] =
+      curFilter !== "mix"
+        ? [curFilter, ...baseOrder.filter((f) => f !== curFilter)]
+        : baseOrder;
+
+    const approxSliceBytes = Math.max(
+      1,
+      Math.round((curWin.t1 - curWin.t0) * targetEngine.sampleRate) * mixChannels.length * 4,
+    );
+    const maxWarmCount = Math.min(
+      orderedFilters.length,
+      Math.max(1, Math.floor(auditionSliceCache.maxBytes / approxSliceBytes)),
+    );
+    for (const f of orderedFilters.slice(0, maxWarmCount)) {
+      const key = sliceCacheKey(capturedEpoch, songId, f, curWin.t0, curWin.t1);
+      if (!auditionSliceCache.has(key)) {
+        tasks.push({ filter: f, win: curWin, key });
+      }
+    }
+  }
+
+  if (tasks.length === 0) return;
+
+  const controller = new AbortController();
+  auditionPrefetchAbort = controller;
+  stopPrefetchAfterCurrent = false;
+
+  try {
+    for (const task of tasks) {
+      if (
+        controller.signal.aborted ||
+        stopPrefetchAfterCurrent ||
+        disposed ||
+        capturedEpoch !== songEpoch ||
+        selectedSongId.value !== songId ||
+        loadedSongId.value !== songId ||
+        subMode.value !== "audition" ||
+        !preferences.value.cacheAuditionFilters ||
+        auditionRendering.value
+      ) {
+        break;
+      }
+      if (auditionSliceCache.has(task.key)) continue;
+      const slicePromise = fetchAndDecodeAuditionSlice(
+        capturedEpoch,
+        songId,
+        task.filter,
+        task.win,
+        targetEngine,
+        controller.signal,
+      );
+      inflightPrefetchSlice = { key: task.key, promise: slicePromise };
+      try {
+        await slicePromise;
+      } finally {
+        if (inflightPrefetchSlice?.promise === slicePromise) {
+          inflightPrefetchSlice = null;
+        }
+      }
+      if (stopPrefetchAfterCurrent) break;
+    }
+  } catch {
+    // Background pre-warm errors or aborts never disturb foreground UI state.
+  } finally {
+    if (auditionPrefetchAbort === controller) {
+      auditionPrefetchAbort = null;
+      stopPrefetchAfterCurrent = false;
+    }
+  }
+}
+
+function toggleCacheAuditionFilters() {
+  preferences.value.cacheAuditionFilters = !preferences.value.cacheAuditionFilters;
+  savePreferences();
+  if (preferences.value.cacheAuditionFilters) {
+    scheduleAuditionPrefetch();
+  } else {
+    abortAuditionPrefetch();
+  }
+}
 
 async function decodeBytesToChannels(
   bytes: ArrayBuffer,
@@ -614,6 +982,7 @@ async function loadSongAudio(
   inFlightAuditionTarget = null;
   auditionRendering.value = false;
   activeAuditionWindow.value = null;
+  clearAuditionSongMemory();
   activeEngineFilterKey = "mix";
   try {
     const bytes = await fetchSongAudioBytes(songId, signal);
@@ -656,8 +1025,12 @@ async function loadSongAudio(
     );
     audioState.value = "ready";
     audioLoadSettledForSongId.value = songId;
-    if (subMode.value === "audition" && auditionFilter.value !== "mix") {
-      void syncAuditionBuffer();
+    if (subMode.value === "audition") {
+      if (auditionFilter.value !== "mix") {
+        void syncAuditionBuffer();
+      } else if (preferences.value.cacheAuditionFilters) {
+        scheduleAuditionPrefetch();
+      }
     }
   } catch (cause) {
     if (isAbortError(cause) || signal.aborted || capturedEpoch !== songEpoch) return;
@@ -672,7 +1045,6 @@ async function loadSongAudio(
 function maybeRefreshAuditionWindow(anchorSec: number, forwardBias = false) {
   if (
     subMode.value !== "audition" ||
-    auditionFilter.value === "mix" ||
     !isSongReadyForActions.value ||
     audioState.value !== "ready"
   ) {
@@ -680,6 +1052,18 @@ function maybeRefreshAuditionWindow(anchorSec: number, forwardBias = false) {
   }
   const songId = loadedSongId.value;
   if (!songId) return;
+  if (auditionFilter.value === "mix") {
+    if (
+      !forwardBias &&
+      preferences.value.cacheAuditionFilters &&
+      !isAnchorWindowReusable(auditionAnchorWindow, songId, anchorSec, false)
+    ) {
+      abortAuditionPrefetch();
+      resolveAuditionWindow(songId, anchorSec, false);
+      scheduleAuditionPrefetch();
+    }
+    return;
+  }
   const cur = activeAuditionWindow.value;
   const outsideCurrent =
     !cur ||
@@ -697,7 +1081,32 @@ function maybeRefreshAuditionWindow(anchorSec: number, forwardBias = false) {
     cur.endSec < durationSec.value - 1e-3 &&
     cur.endSec - anchorSec <= 5.0;
 
-  if (!outsideCurrent && !nearingEdge) return;
+  if (!outsideCurrent && !nearingEdge) {
+    if (
+      forwardBias &&
+      preferences.value.cacheAuditionFilters &&
+      cur !== null &&
+      cur.songId === songId &&
+      cur.filter === auditionFilter.value &&
+      cur.endSec < durationSec.value - 1e-3 &&
+      cur.endSec - anchorSec <= 12.0
+    ) {
+      const nextWin = computeAuditionWindow({
+        durationSec: durationSec.value,
+        playheadSec: Math.max(anchorSec, cur.endSec - 5),
+        activeRange: activeRange.value,
+        looping: looping.value,
+        loopStartSec: loopRegion.value.startMs / 1000,
+        loopEndSec: loopRegion.value.endMs / 1000,
+        forwardBias: true,
+      });
+      const nextKey = sliceCacheKey(songEpoch, songId, auditionFilter.value, nextWin.t0, nextWin.t1);
+      if (!auditionSliceCache.has(nextKey) && inflightPrefetchSlice?.key !== nextKey) {
+        scheduleAuditionPrefetch(nextWin);
+      }
+    }
+    return;
+  }
 
   if (
     inFlightAuditionTarget &&
@@ -741,22 +1150,45 @@ async function syncAuditionBuffer(options?: { anchorSec?: number; forwardBias?: 
       activeEngineFilterKey = "mix";
       syncClicks();
     }
+    if (subMode.value === "audition" && preferences.value.cacheAuditionFilters) {
+      scheduleAuditionPrefetch();
+    }
     return;
   }
 
   const playheadSec = options?.anchorSec ?? shownPlayheadMs() / 1000;
-  const win = computeAuditionWindow({
-    durationSec: durationSec.value,
-    playheadSec,
-    activeRange: activeRange.value,
-    looping: looping.value,
-    loopStartSec: loopRegion.value.startMs / 1000,
-    loopEndSec: loopRegion.value.endMs / 1000,
-    ...(options?.forwardBias ? { forwardBias: true } : {}),
-  });
+  const win = resolveAuditionWindow(songId, playheadSec, Boolean(options?.forwardBias));
 
-  const cacheKey = `${songId}:${targetFilter}:${win.t0}:${win.t1}`;
-  if (activeEngineFilterKey === cacheKey) {
+  const engineKey = sliceCacheKey(capturedEpoch, songId, targetFilter, win.t0, win.t1);
+  if (activeEngineFilterKey === engineKey) {
+    if (preferences.value.cacheAuditionFilters) {
+      scheduleAuditionPrefetch();
+    }
+    return;
+  }
+
+  const cachedSlice = auditionSliceCache.get(engineKey);
+  if (cachedSlice && cachedSlice.sampleRate === engine.sampleRate) {
+    auditionAbort?.abort();
+    auditionAbort = null;
+    inFlightAuditionTarget = null;
+    auditionRendering.value = false;
+    applyDecodedAuditionSlice(songId, targetFilter, win, cachedSlice, engineKey);
+    if (preferences.value.cacheAuditionFilters) {
+      scheduleAuditionPrefetch();
+    }
+    return;
+  }
+
+  if (
+    auditionAbort &&
+    !auditionAbort.signal.aborted &&
+    inFlightAuditionTarget &&
+    inFlightAuditionTarget.songId === songId &&
+    inFlightAuditionTarget.filter === targetFilter &&
+    Math.abs(inFlightAuditionTarget.startSec - win.t0) < 1e-6 &&
+    Math.abs(inFlightAuditionTarget.endSec - win.t1) < 1e-6
+  ) {
     return;
   }
 
@@ -771,25 +1203,32 @@ async function syncAuditionBuffer(options?: { anchorSec?: number; forwardBias?: 
   };
   auditionRendering.value = true;
 
+  const joinedPrefetch =
+    inflightPrefetchSlice?.key === engineKey ? inflightPrefetchSlice.promise : null;
+  let onForegroundAbort: (() => void) | null = null;
+  if (joinedPrefetch) {
+    clearTimeout(auditionPrefetchTimer);
+    auditionPrefetchTimer = undefined;
+    stopPrefetchAfterCurrent = true;
+    onForegroundAbort = () => abortAuditionPrefetch();
+    controller.signal.addEventListener("abort", onForegroundAbort, { once: true });
+  } else {
+    abortAuditionPrefetch();
+  }
+
   try {
-    const slice = await fetchAuditionAudio(
-      songId,
-      { t0: win.t0, t1: win.t1, filter: targetFilter },
-      controller.signal,
-    );
+    const decodedEntry = joinedPrefetch
+      ? await joinedPrefetch
+      : await fetchAndDecodeAuditionSlice(
+          capturedEpoch,
+          songId,
+          targetFilter,
+          win,
+          engine,
+          controller.signal,
+        );
     if (
-      controller.signal.aborted ||
-      disposed ||
-      capturedEpoch !== songEpoch ||
-      selectedSongId.value !== songId ||
-      loadedSongId.value !== songId ||
-      !engine ||
-      !mixChannels
-    ) {
-      return;
-    }
-    const decoded = await decodeBytesToChannels(slice.bytes, engine.context);
-    if (
+      !decodedEntry ||
       controller.signal.aborted ||
       disposed ||
       capturedEpoch !== songEpoch ||
@@ -804,43 +1243,26 @@ async function syncAuditionBuffer(options?: { anchorSec?: number; forwardBias?: 
       subMode.value === "audition" ? auditionFilter.value : "mix";
     if (liveTargetFilter !== targetFilter) return;
 
-    const startFrame =
-      slice.startSample !== null && slice.sampleRate !== null && slice.sampleRate > 0
-        ? engine.sampleRate === slice.sampleRate
-          ? slice.startSample
-          : Math.round((slice.startSample * engine.sampleRate) / slice.sampleRate)
-        : Math.max(0, Math.round(win.t0 * engine.sampleRate));
-
-    const numCh = mixChannels.length;
-    const spliced: Float32Array[] = mixChannels.map((ch) => Float32Array.from(ch));
-    for (let c = 0; c < numCh; c += 1) {
-      const dst = spliced[c];
-      const src = decoded.channels[Math.min(c, decoded.channels.length - 1)];
-      if (!dst || !src) continue;
-      const copyLen = Math.min(src.length, Math.max(0, dst.length - startFrame));
-      if (copyLen > 0) {
-        dst.set(src.subarray(0, copyLen), startFrame);
-      }
-    }
-
-    const splicedBuffer = engine.createBuffer(spliced, mixFrames);
-    engine.swapBuffer(splicedBuffer);
-    activeEngineFilterKey = cacheKey;
-    activeAuditionWindow.value = {
-      songId,
-      filter: targetFilter,
-      startSec: win.t0,
-      endSec: win.t1,
-    };
-    syncClicks();
+    applyDecodedAuditionSlice(songId, targetFilter, win, decodedEntry, engineKey);
   } catch (cause) {
     if (isAbortError(cause) || controller.signal.aborted || capturedEpoch !== songEpoch) return;
     reportError(cause);
   } finally {
+    if (onForegroundAbort) {
+      controller.signal.removeEventListener("abort", onForegroundAbort);
+    }
     if (auditionAbort === controller) {
       auditionAbort = null;
       inFlightAuditionTarget = null;
       auditionRendering.value = false;
+      if (
+        !disposed &&
+        capturedEpoch === songEpoch &&
+        subMode.value === "audition" &&
+        preferences.value.cacheAuditionFilters
+      ) {
+        scheduleAuditionPrefetch();
+      }
     }
   }
 }
@@ -906,6 +1328,7 @@ function resetActiveSongContext() {
   inFlightAuditionTarget = null;
   auditionRendering.value = false;
   activeAuditionWindow.value = null;
+  clearAuditionSongMemory();
   clearSnapState();
 
   stop();
@@ -1384,7 +1807,7 @@ function toggleFlamCheck() {
     clicks: preferences.value.clicks,
   };
   stop();
-  rate.value = 0.5;
+  rate.value = 0.25;
   loopRegion.value = {
     startMs: clampToBounds((anchorSec - flamHalfSec) * 1000),
     endMs: clampToBounds((anchorSec + flamHalfSec) * 1000),
@@ -1394,6 +1817,7 @@ function toggleFlamCheck() {
   savePreferences();
   syncClicks();
   playheadMs.value = loopRegion.value.startMs;
+  maybeRefreshAuditionWindow(playheadMs.value / 1000, false);
   togglePlayback();
 }
 
@@ -2801,6 +3225,7 @@ onBeforeUnmount(() => {
   snapsAbort?.abort();
   recomputeAbort?.abort();
   auditionAbort?.abort();
+  clearAuditionSongMemory();
   clearTimeout(snapDebounceTimer);
   clearTimeout(transportTimer);
   window.removeEventListener("keydown", handleKeydown);
@@ -3359,6 +3784,16 @@ onBeforeUnmount(() => {
                 <button
                   type="button"
                   class="tool-button"
+                  :aria-pressed="preferences.cacheAuditionFilters"
+                  title="Pre-cache audition filters for the active window"
+                  @click="toggleCacheAuditionFilters"
+                >
+                  Cache
+                </button>
+
+                <button
+                  type="button"
+                  class="tool-button"
                   :disabled="!activeOffer"
                   :aria-pressed="holdingAlt"
                   aria-keyshortcuts="Alt"
@@ -3377,7 +3812,7 @@ onBeforeUnmount(() => {
                   :disabled="!sessionPayload"
                   :aria-pressed="Boolean(flamSavedState)"
                   aria-keyshortcuts="G"
-                  title="Flam check: ±250 ms at 0.5× with clicks around selection (G)"
+                  title="Flam check: ±750 ms at 0.25× with clicks around selection (G)"
                   @click="toggleFlamCheck"
                 >
                   Flam <kbd>G</kbd>
@@ -3730,7 +4165,7 @@ onBeforeUnmount(() => {
                   type="button"
                   class="tool-button"
                   aria-keyshortcuts="G"
-                  title="Flam check around sound (G)"
+                  title="Flam check: ±750 ms at 0.25× around sound (G)"
                   @click="toggleFlamCheck"
                 >
                   Flam check <kbd>G</kbd>

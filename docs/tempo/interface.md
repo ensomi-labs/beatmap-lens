@@ -24,7 +24,7 @@ conventions in [`apps/inspector/DESIGN.md`](../../apps/inspector/DESIGN.md) v2.0
 | --- | --- | --- |
 | **Top toolbar** (`.frame-toolbar`) | `40 px` | `Tempo` title, `Import`, `Folder…`, `Export`; `Edit` / `Audition` switch; transport (`Play`/`Stop`, `Loop`, `Clicks`, `Rate`, `Follow`, `Undo`/`Redo`); contained `.time-counter`; status dot |
 | **Left pane** (`tempo-left`) | `248 px` (`184–420 px`) | Vertically split collapsible `Songs` and `Inbox` lists so neither starves the other on multi-track folders |
-| **Stage view bar** (`.stage-toolbar`) | `≥ 32 px`, `flex-wrap: wrap` | Shrinking song title (`flex: 1 1 0; min-width: 96px`) plus sub-mode tools (`Edit` cues or `Audition` filters) with zero horizontal overflow across `1440 px`, `1240 px`, and `1100 px` |
+| **Stage view bar** (`.stage-toolbar`) | `≥ 32 px`, `flex-wrap: wrap` | Shrinking song title (`flex: 1 1 0; min-width: 96px`) plus sub-mode tools (`Edit` cues or `Audition` filters + `Cache` toggle) with zero horizontal overflow across `1440 px`, `1240 px`, and `1100 px` |
 | **Segment strip** (`TempoSegmentStrip`) | `30 px` | Whole-song `[0, duration)` `Segment` partition, `Keep`/`Free`/`Break` shading, `Inbox` priority pips, boundary handles, and viewport lens |
 | **Detail stage** (`TempoStage`) | Flexible well (`#101820`) | Time ruler, worker STFT spectrogram, multi-scale stereo waveform, `Pulse` lane (`Beat` + `×` `Unbeat` cues), derived `Sounds` lane, and inline `Snap-to-Sound` candidates |
 | **Right pane** (`tempo-right`) | `308 px` (`256–480 px`) | `Suggestions` (shown only when `valid` or `stale` offers exist; auto-revealed on `⌘K`) and contextual `Selection` / `Fine-Tune` |
@@ -68,7 +68,7 @@ update continuously; nothing triggers layout reflows.
 | `J` / `⇧J` | Focus and loop next / previous ranked `Inbox` span |
 | `⌘K` (`Ctrl+K`) | Run `heavy_recompute` on active `Range` or whole song |
 | `Alt` (hold) / `\` / `Tab` / `⇧Tab` | Momentary A/B offer preview (`hold-offers`) / cycle options / accept / dismiss |
-| `G` / `X` | Toggle `±250 ms` `0.5×` flam check / loop `±500 ms` around selection |
+| `G` / `X` | Toggle `±750 ms` `0.25×` flam check / loop `±500 ms` around selection |
 | `Ctrl+wheel`, `+` / `-` / `0` / `Z` | Zoom at pointer, zoom in/out/fit, or toggle `0.5 ms/devicePx` fine zoom |
 | `Option+click` / middle-click | Locate playhead (restarts playback once with pre-roll while playing) |
 | `⌘Z` / `⇧⌘Z` | Undo / redo trace events |

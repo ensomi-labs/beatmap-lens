@@ -33,7 +33,11 @@ recorded in canonical float64 seconds on the **original stereo mix**
 (`mix`, `percussive`, `harmonic`, `low`, `mid`, `high`) hot-swaps only the
 listening buffer inside the root `StageAudioEngine` (`X-Audition-Only`); visual
 waveforms, spectrograms, beat clicks, and saved edits remain locked to the
-original mix clock.
+original mix clock. With the `Cache` option enabled (default on), the client
+pre-warms non-`mix` filters strictly for the active `≤ 60 s` window inside a
+bounded `≤ 128 MiB` / `≤ 12`-slice LRU cache and splices into a single reusable
+working channel buffer, keeping memory safe on multi-hour tracks while switching
+filters with zero render delay.
 
 ## Three-Layer `TriggerPolicy` Lifecycle
 
@@ -52,8 +56,9 @@ lifecycles:
 localhost and `x-beatmap-lens-local: 1` guards, serializing trace writes through
 `TraceWriter` (monotonic `seq`, duplicate-ID rejection, and torn-tail healing).
 `TempoDaemonClient` maintains a single warm stdio NDJSON subprocess
-(`tempo_daemon.py`) with bounded LRU PCM/feature caching and cooperative
-per-request `cancel` propagation.
+(`tempo_daemon.py`) with bounded LRU PCM/feature caching, a 2-window filter
+decomposition cache reusing sibling HPSS and FFT band passes across `render_audition`
+calls, and cooperative per-request `cancel` propagation.
 
 Behind `ensomi`'s `TimingProvider` interface (`manifest`, `prepare`, `analyze`,
 `suggestSnaps`, `recompute`), providers satisfy functional I/O, canonical clock,

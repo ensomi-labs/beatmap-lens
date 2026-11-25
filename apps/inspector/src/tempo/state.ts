@@ -268,6 +268,85 @@ export function findSegmentAtTime(
   return timeSec < (segments[0]?.t0 ?? 0) ? segments[0] : segments.at(-1);
 }
 
+export const MAX_AUDITION_SLICE_CACHE_BYTES = 128 * 1024 * 1024;
+export const MAX_AUDITION_SLICE_CACHE_ENTRIES = 12;
+
+export interface DecodedAuditionSlice {
+  startFrame: number;
+  channels: Float32Array[];
+  sampleRate: number;
+  byteLength: number;
+}
+
+/**
+ * Byte-bounded and count-bounded client LRU cache of decoded `<= 60 s` audition slices.
+ * Never retains full-song `AudioBuffer`s so multi-hour tracks stay strictly `<= 128 MiB`.
+ */
+export class AuditionSliceCache {
+  private readonly entries = new Map<string, DecodedAuditionSlice>();
+  private bytesUsed = 0;
+  readonly maxBytes: number;
+  readonly maxEntries: number;
+
+  constructor(
+    maxBytes = MAX_AUDITION_SLICE_CACHE_BYTES,
+    maxEntries = MAX_AUDITION_SLICE_CACHE_ENTRIES,
+  ) {
+    this.maxBytes = Math.max(0, maxBytes);
+    this.maxEntries = Math.max(1, maxEntries);
+  }
+
+  get size(): number {
+    return this.entries.size;
+  }
+
+  get totalBytes(): number {
+    return this.bytesUsed;
+  }
+
+  has(key: string): boolean {
+    return this.entries.has(key);
+  }
+
+  get(key: string): DecodedAuditionSlice | undefined {
+    const hit = this.entries.get(key);
+    if (!hit) return undefined;
+    this.entries.delete(key);
+    this.entries.set(key, hit);
+    return hit;
+  }
+
+  set(key: string, slice: DecodedAuditionSlice): void {
+    const existing = this.entries.get(key);
+    if (existing) {
+      this.bytesUsed = Math.max(0, this.bytesUsed - existing.byteLength);
+      this.entries.delete(key);
+    }
+    if (slice.byteLength > this.maxBytes) {
+      return;
+    }
+    while (
+      this.entries.size > 0 &&
+      (this.entries.size >= this.maxEntries || this.bytesUsed + slice.byteLength > this.maxBytes)
+    ) {
+      const oldestKey = this.entries.keys().next().value;
+      if (oldestKey === undefined) break;
+      const oldest = this.entries.get(oldestKey);
+      this.entries.delete(oldestKey);
+      if (oldest) {
+        this.bytesUsed = Math.max(0, this.bytesUsed - oldest.byteLength);
+      }
+    }
+    this.entries.set(key, slice);
+    this.bytesUsed += slice.byteLength;
+  }
+
+  clear(): void {
+    this.entries.clear();
+    this.bytesUsed = 0;
+  }
+}
+
 /** Computes a bounded `<= maxSpanSec` audition render window covering the active loop/range/view. */
 export function computeAuditionWindow(options: {
   durationSec: number;
@@ -314,13 +393,19 @@ export function computeAuditionWindow(options: {
       return { t0, t1 };
     }
   }
+  const maxT0 = Math.max(0, dur - maxSpan);
+  const gridStep = Math.max(1, Math.min(15, maxSpan / 4));
   if (options.forwardBias) {
-    const t0 = Math.max(0, Math.min(Math.max(0, dur - maxSpan), options.playheadSec - 4));
+    const unclamped = Math.max(0, options.playheadSec - 4);
+    const quantized = Math.floor(unclamped / gridStep) * gridStep;
+    const t0 = Math.max(0, Math.min(maxT0, quantized));
     const t1 = Math.min(dur, t0 + maxSpan);
     return { t0, t1 };
   }
   const half = maxSpan / 2;
-  const t0 = Math.max(0, Math.min(Math.max(0, dur - maxSpan), options.playheadSec - half));
+  const unclamped = Math.max(0, options.playheadSec - half);
+  const quantized = Math.round(unclamped / gridStep) * gridStep;
+  const t0 = Math.max(0, Math.min(maxT0, quantized));
   const t1 = Math.min(dur, t0 + maxSpan);
   return { t0, t1 };
 }

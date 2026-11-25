@@ -718,6 +718,123 @@ class AstraDaemonHardeningTest(unittest.TestCase):
             finally:
                 server.close()
 
+    def test_audition_window_cache_sibling_parity_speedup_and_2_window_lru_eviction(self):
+        import base64
+        import io
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as folder:
+            wav_path = Path(folder) / "window_cache.wav"
+            dur_s = 6.0
+            t = np.arange(int(RATE * dur_s)) / RATE
+            left = (
+                0.22 * np.sin(2.0 * np.pi * 110.0 * t)
+                + 0.18 * np.sin(2.0 * np.pi * 880.0 * t)
+                + 0.12 * np.sin(2.0 * np.pi * 4200.0 * t)
+                + click_train(np.arange(0.4, 5.8, 0.5), dur_s)
+            )
+            right = (
+                0.20 * np.sin(2.0 * np.pi * 165.0 * t)
+                + 0.16 * np.sin(2.0 * np.pi * 1320.0 * t)
+                + 0.10 * np.sin(2.0 * np.pi * 5100.0 * t)
+                + click_train(np.arange(0.65, 5.8, 0.5), dur_s)
+            )
+            stereo = np.column_stack([left, right])
+            write_wav(wav_path, stereo, rate=RATE)
+
+            engine = daemon.TempoEngine(backend="dsp", max_audition_windows=2)
+            entry = engine.cache.get_or_load(wav_path)
+
+            # 1. Verify exact mathematical parity (< 1e-5) of hpss_views_both & band_views_all vs standalone audition_view!
+            sub_pcm = entry.pcm[int(0.5 * RATE) : int(3.5 * RATE)]
+            both_hpss = daemon.hpss_views_both(sub_pcm, RATE)
+            for name in ("percussive", "harmonic"):
+                ref = daemon.audition_view(sub_pcm, RATE, name).astype(np.float32)
+                self.assertTrue(
+                    np.allclose(both_hpss[name], ref, atol=1e-5, rtol=1e-5),
+                    f"{name} max diff: {np.max(np.abs(both_hpss[name] - ref))}",
+                )
+
+            all_bands = daemon.band_views_all(sub_pcm, RATE)
+            for name in ("low", "mid", "high"):
+                ref = daemon.audition_view(sub_pcm, RATE, name).astype(np.float32)
+                self.assertTrue(
+                    np.allclose(all_bands[name], ref, atol=1e-5, rtol=1e-5),
+                    f"{name} max diff: {np.max(np.abs(all_bands[name] - ref))}",
+                )
+
+            # 2. Verify render_span_wav reuses sibling decompositions in a single pass per group and writes zero files!
+            before_files = sorted(p.name for p in Path(folder).iterdir())
+            with (
+                mock.patch.object(daemon, "hpss_views_both", wraps=daemon.hpss_views_both) as spy_hpss,
+                mock.patch.object(daemon, "band_views_all", wraps=daemon.band_views_all) as spy_band,
+            ):
+                t0_cold = time.perf_counter()
+                r_perc = engine.render_span_wav(wav_path, 1.0, 3.0, "percussive")
+                cold_hpss_ms = (time.perf_counter() - t0_cold) * 1000.0
+
+                t0_warm = time.perf_counter()
+                r_harm = engine.render_span_wav(wav_path, 1.0, 3.0, "harmonic")
+                warm_hpss_ms = (time.perf_counter() - t0_warm) * 1000.0
+
+                self.assertEqual(spy_hpss.call_count, 1)
+                self.assertLess(warm_hpss_ms, cold_hpss_ms)
+
+                r_low = engine.render_span_wav(wav_path, 1.0, 3.0, "low")
+                r_mid = engine.render_span_wav(wav_path, 1.0, 3.0, "mid")
+                r_high = engine.render_span_wav(wav_path, 1.0, 3.0, "high")
+                self.assertEqual(spy_band.call_count, 1)
+
+                # Verify WAV byte parity against standalone audition_view + encode_wav_bytes
+                pad_s = int(round(daemon.AUDITION_PAD_S * RATE))
+                s0 = int(round(1.0 * RATE))
+                s1 = int(round(3.0 * RATE))
+                i0 = max(0, s0 - pad_s)
+                i1 = min(entry.pcm.shape[0], s1 + pad_s)
+                lead = s0 - i0
+                count = s1 - s0
+                for filt, res_obj in (
+                    ("percussive", r_perc),
+                    ("harmonic", r_harm),
+                    ("low", r_low),
+                    ("mid", r_mid),
+                    ("high", r_high),
+                ):
+                    ref_full = daemon.audition_view(entry.pcm[i0:i1], RATE, filt)
+                    ref_wav = daemon.encode_wav_bytes(ref_full[lead : lead + count], RATE)
+                    got_wav = base64.b64decode(res_obj["wavBase64"])
+                    with wave.open(io.BytesIO(ref_wav), "rb") as wf_ref, wave.open(io.BytesIO(got_wav), "rb") as wf_got:
+                        arr_ref = np.frombuffer(wf_ref.readframes(wf_ref.getnframes()), dtype="<i2").astype(np.int32)
+                        arr_got = np.frombuffer(wf_got.readframes(wf_got.getnframes()), dtype="<i2").astype(np.int32)
+                        self.assertLessEqual(int(np.max(np.abs(arr_ref - arr_got))), 1, filt)
+
+            self.assertEqual(sorted(p.name for p in Path(folder).iterdir()), before_files)
+
+            # 3. Verify strict 2-window LRU eviction with recency refresh!
+            self.assertEqual(len(engine.audition_window_cache), 1)  # Window A: [1.0, 3.0]
+            engine.render_span_wav(wav_path, 2.0, 4.0, "low")  # Window B: [2.0, 4.0]
+            self.assertEqual(len(engine.audition_window_cache), 2)
+
+            # Touch Window A ([1.0, 3.0]) so Window B becomes LRU victim
+            engine.render_span_wav(wav_path, 1.0, 3.0, "harmonic")
+            # Insert Window C ([3.5, 5.5]) -> evicts Window B, retains Window A + Window C!
+            engine.render_span_wav(wav_path, 3.5, 5.5, "percussive")
+            self.assertEqual(len(engine.audition_window_cache), 2)
+
+            cached_ranges = [(k[1], k[2]) for k in engine.audition_window_cache.keys()]
+            win_a_bounds = (max(0, int(round(1.0 * RATE)) - pad_s), min(entry.pcm.shape[0], int(round(3.0 * RATE)) + pad_s))
+            win_b_bounds = (max(0, int(round(2.0 * RATE)) - pad_s), min(entry.pcm.shape[0], int(round(4.0 * RATE)) + pad_s))
+            win_c_bounds = (max(0, int(round(3.5 * RATE)) - pad_s), min(entry.pcm.shape[0], int(round(5.5 * RATE)) + pad_s))
+            self.assertIn(win_a_bounds, cached_ranges)
+            self.assertIn(win_c_bounds, cached_ranges)
+            self.assertNotIn(win_b_bounds, cached_ranges)
+
+            # 4. Verify cooperative cancellation raises CancelledError promptly
+            cancelled = threading.Event()
+            cancelled.set()
+            with self.assertRaises(daemon.CancelledError):
+                engine.render_span_wav(wav_path, 0.2, 5.2, "percussive", cancel_event=cancelled)
+
 
 if __name__ == "__main__":
     unittest.main()

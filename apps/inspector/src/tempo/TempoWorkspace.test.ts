@@ -14,7 +14,12 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createApp, defineComponent, h, nextTick } from "vue";
 import type { TempoRecomputeResponse, TempoSongSessionPayload, TempoSongSummary } from "./client";
-import { computeAuditionWindow } from "./state";
+import {
+  AuditionSliceCache,
+  computeAuditionWindow,
+  MAX_AUDITION_SLICE_CACHE_BYTES,
+  MAX_AUDITION_SLICE_CACHE_ENTRIES,
+} from "./state";
 import TempoWorkspace from "./TempoWorkspace.vue";
 
 const engineSpy = vi.hoisted(() => ({
@@ -24,12 +29,19 @@ const engineSpy = vi.hoisted(() => ({
   swaps: 0,
   unloads: 0,
   lastBufferChannels: null as Float32Array[] | null,
+  lastPlayOptions: null as {
+    fromMs: number;
+    endMs: number;
+    rate: number;
+    loop: { startMs: number; endMs: number } | null;
+  } | null,
   clicks: [] as (number[] | null)[],
   clickVolumes: [] as number[],
   playing: false,
   positionMs: 0,
   forceContextSampleRate: null as number | null,
   overrideHeardAt: undefined as (() => number | undefined) | undefined,
+  overrideAudioFrames: null as number | null,
 }));
 
 vi.mock("../stage-audio", async () => {
@@ -64,12 +76,13 @@ vi.mock("../stage-audio", async () => {
                 } as unknown as AudioBuffer;
               }
             }
+            const defaultFrames = engineSpy.overrideAudioFrames ?? this.sampleRate * 16;
             return {
               numberOfChannels: 1,
               sampleRate: this.sampleRate,
-              length: this.sampleRate * 16,
-              duration: 16,
-              getChannelData: () => new Float32Array(this.sampleRate * 16),
+              length: defaultFrames,
+              duration: defaultFrames / this.sampleRate,
+              getChannelData: () => new Float32Array(defaultFrames),
             } as unknown as AudioBuffer;
           },
         };
@@ -109,10 +122,16 @@ vi.mock("../stage-audio", async () => {
         this.loaded = undefined;
       }
 
-      async play(opts: { fromMs: number }) {
+      async play(opts: {
+        fromMs: number;
+        endMs: number;
+        rate: number;
+        loop: { startMs: number; endMs: number } | null;
+      }) {
         engineSpy.plays += 1;
         engineSpy.playing = true;
         engineSpy.positionMs = opts.fromMs;
+        engineSpy.lastPlayOptions = opts;
         this.playing = true;
         return true;
       }
@@ -395,12 +414,14 @@ describe("TempoWorkspace interactive UI", () => {
       swaps: 0,
       unloads: 0,
       lastBufferChannels: null,
+      lastPlayOptions: null,
       clicks: [],
       clickVolumes: [],
       playing: false,
       positionMs: 0,
       forceContextSampleRate: null,
       overrideHeardAt: undefined,
+      overrideAudioFrames: null,
     });
 
     const song1 = makeSongRecord("01-campanella-a1b2c3d4", "01 - Lime - Campanella", "01.mp3");
@@ -1588,5 +1609,397 @@ describe("TempoWorkspace interactive UI", () => {
     await flushUi();
 
     expect(song1.controller.getState().beats.get("b-s14-01")?.timeSec).toBeCloseTo(0.998, 4);
+  });
+
+  it("runs Flam check (G) at 0.25x over +-750 ms (1,500 ms span, clamped at bounds) with clicks and restores prior state on second G", async () => {
+    await mountWorkspace();
+
+    // Set non-default prior state: rate = 0.75x, custom loop [2000, 6000] enabled, clicks OFF
+    const rate075Btn = Array.from(
+      container.querySelectorAll('.frame-toolbar [aria-label="Playback rate"] button'),
+    ).find((b) => b.textContent?.trim() === "0.75×") as HTMLButtonElement;
+    rate075Btn.click();
+    await flushUi();
+
+    stageHook.emit?.("range-select", { t0: 2, t1: 6 });
+    await flushUi();
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "l" }));
+    await flushUi();
+
+    const clicksBtn = Array.from(container.querySelectorAll(".frame-toolbar button")).find(
+      (b) => b.textContent?.trim() === "Clicks",
+    ) as HTMLButtonElement;
+    expect(clicksBtn.getAttribute("aria-pressed")).toBe("false");
+
+    // Select beat at 3.0 s (`b-s14-03`) and press G -> 0.25x, loop [2250, 3750] (1,500 ms span), clicks ON!
+    stageHook.emit?.("select", { kind: "beat", id: "b-s14-03" });
+    await flushUi();
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "g" }));
+    await flushUi();
+
+    expect(engineSpy.playing).toBe(true);
+    expect(engineSpy.lastPlayOptions?.rate).toBe(0.25);
+    expect(engineSpy.lastPlayOptions?.loop).toEqual({ startMs: 2250, endMs: 3750 });
+    expect(
+      (engineSpy.lastPlayOptions?.loop?.endMs ?? 0) -
+        (engineSpy.lastPlayOptions?.loop?.startMs ?? 0),
+    ).toBe(1500);
+    expect(clicksBtn.getAttribute("aria-pressed")).toBe("true");
+    expect(engineSpy.clicks.at(-1)).not.toBeNull();
+    expect(container.querySelector(".frame-status")?.textContent).toContain("Rate 0.25×");
+
+    // Press G again -> stops flam check and restores rate = 0.75x, looping = true, loopRegion = [2000, 6000], clicks = false!
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "g" }));
+    await flushUi();
+
+    expect(engineSpy.playing).toBe(false);
+    expect(rate075Btn.getAttribute("aria-pressed")).toBe("true");
+    expect(clicksBtn.getAttribute("aria-pressed")).toBe("false");
+    expect(stageHook.props.looping).toBe(true);
+    expect(stageHook.props.loopRegion ?? stageHook.props["loop-region"]).toEqual({
+      startMs: 2000,
+      endMs: 6000,
+    });
+
+    // Also verify track-start and track-end boundary clamping (+-750 ms clamped to [0, 16000]):
+    stageHook.emit?.("select", { kind: "none" });
+    stageHook.emit?.("seek", 300);
+    await flushUi();
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "g" }));
+    await flushUi();
+    expect(engineSpy.lastPlayOptions?.rate).toBe(0.25);
+    expect(engineSpy.lastPlayOptions?.loop).toEqual({ startMs: 0, endMs: 1050 });
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "g" }));
+    await flushUi();
+
+    stageHook.emit?.("seek", 15_600);
+    await flushUi();
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "g" }));
+    await flushUi();
+    expect(engineSpy.lastPlayOptions?.loop).toEqual({ startMs: 14_850, endMs: 16_000 });
+  });
+
+  it("defaults Audition Cache ON with localStorage persistence, aborts pre-warm when toggled OFF, and swaps cached Perc <-> Harm with zero Rendering flicker", async () => {
+    const auditionRequests: Array<{
+      filter: string;
+      t0: number;
+      t1: number;
+      signal?: AbortSignal;
+    }> = [];
+    let pendingHarmResolve: (() => void) | null = null;
+    let blockHarmOnce = false;
+
+    const fillByFilter: Record<string, number> = {
+      percussive: 0.75,
+      harmonic: 0.42,
+      low: 0.25,
+      mid: 0.5,
+      high: 0.15,
+    };
+
+    const baseFetch = globalThis.fetch;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const rawUrl = typeof input === "string" ? input : input.toString();
+        const url = new URL(rawUrl, "http://127.0.0.1");
+        if (url.pathname.endsWith("/audition")) {
+          const filter = url.searchParams.get("filter") ?? "mix";
+          const t0 = Number(url.searchParams.get("t0") ?? "0");
+          const t1 = Number(url.searchParams.get("t1") ?? "0");
+          auditionRequests.push({
+            filter,
+            t0,
+            t1,
+            ...(init?.signal ? { signal: init.signal } : {}),
+          });
+          if (blockHarmOnce && filter === "harmonic") {
+            blockHarmOnce = false;
+            await new Promise<void>((resolve, reject) => {
+              pendingHarmResolve = resolve;
+              init?.signal?.addEventListener(
+                "abort",
+                () => reject(new DOMException("Aborted", "AbortError")),
+                { once: true },
+              );
+            });
+          }
+          const marker = new ArrayBuffer(12);
+          const dv = new DataView(marker);
+          dv.setUint32(0, 0x21445541, true);
+          dv.setUint32(4, 200, true);
+          dv.setFloat32(8, fillByFilter[filter] ?? 0.5, true);
+          return new Response(marker, {
+            status: 200,
+            headers: {
+              "Content-Type": "audio/wav",
+              "X-Audition-Start-Sample": "1000",
+              "X-Audition-End-Sample": "1200",
+              "X-Audition-Sample-Rate": "44100",
+            },
+          });
+        }
+        return await baseFetch(input, init);
+      }),
+    );
+
+    await mountWorkspace();
+
+    const auditionBtn = Array.from(
+      container.querySelectorAll(".frame-toolbar .segmented button"),
+    ).find((b) => b.textContent?.trim() === "Audition") as HTMLButtonElement;
+    blockHarmOnce = true;
+    auditionBtn.click();
+    await flushUi();
+
+    const cacheBtn = Array.from(container.querySelectorAll(".stage-toolbar button")).find(
+      (b) => b.textContent?.trim() === "Cache",
+    ) as HTMLButtonElement | undefined;
+    expect(cacheBtn).toBeDefined();
+    expect(cacheBtn?.getAttribute("aria-pressed")).toBe("true");
+
+    // Wait >15ms so background pre-warm starts `percussive` and stalls on `harmonic`
+    await new Promise((r) => setTimeout(r, 35));
+    await flushUi();
+    expect(auditionRequests.some((r) => r.filter === "percussive")).toBe(true);
+    const harmReq = auditionRequests.find((r) => r.filter === "harmonic");
+    expect(harmReq).toBeDefined();
+    expect(harmReq?.signal?.aborted).toBe(false);
+    // Background pre-warm NEVER shows "Rendering filter…"
+    expect(container.querySelector(".tempo-status")?.textContent?.trim()).not.toBe(
+      "Rendering filter…",
+    );
+
+    // Toggle Cache OFF -> immediately aborts the in-flight background `harmonic` request and persists `false`!
+    cacheBtn?.click();
+    await flushUi();
+    expect(cacheBtn?.getAttribute("aria-pressed")).toBe("false");
+    expect(harmReq?.signal?.aborted).toBe(true);
+    expect(
+      JSON.parse(localStorage.getItem("lens-tempo-preferences") ?? "{}").cacheAuditionFilters,
+    ).toBe(false);
+    (pendingHarmResolve as (() => void) | null)?.();
+
+    const countAfterDisable = auditionRequests.length;
+    await new Promise((r) => setTimeout(r, 35));
+    await flushUi();
+    expect(auditionRequests.length).toBe(countAfterDisable);
+
+    // Toggle Cache back ON -> warms all remaining non-mix filters for `[0, 16)`!
+    cacheBtn?.click();
+    await nextTick();
+    expect(cacheBtn?.getAttribute("aria-pressed")).toBe("true");
+    expect(
+      JSON.parse(localStorage.getItem("lens-tempo-preferences") ?? "{}").cacheAuditionFilters,
+    ).toBe(true);
+    await new Promise((r) => setTimeout(r, 45));
+    await flushUi();
+
+    const warmedFilters = new Set(auditionRequests.map((r) => r.filter));
+    expect(warmedFilters).toEqual(new Set(["percussive", "harmonic", "low", "mid", "high"]));
+
+    // Now switch Perc -> Harm -> Perc: ZERO new fetches, ZERO "Rendering filter…" status flicker, exact synchronous buffer splice!
+    const statusEl = container.querySelector(".tempo-status");
+    const observedStatusTexts: string[] = [];
+    const statusObserver = new MutationObserver(() => {
+      observedStatusTexts.push(statusEl?.textContent?.trim() ?? "");
+    });
+    if (statusEl) {
+      statusObserver.observe(statusEl, { childList: true, characterData: true, subtree: true });
+    }
+
+    const countBeforeSwitches = auditionRequests.length;
+    const swapsBefore = engineSpy.swaps;
+    const percBtn = Array.from(container.querySelectorAll(".stage-toolbar .segmented button")).find(
+      (b) => b.textContent?.trim() === "Perc",
+    ) as HTMLButtonElement;
+    const harmBtn = Array.from(container.querySelectorAll(".stage-toolbar .segmented button")).find(
+      (b) => b.textContent?.trim() === "Harm",
+    ) as HTMLButtonElement;
+
+    percBtn.click();
+    // Synchronous check BEFORE flushUi()!
+    expect(engineSpy.swaps).toBe(swapsBefore + 1);
+    expect(engineSpy.lastBufferChannels?.[0]?.[1000]).toBeCloseTo(0.75, 5);
+    await nextTick();
+    expect(container.querySelector(".tempo-status")?.textContent?.trim()).not.toBe(
+      "Rendering filter…",
+    );
+
+    harmBtn.click();
+    expect(engineSpy.swaps).toBe(swapsBefore + 2);
+    expect(engineSpy.lastBufferChannels?.[0]?.[1000]).toBeCloseTo(0.42, 5);
+    await nextTick();
+    expect(container.querySelector(".tempo-status")?.textContent?.trim()).not.toBe(
+      "Rendering filter…",
+    );
+
+    percBtn.click();
+    expect(engineSpy.swaps).toBe(swapsBefore + 3);
+    expect(engineSpy.lastBufferChannels?.[0]?.[1000]).toBeCloseTo(0.75, 5);
+    await flushUi();
+    statusObserver.disconnect();
+    expect(observedStatusTexts).not.toContain("Rendering filter…");
+    expect(auditionRequests.length).toBe(countBeforeSwitches);
+  });
+
+  it("reuses exact active 60s window across filter switches during playback and enforces <= 128 MiB / <= 12-slice LRU bounds on 3600s tracks", async () => {
+    // 1. Direct unit checks for 15s grid quantization & AuditionSliceCache byte/count bounds:
+    expect(
+      computeAuditionWindow({
+        durationSec: 3600,
+        playheadSec: 100.0,
+        activeRange: null,
+        looping: false,
+        loopStartSec: 0,
+        loopEndSec: 0,
+      }),
+    ).toEqual({ t0: 75, t1: 135 });
+    expect(
+      computeAuditionWindow({
+        durationSec: 3600,
+        playheadSec: 102.5,
+        activeRange: null,
+        looping: false,
+        loopStartSec: 0,
+        loopEndSec: 0,
+      }),
+    ).toEqual({ t0: 75, t1: 135 });
+
+    // Verify 128 MiB byte cap: 60s @ 48 kHz stereo = 23,040,000 bytes/slice -> 5 slices fit (115.2 MB), 6th evicts oldest!
+    const byteCache = new AuditionSliceCache();
+    expect(byteCache.maxBytes).toBe(MAX_AUDITION_SLICE_CACHE_BYTES);
+    expect(byteCache.maxEntries).toBe(MAX_AUDITION_SLICE_CACHE_ENTRIES);
+    const sliceBytes48kStereo = 60 * 48_000 * 2 * 4; // 23,040,000 bytes
+    for (let i = 0; i < 6; i += 1) {
+      if (i === 5) {
+        // Touch key_0 via get() so key_1 becomes the LRU victim instead of key_0!
+        expect(byteCache.get("key_0")).toBeDefined();
+      }
+      byteCache.set(`key_${i}`, {
+        startFrame: i * 1000,
+        channels: [],
+        sampleRate: 48_000,
+        byteLength: sliceBytes48kStereo,
+      });
+    }
+    expect(byteCache.size).toBe(5);
+    expect(byteCache.totalBytes).toBeLessThanOrEqual(MAX_AUDITION_SLICE_CACHE_BYTES);
+    expect(byteCache.has("key_0")).toBe(true);
+    expect(byteCache.has("key_1")).toBe(false);
+
+    // 2. Full component test on a simulated 3,600 s (1-hour) song (at 1 kHz mock rate to keep test fast):
+    engineSpy.forceContextSampleRate = 1000;
+    engineSpy.overrideAudioFrames = 3_600_000;
+    const requestedSlices: Array<{ filter: string; t0: number; t1: number }> = [];
+    const baseFetch = globalThis.fetch;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const rawUrl = typeof input === "string" ? input : input.toString();
+        const url = new URL(rawUrl, "http://127.0.0.1");
+        if (url.pathname.endsWith("/open")) {
+          const song1 = requireSong("01-campanella-a1b2c3d4");
+          if (!song1.controller.getState().audio) {
+            await song1.controller.openSong({
+              songId: "01-campanella-a1b2c3d4",
+              durationSec: 3600,
+              sampleRate: 1000,
+              clock: "source-audio-sec",
+            });
+          }
+          return new Response(JSON.stringify(buildPayload(song1)), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        if (url.pathname.endsWith("/audition")) {
+          const filter = url.searchParams.get("filter") ?? "mix";
+          const t0 = Number(url.searchParams.get("t0") ?? "0");
+          const t1 = Number(url.searchParams.get("t1") ?? "0");
+          requestedSlices.push({ filter, t0, t1 });
+          const marker = new ArrayBuffer(12);
+          const dv = new DataView(marker);
+          dv.setUint32(0, 0x21445541, true);
+          dv.setUint32(4, 60_000, true);
+          dv.setFloat32(8, 0.33, true);
+          return new Response(marker, {
+            status: 200,
+            headers: {
+              "Content-Type": "audio/wav",
+              "X-Audition-Start-Sample": String(Math.round(t0 * 1000)),
+              "X-Audition-End-Sample": String(Math.round(t1 * 1000)),
+              "X-Audition-Sample-Rate": "1000",
+            },
+          });
+        }
+        return await baseFetch(input, init);
+      }),
+    );
+
+    await mountWorkspace();
+
+    const auditionBtn = Array.from(
+      container.querySelectorAll(".frame-toolbar .segmented button"),
+    ).find((b) => b.textContent?.trim() === "Audition") as HTMLButtonElement;
+    auditionBtn.click();
+    await flushUi();
+
+    // Seek to 90.0 s (establishes anchor window [60, 120)) and warm all 5 filters
+    stageHook.emit?.("seek", 90_000);
+    await flushUi();
+    const harmBtn = Array.from(container.querySelectorAll(".stage-toolbar .segmented button")).find(
+      (b) => b.textContent?.trim() === "Harm",
+    ) as HTMLButtonElement;
+    const percBtn = Array.from(container.querySelectorAll(".stage-toolbar .segmented button")).find(
+      (b) => b.textContent?.trim() === "Perc",
+    ) as HTMLButtonElement;
+    harmBtn.click();
+    await new Promise((r) => setTimeout(r, 45));
+    await flushUi();
+    expect(
+      requestedSlices
+        .filter((s) => s.t0 === 60 && s.t1 === 120)
+        .map((s) => s.filter)
+        .sort(),
+    ).toEqual(["harmonic", "high", "low", "mid", "percussive"]);
+
+    // Start playback and advance playhead from 90.0 s to 102.5 s (where unanchored computeAuditionWindow would compute [75, 135)!)
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: " " }));
+    await flushUi();
+    engineSpy.positionMs = 102_500;
+
+    const fetchesBeforeSwitch = requestedSlices.length;
+    percBtn.click();
+    await flushUi();
+    // Reused exact [60, 120) anchor window -> ZERO new /audition fetches!
+    expect(requestedSlices.length).toBe(fetchesBeforeSwitch);
+
+    // Stop playback, turn Cache OFF, and visit 13 distinct 60s windows across the 3600s track to verify 12-slice eviction!
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: " " }));
+    await flushUi();
+    const cacheBtn = Array.from(container.querySelectorAll(".stage-toolbar button")).find(
+      (b) => b.textContent?.trim() === "Cache",
+    ) as HTMLButtonElement;
+    cacheBtn.click();
+    await flushUi();
+
+    requestedSlices.length = 0;
+    for (let idx = 0; idx < 13; idx += 1) {
+      // Centers at 210, 300, 390, ... -> distinct non-overlapping [180, 240), [270, 330), ...
+      stageHook.emit?.("seek", (210 + idx * 90) * 1000);
+      await flushUi();
+    }
+    expect(requestedSlices.length).toBe(13);
+
+    // Re-visiting idx=12 (most recent) and idx=1 (12th most recent) hits cache (0 fetches)!
+    stageHook.emit?.("seek", (210 + 1 * 90) * 1000);
+    await flushUi();
+    expect(requestedSlices.length).toBe(13);
+
+    // Re-visiting idx=0 (evicted as 13th entry) fetches fresh from server!
+    stageHook.emit?.("seek", 210 * 1000);
+    await flushUi();
+    expect(requestedSlices.length).toBe(14);
   });
 });
