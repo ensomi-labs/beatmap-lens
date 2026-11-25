@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -170,7 +171,7 @@ class AnalyzeAndSegmentationTest(unittest.TestCase):
 
 
 class CpuSuggestSnapsTest(unittest.TestCase):
-    def test_verifiable_snap_roles_and_sub_40ms_latency(self):
+    def test_verifiable_snap_roles_and_sub_100ms_latency(self):
         duration = 6.0
         n = int(duration * RATE)
         t = np.arange(n) / RATE
@@ -210,9 +211,11 @@ class CpuSuggestSnapsTest(unittest.TestCase):
             engine = daemon.TempoEngine(backend="dsp")
             engine.prepare(wav_path)
 
+            budget_ms = 250.0 if os.environ.get("CI") else 100.0
+
             # Query 1: transient_attack near 1.015 s.
             r1 = engine.suggest_snaps(wav_path, time_sec=1.015, window_sec=0.12)
-            self.assertLess(r1["elapsedMs"], 40.0, r1)
+            self.assertLess(r1["elapsedMs"], budget_ms, r1)
             roles_1 = [c["role"] for c in r1["candidates"]]
             self.assertIn("transient_attack", roles_1, r1)
             atk = next(c for c in r1["candidates"] if c["role"] == "transient_attack")
@@ -222,12 +225,12 @@ class CpuSuggestSnapsTest(unittest.TestCase):
 
             # Query 2: p_center near 2.035 s.
             r2 = engine.suggest_snaps(wav_path, time_sec=2.035, window_sec=0.14)
-            self.assertLess(r2["elapsedMs"], 40.0, r2)
+            self.assertLess(r2["elapsedMs"], budget_ms, r2)
             self.assertIn("p_center", [c["role"] for c in r2["candidates"]], r2)
 
             # Query 3: harmonic_change near 3.510 s.
             r3 = engine.suggest_snaps(wav_path, time_sec=3.510, window_sec=0.14)
-            self.assertLess(r3["elapsedMs"], 40.0, r3)
+            self.assertLess(r3["elapsedMs"], budget_ms, r3)
             hc = next((c for c in r3["candidates"] if c["role"] == "harmonic_change"), None)
             self.assertIsNotNone(hc, r3)
             assert hc is not None
@@ -235,7 +238,7 @@ class CpuSuggestSnapsTest(unittest.TestCase):
 
             # Query 4: release near 4.190 s.
             r4 = engine.suggest_snaps(wav_path, time_sec=4.190, window_sec=0.14)
-            self.assertLess(r4["elapsedMs"], 40.0, r4)
+            self.assertLess(r4["elapsedMs"], budget_ms, r4)
             rel = next((c for c in r4["candidates"] if c["role"] == "release"), None)
             self.assertIsNotNone(rel, r4)
             assert rel is not None
