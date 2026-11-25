@@ -1758,10 +1758,15 @@ describe("TempoWorkspace interactive UI", () => {
     expect(cacheBtn).toBeDefined();
     expect(cacheBtn?.getAttribute("aria-pressed")).toBe("true");
 
-    // Wait >15ms so background pre-warm starts `percussive` and stalls on `harmonic`
-    await new Promise((r) => setTimeout(r, 35));
+    // Wait until background pre-warm starts `percussive` and stalls on `harmonic`
+    await vi.waitFor(
+      () => {
+        expect(auditionRequests.some((r) => r.filter === "percussive")).toBe(true);
+        expect(auditionRequests.some((r) => r.filter === "harmonic")).toBe(true);
+      },
+      { timeout: 2000 },
+    );
     await flushUi();
-    expect(auditionRequests.some((r) => r.filter === "percussive")).toBe(true);
     const harmReq = auditionRequests.find((r) => r.filter === "harmonic");
     expect(harmReq).toBeDefined();
     expect(harmReq?.signal?.aborted).toBe(false);
@@ -1792,11 +1797,16 @@ describe("TempoWorkspace interactive UI", () => {
     expect(
       JSON.parse(localStorage.getItem("lens-tempo-preferences") ?? "{}").cacheAuditionFilters,
     ).toBe(true);
-    await new Promise((r) => setTimeout(r, 45));
+    await vi.waitFor(
+      () => {
+        const warmed = new Set(auditionRequests.map((r) => r.filter));
+        expect(warmed).toEqual(new Set(["percussive", "harmonic", "low", "mid", "high"]));
+      },
+      { timeout: 2000 },
+    );
     await flushUi();
-
-    const warmedFilters = new Set(auditionRequests.map((r) => r.filter));
-    expect(warmedFilters).toEqual(new Set(["percussive", "harmonic", "low", "mid", "high"]));
+    await new Promise((r) => setTimeout(r, 20));
+    await flushUi();
 
     // Now switch Perc -> Harm -> Perc: ZERO new fetches, ZERO "Rendering filter…" status flicker, exact synchronous buffer splice!
     const statusEl = container.querySelector(".tempo-status");
@@ -1955,14 +1965,20 @@ describe("TempoWorkspace interactive UI", () => {
       (b) => b.textContent?.trim() === "Perc",
     ) as HTMLButtonElement;
     harmBtn.click();
-    await new Promise((r) => setTimeout(r, 45));
+    await vi.waitFor(
+      () => {
+        expect(
+          requestedSlices
+            .filter((s) => s.t0 === 60 && s.t1 === 120)
+            .map((s) => s.filter)
+            .sort(),
+        ).toEqual(["harmonic", "high", "low", "mid", "percussive"]);
+      },
+      { timeout: 2000 },
+    );
     await flushUi();
-    expect(
-      requestedSlices
-        .filter((s) => s.t0 === 60 && s.t1 === 120)
-        .map((s) => s.filter)
-        .sort(),
-    ).toEqual(["harmonic", "high", "low", "mid", "percussive"]);
+    await new Promise((r) => setTimeout(r, 20));
+    await flushUi();
 
     // Start playback and advance playhead from 90.0 s to 102.5 s (where unanchored computeAuditionWindow would compute [75, 135)!)
     window.dispatchEvent(new KeyboardEvent("keydown", { key: " " }));
